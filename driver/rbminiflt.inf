@@ -9,7 +9,8 @@ Class       = "ActivityMonitor"        ; Mini-Filter 所属类
 ClassGuid   = {b86dff51-a1b9-4a26-abc7-7f6c5c8c7e12}
 Provider    = %ManufacturerName%
 DriverVer   = 08/28/2026,1.0.0.0
-CatalogFile = rbminiflt.cat
+; 无 CatalogFile: 本驱动未签名, 仅在 testsigning 模式下安装
+; (若声明 CatalogFile 但 cat 文件缺失, pnputil 可能拒绝添加驱动包)
 PnpLockdown = 1
 
 [DestinationDirs]

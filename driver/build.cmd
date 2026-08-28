@@ -33,7 +33,7 @@ if "%CFG%"=="Debug" (
 if errorlevel 1 goto :err
 
 echo.
-echo === Build OK: rbminiflt.sys (12288 bytes expected) ===
+echo === Build OK: rbminiflt.sys ===
 dir rbminiflt.sys
 exit /b 0
 

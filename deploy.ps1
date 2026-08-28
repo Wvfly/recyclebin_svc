@@ -2,13 +2,15 @@
 # 以管理员 PowerShell 运行
 # 用途: 创建暂存区目录、写入配置、安装驱动、注册核心服务(C)与管理 API(Go)
 #
-# 二进制来源: 优先取 build_all.cmd 收集的 target\Release (或 target\Debug),
-# 找不到再回退到 driver\ / service_c\ / service_go\ 源码目录。
-# 建议先运行 build_all.cmd Release 再执行本脚本。
+# 用法1 (推荐): 先运行 build_all.cmd 收集产物, 然后把整个 target\Release
+#               目录拷贝到目标机, 在其中以管理员 PowerShell 运行 .\deploy.ps1。
+#               所有文件与脚本同目录, 无需额外复制。
+# 用法2 (兼容): 在仓库根运行 .\deploy.ps1, 自动从 target\ 或源码目录找二进制。
 $ErrorActionPreference = "Stop"
 
-$Root   = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$DriverDir = Join-Path $Root "driver"
+# $PSScriptRoot 始终是脚本所在目录的绝对路径, 与调用方式无关
+# (dot-source / -File 绝对或相对路径 / 经 PATH 调用均安全)
+$Root   = $PSScriptRoot
 
 # ============================================================
 # 配置 (可按环境修改)
@@ -50,8 +52,11 @@ function Get-DriveRoot([string]$path) {
     return $null
 }
 
-# 查找二进制: 优先 build_all.cmd 收集的 target 目录, 回退到源码目录
-function Find-Binary([string]$name) {
+# 查找部署文件: 优先与脚本同目录 (target 自包含部署包), 找不到再回退到
+# 仓库根工作流 (target 收集目录 / 源码目录)
+function Find-File([string]$name) {
+    $here = Join-Path $Root $name
+    if (Test-Path $here) { return $here }
     $candidates = @(
         (Join-Path $Root "target\Release\$name"),
         (Join-Path $Root "target\Debug\$name"),
@@ -210,26 +215,33 @@ if (-not (Test-Path $storeRoot)) {
 Write-Host "  StoreRoot: $storeRoot"
 
 Write-Host "[3/6] 安装内核驱动 (rbminiflt.inf)"
-$inf = Join-Path $DriverDir "rbminiflt.inf"
-$sys = Find-Binary "rbminiflt.sys"
+$inf = Find-File "rbminiflt.inf"
+$sys = Find-File "rbminiflt.sys"
 if ($sys) {
     Copy-Item $sys "$env:SystemRoot\system32\drivers\rbminiflt.sys" -Force
-    # pnputil 从 INF 同目录解析源文件, 若 sys 来自 target 则同步一份到 driver\
-    if ((Split-Path $sys) -ne $DriverDir) {
-        Copy-Item $sys (Join-Path $DriverDir "rbminiflt.sys") -Force
+    # pnputil 从 INF 同目录解析源文件; 若 sys 不在 INF 同目录则先同步过去
+    if ($inf -and ((Split-Path $sys) -ne (Split-Path $inf))) {
+        Copy-Item $sys (Join-Path (Split-Path $inf) "rbminiflt.sys") -Force
     }
     Write-Host "  驱动二进制: $sys"
 } else {
     Write-Warning "未找到 rbminiflt.sys, 请先运行 build_all.cmd Release"
 }
-pnputil /add-driver $inf /install | Out-Null
-Write-Host "  驱动已注册 (Altitude 370030)"
+if ($inf) {
+    pnputil /add-driver $inf /install | Out-Null
+    Write-Host "  驱动已注册 (Altitude 370030)"
+} else {
+    Write-Warning "未找到 rbminiflt.inf, 跳过驱动注册"
+}
 
 Write-Host "[4/6] 启动驱动"
-try { sc.exe start rbminiflt } catch { Write-Warning "驱动启动失败, 检查签名/测试模式" }
+sc.exe start rbminiflt | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "驱动启动失败 (exit $LASTEXITCODE), 检查签名/测试模式"
+}
 
 Write-Host "[5/6] 安装核心服务 rbservice.exe (C, SYSTEM 自启)"
-$coreBin = Find-Binary "rbservice.exe"
+$coreBin = Find-File "rbservice.exe"
 if (-not $coreBin) {
     Write-Warning "未找到 rbservice.exe, 请先运行 build_all.cmd Release"
 } else {
@@ -242,7 +254,7 @@ if (-not $coreBin) {
 }
 
 Write-Host "[6/6] 安装管理 API rbapi.exe (Go, 可选)"
-$apiBin = Find-Binary "rbapi.exe"
+$apiBin = Find-File "rbapi.exe"
 if (-not $apiBin) {
     Write-Warning "未找到 rbapi.exe, 跳过 REST API (先运行 build_all.cmd Release, 或 cd service_go; go build -o rbapi.exe .)"
 } elseif ($UserCfg["EnableRestApi"] -ne 1) {

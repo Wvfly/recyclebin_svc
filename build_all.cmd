@@ -16,8 +16,11 @@ rem Then runs the C/Go contract verification suites when python is
 rem available, so a change that breaks the shared-schema contract fails
 rem here instead of at deploy time.
 rem
-rem Finally copies every built binary into one folder:
+rem Finally copies every built binary plus the driver INF and deploy.ps1
+rem into one self-contained deploy folder:
 rem   target\%Config%\   e.g. target\Release\, target\Debug\
+rem   (rbminiflt.sys, rbservice.exe, rbapi.exe, rbminiflt.inf, deploy.ps1)
+rem Copy that folder to the target machine and run .\deploy.ps1 there.
 rem
 rem Notes:
 rem   - Stale binaries are deleted first, so a missing output at the end
@@ -238,6 +241,8 @@ rem Remove stale copies so "file exists" means "this build produced it".
 if exist "%TARGET%\rbminiflt.sys"  del /f /q "%TARGET%\rbminiflt.sys"  >nul 2>&1
 if exist "%TARGET%\rbservice.exe"  del /f /q "%TARGET%\rbservice.exe"  >nul 2>&1
 if exist "%TARGET%\rbapi.exe"      del /f /q "%TARGET%\rbapi.exe"      >nul 2>&1
+if exist "%TARGET%\rbminiflt.inf"  del /f /q "%TARGET%\rbminiflt.inf"  >nul 2>&1
+if exist "%TARGET%\deploy.ps1"     del /f /q "%TARGET%\deploy.ps1"     >nul 2>&1
 
 copy /y "%ROOT%\driver\rbminiflt.sys"   "%TARGET%\rbminiflt.sys"   >nul
 if errorlevel 1 goto :collect_failed
@@ -252,7 +257,14 @@ if not defined API_SKIPPED (
     )
 )
 
-echo   [OK] all artifacts in %TARGET%
+rem Deploy assets: INF + deploy script make target self-contained.
+copy /y "%ROOT%\driver\rbminiflt.inf"  "%TARGET%\rbminiflt.inf"  >nul
+if errorlevel 1 goto :collect_failed
+
+copy /y "%ROOT%\deploy.ps1"            "%TARGET%\deploy.ps1"     >nul
+if errorlevel 1 goto :collect_failed
+
+echo   [OK] binaries + INF + deploy.ps1 in %TARGET%
 echo.
 goto :summary
 
@@ -295,14 +307,14 @@ if defined API_SKIPPED (
 )
 
 echo.
-echo   Artifacts collected to: %TARGET%
-echo     ^(everything the service needs in one folder - deploy from here^)
-
+echo   Deploy package ready: %TARGET%
+echo     ^(self-contained: binaries + rbminiflt.inf + deploy.ps1^)
 echo.
 echo   Next steps:
-echo     1. Edit deploy.ps1: set ProtectedPaths and StoreRoot on the SAME volume
-echo     2. bcdedit /set testsigning on   ^(then reboot^)
-echo     3. powershell -ExecutionPolicy Bypass -File .\deploy.ps1
+echo     1. Copy the whole folder above to the target machine
+echo     2. Edit deploy.ps1 there: set ProtectedPaths and StoreRoot on the SAME volume
+echo     3. bcdedit /set testsigning on   ^(then reboot^)
+echo     4. powershell -ExecutionPolicy Bypass -File .\deploy.ps1
 echo.
 exit /b 0
 
@@ -323,7 +335,9 @@ echo.
 echo Then runs db\verify_contract.py and db\verify_c_contract.py when python
 echo is available.
 echo.
-echo Finally copies all built binaries into a single folder: target\%Config%\.
+echo Finally copies all built binaries plus the driver INF and deploy.ps1 into
+echo one self-contained deploy folder: target\%Config%\. Copy that folder to
+echo the target machine and run .\deploy.ps1 there.
 echo.
 echo Stale binaries are deleted before building, so a missing output at the
 echo end always means the build genuinely failed.
