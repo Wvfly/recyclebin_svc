@@ -372,6 +372,9 @@ FodyWeavers.xsd
 # Compiled service binaries (service_c\rbservice.exe, service_go\rbapi.exe)
 *.exe
 
+# One-shot build output folder (build_all.cmd collects all binaries here)
+target/
+
 # Generated at build time by db\gen_schema.ps1 from db\schema.sql.
 # schema.sql is the source of truth; this header is derived output.
 service_c/schema_sql.h

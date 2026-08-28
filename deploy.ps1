@@ -1,6 +1,10 @@
 ﻿# deploy.ps1 - 部署 RecycleBin for SMB
 # 以管理员 PowerShell 运行
 # 用途: 创建暂存区目录、写入配置、安装驱动、注册核心服务(C)与管理 API(Go)
+#
+# 二进制来源: 优先取 build_all.cmd 收集的 target\Release (或 target\Debug),
+# 找不到再回退到 driver\ / service_c\ / service_go\ 源码目录。
+# 建议先运行 build_all.cmd Release 再执行本脚本。
 $ErrorActionPreference = "Stop"
 
 $Root   = Split-Path -Parent $MyInvocation.MyCommand.Definition
@@ -43,6 +47,21 @@ $UserCfg = @{
 function Get-DriveRoot([string]$path) {
     # "D:\Share\Sub" -> "D:"; "D:" -> "D:"; 无盘符则返回 $null
     if ($path -match '^([A-Za-z]):') { return ($Matches[1] + ":").ToUpper() }
+    return $null
+}
+
+# 查找二进制: 优先 build_all.cmd 收集的 target 目录, 回退到源码目录
+function Find-Binary([string]$name) {
+    $candidates = @(
+        (Join-Path $Root "target\Release\$name"),
+        (Join-Path $Root "target\Debug\$name"),
+        (Join-Path $Root "driver\$name"),
+        (Join-Path $Root "service_c\$name"),
+        (Join-Path $Root "service_go\$name")
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path $c) { return $c }
+    }
     return $null
 }
 
@@ -192,18 +211,17 @@ Write-Host "  StoreRoot: $storeRoot"
 
 Write-Host "[3/6] 安装内核驱动 (rbminiflt.inf)"
 $inf = Join-Path $DriverDir "rbminiflt.inf"
-# build.cmd 输出在 driver\ 根目录; VS 输出在 x64\Release\ 目录, 两者都兼容
-$sys = Join-Path $DriverDir "rbminiflt.sys"
-if (-not (Test-Path $sys)) {
-    $alt = Join-Path $DriverDir "x64\Release\rbminiflt.sys"
-    if (Test-Path $alt) { $sys = $alt }
-}
-if (Test-Path $sys) {
+$sys = Find-Binary "rbminiflt.sys"
+if ($sys) {
     Copy-Item $sys "$env:SystemRoot\system32\drivers\rbminiflt.sys" -Force
+    # pnputil 从 INF 同目录解析源文件, 若 sys 来自 target 则同步一份到 driver\
+    if ((Split-Path $sys) -ne $DriverDir) {
+        Copy-Item $sys (Join-Path $DriverDir "rbminiflt.sys") -Force
+    }
+    Write-Host "  驱动二进制: $sys"
 } else {
-    Write-Warning "未找到 rbminiflt.sys, 请先编译驱动 (driver\build.cmd Release)"
+    Write-Warning "未找到 rbminiflt.sys, 请先运行 build_all.cmd Release"
 }
-# pnputil 从 INF 同目录解析源文件, 确保 sys 在 driver\ 下
 pnputil /add-driver $inf /install | Out-Null
 Write-Host "  驱动已注册 (Altitude 370030)"
 
@@ -211,11 +229,11 @@ Write-Host "[4/6] 启动驱动"
 try { sc.exe start rbminiflt } catch { Write-Warning "驱动启动失败, 检查签名/测试模式" }
 
 Write-Host "[5/6] 安装核心服务 rbservice.exe (C, SYSTEM 自启)"
-$CsvcDir = Join-Path $Root "service_c"
-$coreBin = Join-Path $CsvcDir "rbservice.exe"
-if (-not (Test-Path $coreBin)) {
-    Write-Warning "未找到 rbservice.exe, 请先编译 (service_c\build.cmd Release)"
+$coreBin = Find-Binary "rbservice.exe"
+if (-not $coreBin) {
+    Write-Warning "未找到 rbservice.exe, 请先运行 build_all.cmd Release"
 } else {
+    Write-Host "  服务二进制: $coreBin"
     sc.exe create RecycleBinSvc binPath= "`"$coreBin`"" type= own start= auto obj= LocalSystem
     sc.exe description RecycleBinSvc "RecycleBin for SMB - 删除拦截核心服务 (落地/配额/还原)"
     # 崩溃后自动重启, 避免服务掉线产生无法落地的孤儿文件
@@ -224,10 +242,9 @@ if (-not (Test-Path $coreBin)) {
 }
 
 Write-Host "[6/6] 安装管理 API rbapi.exe (Go, 可选)"
-$ApiDir = Join-Path $Root "service_go"
-$apiBin = Join-Path $ApiDir "rbapi.exe"
-if (-not (Test-Path $apiBin)) {
-    Write-Warning "未找到 rbapi.exe, 跳过 REST API (cd service_go; go build -o rbapi.exe .)"
+$apiBin = Find-Binary "rbapi.exe"
+if (-not $apiBin) {
+    Write-Warning "未找到 rbapi.exe, 跳过 REST API (先运行 build_all.cmd Release, 或 cd service_go; go build -o rbapi.exe .)"
 } elseif ($UserCfg["EnableRestApi"] -ne 1) {
     Write-Host "  EnableRestApi=0, 跳过 REST API 安装"
 } else {
