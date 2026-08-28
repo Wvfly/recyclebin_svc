@@ -3,17 +3,52 @@
  *
  * Behavior:
  *   PreSetInfo(FileDispositionInformation, DeleteFile=1):
- *     1. Only intercept remote sessions (RequestorSessionId != 0)
- *     2. Path matches a protected share prefix?
- *     3. Rename to \RBStore\<VolGuid>\<Sid>\<relative path>
- *     4. Success -> COMPLETE(STATUS_SUCCESS)  (user thinks the delete succeeded)
- *     5. Failure -> allow real delete + event log
- *     6. Async enqueue notification -> communication port (non-blocking)
+ *     1. Path matches a protected share prefix? (boundary checked)
+ *     2. Ensure staging dirs: <vol>\RBStore and <vol>\RBStore\<sid>
+ *        (created with a DACL that lets SMB users rename files in)
+ *     3. Rename to \RBStore\<Sid>\<seq>_<basename> (flat, same volume)
+ *     4. Success -> COMPLETE(STATUS_SUCCESS)  (user thinks delete succeeded)
+ *     5. Failure -> allow real delete (fail-open) + stats
+ *     6. Async enqueue notification -> dedicated send thread -> FltSendMessage
+ *        (bounded queue + 30s send timeout, never blocks the delete path)
+ *
+ * Note: we intentionally do NOT filter by RequestorSessionId. SMB2 deletes
+ * are executed by srv2.sys which runs in session 0, so the requestor session
+ * id is 0 even for remote clients; the only reliable discriminator is the
+ * path policy (protected prefixes). The real client SID is resolved from the
+ * requestor token (SMB impersonates the client user); placeholder fallback
+ * "\S-SESSION-<id>" is only used when no token is available.
  *
  * Build: WDK 10 + VS2022, x64, Driver Type = WDM (pure Mini-Filter)
  * Linker Input: fltMgr.lib
  */
 #include "rbminiflt.h"
+
+/* This WDK install ships a minimal header/lib set: no ntseapi.h, and
+   ntoskrnl.lib lacks RtlInitializeAcl / RtlAllocateAndInitializeSid /
+   RtlFreeSid / RtlInitializeSecurityDescriptor / RtlSetSecurityDescriptorDacl.
+   RbfCreateDirectory therefore builds a self-relative security descriptor
+   by hand (pure structs, no Rtl* calls). */
+#ifndef ACL_REVISION
+#define ACL_REVISION (2)
+#endif
+#ifndef SECURITY_DESCRIPTOR_REVISION
+#define SECURITY_DESCRIPTOR_REVISION (1)
+#endif
+
+/* Staging-dir DACL builder. Layout (self-relative, 44 bytes):
+   SECURITY_DESCRIPTOR_RELATIVE (20) | ACL (8) | ACE_HEADER (4) | Mask (4)
+   | SID bytes (8, S-1-0-0 Everyone).
+   ACE grants Everyone: add-file/add-subdir/list/traverse/read-attrs/sync. */
+#pragma pack(push, 1)
+typedef struct _RBF_STAGING_SD {
+    SECURITY_DESCRIPTOR_RELATIVE Sd;       /* off 0,  size 20 */
+    ACL                          Acl;      /* off 20, size 8  */
+    ACE_HEADER                   AceHeader;/* off 28, size 4  */
+    ACCESS_MASK                  AceMask;  /* off 32, size 4  */
+    UCHAR                        SidBytes[8]; /* off 36, S-1-0-0 */
+} RBF_STAGING_SD;
+#pragma pack(pop)
 
 RBF_GLOBAL G;
 
@@ -21,7 +56,7 @@ RBF_GLOBAL G;
  * Config: read protected paths and store root from registry
  *   HKLM\SYSTEM\CurrentControlSet\Services\rbminiflt\Parameters
  *     ProtectedPaths REG_MULTI_SZ  (NT-style, e.g. \Device\HarddiskVolume2\Share)
- *     StoreRoot      REG_SZ        (e.g. C:\RBStore) -- reserved, paths derived
+ *     StoreRoot      REG_SZ        (reserved; paths are derived per-volume)
  * ========================================================== */
 NTSTATUS RbfLoadConfig(VOID)
 {
@@ -100,55 +135,122 @@ VOID RbfFreeConfig(VOID)
 }
 
 /* Check if Path matches a protected prefix. Path is NT form
-   (\Device\HarddiskVolumeN\...). Cached prefixes are already uppercase. */
+   (\Device\HarddiskVolumeN\...). Cached prefixes are already uppercase.
+   Boundary check: prefix must be followed by '\' or the end of the path,
+   so "\Device\...\Share" does NOT match "\Device\...\ShareSecret\...". */
 BOOLEAN RbfIsProtected(_In_ PCUNICODE_STRING Path)
 {
     ULONG i;
     UNICODE_STRING up;
-    if (G.ProtectedCount == 0) return FALSE;
-    up.Buffer = ExAllocatePool2(POOL_FLAG_PAGED, Path->Length, RBF_TAG);
-    if (!up.Buffer) return FALSE;
-    up.MaximumLength = Path->Length;
-    up.Length = Path->Length;
-    RtlCopyMemory(up.Buffer, Path->Buffer, Path->Length);
-    RtlUpcaseUnicodeString(&up, &up, FALSE);
+    BOOLEAN matched = FALSE;
 
-    for (i = 0; i < G.ProtectedCount; i++) {
-        if (up.Length >= G.Protected[i].Prefix.Length &&
-            RtlCompareMemory(up.Buffer,
-                             G.Protected[i].Prefix.Buffer,
-                             G.Protected[i].Prefix.Length) == G.Protected[i].Prefix.Length) {
-            ExFreePoolWithTag(up.Buffer, RBF_TAG);
-            return TRUE;
+    if (G.ProtectedCount == 0) return FALSE;
+
+    /* Fast path: use stack buffer for short paths, avoid pool traffic. */
+    {
+        WCHAR stackBuf[256];
+        PWSTR buf = NULL;
+        if (Path->Length <= sizeof(stackBuf)) {
+            buf = stackBuf;
+        } else {
+            buf = ExAllocatePool2(POOL_FLAG_PAGED, Path->Length, RBF_TAG);
+            if (!buf) return FALSE;
         }
+        up.Buffer = buf;
+        up.MaximumLength = Path->Length;
+        up.Length = Path->Length;
+        RtlCopyMemory(buf, Path->Buffer, Path->Length);
+        RtlUpcaseUnicodeString(&up, &up, FALSE);
+
+        for (i = 0; i < G.ProtectedCount; i++) {
+            ULONG plen = G.Protected[i].Prefix.Length;
+            if (up.Length >= plen &&
+                RtlCompareMemory(up.Buffer, G.Protected[i].Prefix.Buffer, plen) == plen) {
+                /* Boundary: next char must be '\' or end of path */
+                if (up.Length == plen || up.Buffer[plen / sizeof(WCHAR)] == L'\\') {
+                    matched = TRUE;
+                    break;
+                }
+            }
+        }
+        if (buf != stackBuf) ExFreePoolWithTag(buf, RBF_TAG);
     }
-    ExFreePoolWithTag(up.Buffer, RBF_TAG);
-    return FALSE;
+    return matched;
 }
 
 /* ============================================================
  * Session / SID
- *  Resolving a real SID string in kernel mode is expensive and the
- *  relevant APIs are unstable across WDK versions. We instead return
- *  a placeholder SID derived from the SessionId; the user-mode
- *  service resolves the real SID using WTS APIs.
- *  On success, SidString->Buffer must be freed by the caller.
+ *  Resolves the REAL client SID from the requestor token. SMB2
+ *  requests are impersonated by srv2.sys with the client's token,
+ *  so SeQuerySubjectContextToken -> TokenUser gives the actual user
+ *  (fixes both the "session id is always 0 for SMB" problem and the
+ *  per-session quota bucketing). Falls back to a placeholder
+ *  "\S-SESSION-<id>" when no token is available.
+ *  The returned string starts with '\' so it can be appended directly
+ *  after "<vol>\RBStore". On success, SidString->Buffer must be freed
+ *  by the caller.
+ *  Requires PASSIVE_LEVEL (guaranteed for SET_INFORMATION dispatch).
  * ========================================================== */
 NTSTATUS RbfGetRequestorSid(_In_ PFLT_CALLBACK_DATA Data,
                             _In_ ULONG SessionId,
                             _Out_ PUNICODE_STRING SidString)
 {
-    UNREFERENCED_PARAMETER(Data);
+    NTSTATUS status;
+    BOOLEAN gotReal = FALSE;
+    SECURITY_SUBJECT_CONTEXT ctx;
+
+    UNREFERENCED_PARAMETER(Data);  /* subject context is taken from the
+                                      current thread (SMB impersonation) */
+
     SidString->Buffer = NULL;
     SidString->Length = SidString->MaximumLength = 0;
+
+    SeCaptureSubjectContext(&ctx);
+    {
+        PACCESS_TOKEN token = SeQuerySubjectContextToken(&ctx);
+        PTOKEN_USER tokenUser = NULL;
+
+        if (token != NULL &&
+            NT_SUCCESS(SeQueryInformationToken(token, TokenUser, &tokenUser)) &&
+            tokenUser != NULL && tokenUser->User.Sid != NULL) {
+
+            UNICODE_STRING sidNoSlash = {0};
+            status = RtlConvertSidToUnicodeString(&sidNoSlash,
+                                                  tokenUser->User.Sid, TRUE);
+            if (NT_SUCCESS(status) &&
+                sidNoSlash.Length > 0 &&
+                sidNoSlash.Length + sizeof(WCHAR) < RBF_MAX_NAME * sizeof(WCHAR)) {
+
+                PWSTR buf = ExAllocatePool2(POOL_FLAG_PAGED,
+                                            RBF_MAX_NAME * sizeof(WCHAR), RBF_TAG);
+                if (buf != NULL) {
+                    buf[0] = L'\\';
+                    RtlCopyMemory(buf + 1, sidNoSlash.Buffer, sidNoSlash.Length);
+                    buf[sidNoSlash.Length / sizeof(WCHAR) + 1] = L'\0';
+                    SidString->Buffer = buf;
+                    SidString->Length = (USHORT)(sidNoSlash.Length + sizeof(WCHAR));
+                    SidString->MaximumLength = (USHORT)(RBF_MAX_NAME * sizeof(WCHAR));
+                    gotReal = TRUE;
+                }
+                ExFreePoolWithTag(sidNoSlash.Buffer, RBF_TAG);
+            } else {
+                DbgPrint("[RBF] SID conversion failed 0x%X, fallback\n", status);
+            }
+        }
+        if (tokenUser != NULL) ExFreePool(tokenUser);
+    }
+    SeReleaseSubjectContext(&ctx);
+
+    if (gotReal) return STATUS_SUCCESS;
+
+    /* Fallback: placeholder L"\S-SESSION-<id>" */
     SidString->MaximumLength = (USHORT)(RBF_MAX_NAME * sizeof(WCHAR));
     SidString->Buffer = ExAllocatePool2(POOL_FLAG_PAGED,
                                         SidString->MaximumLength, RBF_TAG);
     if (!SidString->Buffer) return STATUS_INSUFFICIENT_RESOURCES;
 
-    /* Manual build of L"S-SESSION-<id>" without CRT/ntstrsafe dependency. */
     {
-        PCWSTR prefix = L"S-SESSION-";
+        PCWSTR prefix = L"\\S-SESSION-";
         SIZE_T pi = 0;
         ULONG n = SessionId;
         WCHAR digits[16];
@@ -170,7 +272,7 @@ NTSTATUS RbfGetRequestorSid(_In_ PFLT_CALLBACK_DATA Data,
 /* ============================================================
  * Move to staging: rename source to StorePath.
  *   StorePath must already be constructed (same volume, outside the
- *   protected prefix). We do NOT recurse-into ourselves because the
+ *   protected prefix). We do NOT recurse into ourselves because the
  *   target path won't match the protected prefix.
  * ========================================================== */
 NTSTATUS RbfMoveToStore(_In_ PCFLT_RELATED_OBJECTS FltObjects,
@@ -204,12 +306,123 @@ NTSTATUS RbfMoveToStore(_In_ PCFLT_RELATED_OBJECTS FltObjects,
 }
 
 /* ============================================================
+ * Create a directory (open-if-exists). Used to ensure
+ *   <vol>\RBStore and <vol>\RBStore\<Sid>
+ * exist before any rename lands in them. ZwCreateFile is safe here:
+ * our filter only hooks IRP_MJ_SET_INFORMATION (delete/rename), so
+ * these IRP_MJ_CREATE calls never re-enter this callback.
+ *
+ * CRITICAL: the rename into RBStore is executed with the REQUESTOR's
+ * token (SMB client user). Volume roots are usually NOT writable by
+ * share users, so the staging dirs must carry an explicit DACL granting
+ * Everyone the rights needed to add entries (but NOT delete/modify other
+ * people's staged items). Staged FILES keep their original ACLs, so
+ * content is not exposed to users who lacked access before deletion.
+ * ========================================================== */
+NTSTATUS RbfCreateDirectory(_In_ PCUNICODE_STRING DirPath)
+{
+    NTSTATUS status;
+    OBJECT_ATTRIBUTES oa;
+    HANDLE hDir = NULL;
+    IO_STATUS_BLOCK iosb;
+    RBF_STAGING_SD sd;
+    PSECURITY_DESCRIPTOR psd = NULL;
+
+    RtlZeroMemory(&sd, sizeof(sd));
+
+    /* Build self-relative SD: DACL = 1 ACE (Everyone, add-only rights). */
+    sd.Sd.Revision = SECURITY_DESCRIPTOR_REVISION;
+    sd.Sd.Sbz1 = 0;
+    sd.Sd.Control = SE_SELF_RELATIVE | SE_DACL_PRESENT;
+    sd.Sd.Owner = 0;
+    sd.Sd.Group = 0;
+    sd.Sd.Sacl = 0;
+    sd.Sd.Dacl = 20; /* fixed layout: SD header (20) precedes the ACL */
+
+    sd.Acl.AclRevision = ACL_REVISION;
+    sd.Acl.Sbz1 = 0;
+    sd.Acl.AclSize = (USHORT)(sizeof(ACL) + 4 + 4 + 8); /* ACL + ACE = 24 */
+    sd.Acl.AceCount = 1;
+    sd.Acl.Sbz2 = 0;
+
+    sd.AceHeader.AceType = ACCESS_ALLOWED_ACE_TYPE;
+    sd.AceHeader.AceFlags = 0;
+    sd.AceHeader.AceSize = (USHORT)(4 + 4 + 8); /* header+mask+sid = 16 */
+    sd.AceMask = FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_LIST_DIRECTORY |
+                 FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+    /* SID = S-1-0-0 (Everyone): rev=1, subauth=0, authority=0x000000000001 */
+    sd.SidBytes[0] = 1;
+    sd.SidBytes[1] = 0;
+    sd.SidBytes[2] = 0;
+    sd.SidBytes[3] = 0;
+    sd.SidBytes[4] = 0;
+    sd.SidBytes[5] = 0;
+    sd.SidBytes[6] = 0;
+    sd.SidBytes[7] = 1;
+
+    psd = (PSECURITY_DESCRIPTOR)&sd;
+
+    InitializeObjectAttributes(&oa, (PUNICODE_STRING)DirPath,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, psd);
+    status = ZwCreateFile(&hDir,
+        FILE_LIST_DIRECTORY | SYNCHRONIZE,
+        &oa, &iosb, NULL,
+        FILE_ATTRIBUTE_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN_IF,
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_FOR_BACKUP_INTENT,
+        NULL, 0);
+    if (NT_SUCCESS(status) && hDir != NULL) {
+        ZwClose(hDir);
+        status = STATUS_SUCCESS;
+    }
+    return status;
+}
+
+/* Ensure <VolumeName>\RBStore and <VolumeName>\RBStore\<Sid> exist. */
+NTSTATUS RbfEnsureStoreDir(_In_ PCUNICODE_STRING VolumeName,
+                           _In_ PCUNICODE_STRING SidString)
+{
+    NTSTATUS status;
+    UNICODE_STRING dirPath;
+    UNICODE_STRING storeDir;
+
+    RtlInitUnicodeString(&storeDir, L"\\RBStore");
+
+    dirPath.Buffer = ExAllocatePool2(POOL_FLAG_PAGED, RBF_MAX_PATH * sizeof(WCHAR), RBF_TAG);
+    if (!dirPath.Buffer) return STATUS_INSUFFICIENT_RESOURCES;
+    dirPath.MaximumLength = (USHORT)(RBF_MAX_PATH * sizeof(WCHAR));
+    dirPath.Length = 0;
+
+    status = RtlAppendUnicodeStringToString(&dirPath, VolumeName);
+    if (NT_SUCCESS(status))
+        status = RtlAppendUnicodeStringToString(&dirPath, &storeDir);
+    if (NT_SUCCESS(status))
+        status = RbfCreateDirectory(&dirPath);
+
+    if (NT_SUCCESS(status)) {
+        status = RtlAppendUnicodeStringToString(&dirPath, SidString);
+        if (NT_SUCCESS(status))
+            status = RbfCreateDirectory(&dirPath);
+    }
+
+    ExFreePoolWithTag(dirPath.Buffer, RBF_TAG);
+    return status;
+}
+
+/* ============================================================
  * Build staging target path (same volume, avoids cross-volume rename):
- *   <source volume>\RBStore\<Sid>\<relative path>
- *  Example: \Device\HarddiskVolume2\Share\a.txt
- *        -> \Device\HarddiskVolume2\RBStore\S-SESSION-1\Share\a.txt
- *  This puts the target outside the protected prefix
- *  (\Device\HarddiskVolume2\Share) so the Pre callback won't recurse.
+ *   <source volume>\RBStore\<Sid>\<seq>_<basename>
+ *  Example: \Device\HarddiskVolume2\Share\sub\a.txt
+ *        -> \Device\HarddiskVolume2\RBStore\S-1-5-21-...\0000000001_a.txt
+ *
+ * FLAT layout (NOT path-preserving). The relative directory tree is
+ * intentionally not recreated under RBStore: that would require creating
+ * every intermediate directory before each rename (N create calls per
+ * delete, and any missing level fails the rename -> fail-open real
+ * delete). Flat names only need the already-created <vol>\RBStore\<sid>
+ * dir; the original path travels in the notification so user-mode can
+ * restore exactly.
  * ========================================================== */
 NTSTATUS RbfBuildStorePath(_In_ PCUNICODE_STRING SidString,
                            _In_ PCUNICODE_STRING SrcPath,
@@ -217,8 +430,11 @@ NTSTATUS RbfBuildStorePath(_In_ PCUNICODE_STRING SidString,
 {
     NTSTATUS status;
     USHORT volLen = 0;
-    UNICODE_STRING volPart, restPart, rbDir;
+    USHORT baseStart = 0;
+    UNICODE_STRING volPart, rbDir, seqPart, baseName;
     USHORT i, slashes = 0;
+    ULONG64 seq;
+    WCHAR seqBuf[64];
 
     StorePath->Buffer = ExAllocatePool2(POOL_FLAG_PAGED,
                                        RBF_MAX_PATH * sizeof(WCHAR), RBF_TAG);
@@ -233,19 +449,44 @@ NTSTATUS RbfBuildStorePath(_In_ PCUNICODE_STRING SidString,
             if (slashes == 3) break;  /* \Device\HarddiskVolumeN\... */
         }
     }
-    volLen = i; /* index of the third '\' (inclusive) */
+    volLen = i; /* index of the third '\' (exclusive: volPart excludes it) */
     if (volLen == 0 || volLen >= SrcPath->Length / sizeof(WCHAR)) {
         ExFreePoolWithTag(StorePath->Buffer, RBF_TAG);
         StorePath->Buffer = NULL;
         return STATUS_INVALID_PARAMETER;
     }
 
+    /* Base name = component after the last '\' */
+    baseStart = volLen;
+    for (i = volLen; i < SrcPath->Length / sizeof(WCHAR); i++) {
+        if (SrcPath->Buffer[i] == L'\\') baseStart = i + 1;
+    }
+    if (baseStart >= SrcPath->Length / sizeof(WCHAR)) baseStart = volLen;
+
     volPart.Buffer = SrcPath->Buffer;
     volPart.Length = volPart.MaximumLength = (USHORT)(volLen * sizeof(WCHAR));
-    restPart.Buffer = SrcPath->Buffer + volLen;  /* includes leading '\' */
-    restPart.Length = restPart.MaximumLength =
-        (USHORT)(SrcPath->Length - volPart.Length);
+    baseName.Buffer = SrcPath->Buffer + baseStart;
+    baseName.Length = baseName.MaximumLength =
+        (USHORT)(SrcPath->Length - baseStart * sizeof(WCHAR));
 
+    /* seq part: L"\<seq>_" (monotonic -> unique per boot) */
+    seq = (ULONG64)InterlockedIncrement64((volatile LONG64 *)&G.StageSeq);
+    {
+        INT di = 0, k = 0;
+        ULONG64 n = seq;
+        WCHAR tmp[32];
+
+        seqBuf[di++] = L'\\';
+        if (n == 0) {
+            seqBuf[di++] = L'0';
+        } else {
+            while (n > 0) { tmp[k++] = (WCHAR)(L'0' + (n % 10)); n /= 10; }
+            while (k > 0) seqBuf[di++] = tmp[--k];
+        }
+        seqBuf[di++] = L'_';
+        seqBuf[di] = L'\0';
+    }
+    RtlInitUnicodeString(&seqPart, seqBuf);
     RtlInitUnicodeString(&rbDir, L"\\RBStore");
 
     status = RtlAppendUnicodeStringToString(StorePath, &volPart);
@@ -254,7 +495,9 @@ NTSTATUS RbfBuildStorePath(_In_ PCUNICODE_STRING SidString,
     if (NT_SUCCESS(status))
         status = RtlAppendUnicodeStringToString(StorePath, SidString);
     if (NT_SUCCESS(status))
-        status = RtlAppendUnicodeStringToString(StorePath, &restPart);
+        status = RtlAppendUnicodeStringToString(StorePath, &seqPart);
+    if (NT_SUCCESS(status))
+        status = RtlAppendUnicodeStringToString(StorePath, &baseName);
     if (!NT_SUCCESS(status)) {
         ExFreePoolWithTag(StorePath->Buffer, RBF_TAG);
         StorePath->Buffer = NULL;
@@ -263,25 +506,103 @@ NTSTATUS RbfBuildStorePath(_In_ PCUNICODE_STRING SidString,
 }
 
 /* ============================================================
- * Async notification queue
+ * Async notification queue (bounded) + async send worker
  * ========================================================== */
 NTSTATUS RbfQueueNotify(_In_ PRBF_NOTIFICATION Note)
 {
     PRBF_NOTIFY_NODE node;
     KIRQL irql;
+    PFLT_PORT port;
 
     if (!G.QueueActive) return STATUS_DEVICE_NOT_READY;
 
+    /* Snapshot the client port under the queue lock. */
+    KeAcquireSpinLock(&G.QueueLock, &irql);
+    port = G.ClientPort;
+    KeReleaseSpinLock(&G.QueueLock, irql);
+    if (port == NULL) {
+        InterlockedIncrement64((volatile LONG64 *)&G.Stats.NotifyDropped);
+        return STATUS_PORT_DISCONNECTED;
+    }
+
     node = ExAllocatePool2(POOL_FLAG_PAGED, sizeof(RBF_NOTIFY_NODE), RBF_TAG);
-    if (!node) return STATUS_INSUFFICIENT_RESOURCES;
+    if (!node) {
+        InterlockedIncrement64((volatile LONG64 *)&G.Stats.NotifyDropped);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     RtlCopyMemory(&node->Notification, Note, sizeof(RBF_NOTIFICATION));
+    node->Port = port;
+
     KeAcquireSpinLock(&G.QueueLock, &irql);
+    if (G.QueueDepth >= RBF_QUEUE_MAX) {
+        KeReleaseSpinLock(&G.QueueLock, irql);
+        InterlockedIncrement64((volatile LONG64 *)&G.Stats.NotifyQueueFull);
+        ExFreePoolWithTag(node, RBF_TAG);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     InsertTailList(&G.NotifyQueue, &node->Entry);
+    G.QueueDepth++;
+    if (G.QueueDepth > G.MaxQueueDepth) G.MaxQueueDepth = G.QueueDepth;
+    G.Stats.QueueDepth = G.QueueDepth;
+    G.Stats.MaxQueueDepth = G.MaxQueueDepth;
     KeReleaseSpinLock(&G.QueueLock, irql);
 
+    /* Wake the send thread. */
     KeSetEvent(&G.NotifyEvent, IO_NO_INCREMENT, FALSE);
     return STATUS_SUCCESS;
+}
+
+/* Dedicated system thread that drains the queue via FltSendMessage.
+   FltSendMessage may block while user-mode is slow; a bounded queue
+   upstream protects us, and this thread never touches the I/O path. */
+VOID RbfSendThread(_In_ PVOID Context)
+{
+    UNREFERENCED_PARAMETER(Context);
+
+    while (G.QueueActive) {
+        KeWaitForSingleObject(&G.NotifyEvent, Executive, KernelMode,
+                              FALSE, NULL);
+        if (!G.QueueActive)
+            break;
+
+        while (1) {
+            PRBF_NOTIFY_NODE node;
+            PFLT_PORT port;
+            NTSTATUS status;
+            KIRQL irql;
+
+            KeAcquireSpinLock(&G.QueueLock, &irql);
+            if (IsListEmpty(&G.NotifyQueue)) {
+                KeReleaseSpinLock(&G.QueueLock, irql);
+                break;
+            }
+            node = CONTAINING_RECORD(RemoveHeadList(&G.NotifyQueue),
+                                     RBF_NOTIFY_NODE, Entry);
+            G.QueueDepth--;
+            G.Stats.QueueDepth = G.QueueDepth;
+            port = node->Port;
+            KeReleaseSpinLock(&G.QueueLock, irql);
+
+            {
+                /* 30 s relative timeout: prevents the send thread from
+                   blocking forever if user-mode stops reading but the
+                   port is still open. */
+                LARGE_INTEGER timeout;
+                timeout.QuadPart = -30LL * 10 * 1000 * 1000; /* 100ns units */
+                status = FltSendMessage(G.Filter, &port,
+                                        &node->Notification, sizeof(RBF_NOTIFICATION),
+                                        NULL, NULL, &timeout);
+            }
+            if (NT_SUCCESS(status)) {
+                InterlockedIncrement64((volatile LONG64 *)&G.Stats.NotifySent);
+            } else {
+                InterlockedIncrement64((volatile LONG64 *)&G.Stats.NotifyDropped);
+            }
+            ExFreePoolWithTag(node, RBF_TAG);
+        }
+    }
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 VOID RbfFlushQueue(VOID)
@@ -296,6 +617,7 @@ VOID RbfFlushQueue(VOID)
         }
         node = CONTAINING_RECORD(RemoveHeadList(&G.NotifyQueue),
                                  RBF_NOTIFY_NODE, Entry);
+        G.QueueDepth--;
         KeReleaseSpinLock(&G.QueueLock, irql);
         ExFreePoolWithTag(node, RBF_TAG);
     }
@@ -331,6 +653,16 @@ NTSTATUS RbfUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags)
 {
     UNREFERENCED_PARAMETER(Flags);
     G.QueueActive = FALSE;
+
+    /* Wake and wait for the send thread to exit. */
+    KeSetEvent(&G.NotifyEvent, IO_NO_INCREMENT, FALSE);
+    if (G.SendThreadHandle) {
+        KeWaitForSingleObject(G.SendThreadHandle, Executive, KernelMode,
+                              FALSE, NULL);
+        ZwClose(G.SendThreadHandle);
+        G.SendThreadHandle = NULL;
+    }
+
     RbfFlushQueue();
     if (G.ServerPort) FltCloseCommunicationPort(G.ServerPort);
     if (G.Filter)     FltUnregisterFilter(G.Filter);
@@ -353,7 +685,12 @@ NTSTATUS RbfPortConnect(
     UNREFERENCED_PARAMETER(ConnectionContext);
     UNREFERENCED_PARAMETER(SizeOfContext);
     UNREFERENCED_PARAMETER(ConnectionPortCookie);
-    G.ClientPort = ClientPort;
+    {
+        KIRQL irql;
+        KeAcquireSpinLock(&G.QueueLock, &irql);
+        G.ClientPort = ClientPort;
+        KeReleaseSpinLock(&G.QueueLock, irql);
+    }
     DbgPrint("[RBF] User-mode service connected\n");
     return STATUS_SUCCESS;
 }
@@ -361,8 +698,42 @@ NTSTATUS RbfPortConnect(
 VOID RbfPortDisconnect(_In_opt_ PVOID ConnectionCookie)
 {
     UNREFERENCED_PARAMETER(ConnectionCookie);
-    G.ClientPort = NULL;
+    {
+        KIRQL irql;
+        KeAcquireSpinLock(&G.QueueLock, &irql);
+        G.ClientPort = NULL;
+        KeReleaseSpinLock(&G.QueueLock, irql);
+    }
     DbgPrint("[RBF] User-mode service disconnected\n");
+}
+
+/* Handle user-mode -> driver commands (RBF_CMD_QUERY_STATS). */
+NTSTATUS RbfPortMessage(
+    _In_ PFLT_PORT ClientPort,
+    _In_opt_ PVOID ServerPortCookie,
+    _In_reads_bytes_opt_(InputBufferLength) PVOID InputBuffer,
+    _In_ ULONG InputBufferLength,
+    _Out_writes_bytes_opt_(OutputBufferLength) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferLength,
+    _Out_ PULONG ReturnOutputBufferLength)
+{
+    PRBF_REPLY reply;
+    UNREFERENCED_PARAMETER(ClientPort);
+    UNREFERENCED_PARAMETER(ServerPortCookie);
+
+    if (ReturnOutputBufferLength) *ReturnOutputBufferLength = 0;
+    if (!InputBuffer || InputBufferLength < sizeof(RBF_REPLY))
+        return STATUS_INVALID_PARAMETER;
+
+    reply = (PRBF_REPLY)InputBuffer;
+    if (reply->Ack == RBF_CMD_QUERY_STATS) {
+        if (OutputBufferLength < sizeof(RBF_STATS))
+            return STATUS_BUFFER_TOO_SMALL;
+        RtlCopyMemory(OutputBuffer, &G.Stats, sizeof(RBF_STATS));
+        if (ReturnOutputBufferLength) *ReturnOutputBufferLength = sizeof(RBF_STATS);
+        return STATUS_SUCCESS;
+    }
+    return STATUS_INVALID_DEVICE_REQUEST;
 }
 
 /* ============================================================
@@ -381,7 +752,6 @@ RbfPreSetInfo(
     RBF_NOTIFICATION              note = {0};
     NTSTATUS                      status;
     ULONG                         sessionId = 0;
-    BOOLEAN                       isRemote = FALSE;
 
     UNREFERENCED_PARAMETER(CompletionContext);
 
@@ -395,13 +765,13 @@ RbfPreSetInfo(
     if (!dispInfo->DeleteFile)
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
-    /* 2. Only intercept remote sessions (SessionId != 0) */
+    /* 2. Path-based policy: intercept ANY delete hitting a protected
+       prefix (local or remote). SMB2 deletes are executed by srv2.sys in
+       session 0, so RequestorSessionId is 0 even for remote clients and
+       cannot be used as a discriminator; we only record it for audit. */
     status = FltGetRequestorSessionId(Data, &sessionId);
-    if (NT_SUCCESS(status) && sessionId != 0) {
-        isRemote = TRUE;
-    }
-    if (!isRemote)
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!NT_SUCCESS(status))
+        sessionId = 0;
 
     /* 3. Get path */
     status = FltGetFileNameInformation(
@@ -419,10 +789,23 @@ RbfPreSetInfo(
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    /* 5. Get requestor SID placeholder (SessionId-based, user-mode resolves) */
+    InterlockedIncrement64((volatile LONG64 *)&G.Stats.Intercepts);
+
+    /* 5. Get requestor SID: real client SID from the requestor token
+       (SMB impersonates the client user), placeholder fallback. */
     UNICODE_STRING sidStr = {0};
     status = RbfGetRequestorSid(Data, sessionId, &sidStr);
     if (!NT_SUCCESS(status)) {
+        FltReleaseFileNameInformation(nameInfo);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    /* 5.5 Ensure staging directories exist: <vol>\RBStore and <vol>\RBStore\<sid> */
+    status = RbfEnsureStoreDir(&nameInfo->Volume, &sidStr);
+    if (!NT_SUCCESS(status)) {
+        /* Cannot stage -> fail-open (allow real delete). */
+        DbgPrint("[RBF] ensure store dir failed 0x%X, allowing real delete\n", status);
+        ExFreePoolWithTag(sidStr.Buffer, RBF_TAG);
         FltReleaseFileNameInformation(nameInfo);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
@@ -439,6 +822,7 @@ RbfPreSetInfo(
     status = RbfMoveToStore(FltObjects, FltObjects->FileObject, &storePath);
     if (NT_SUCCESS(status)) {
         /* Success: complete the original DELETE as success */
+        InterlockedIncrement64((volatile LONG64 *)&G.Stats.RenameOk);
         Data->IoStatus.Status      = STATUS_SUCCESS;
         Data->IoStatus.Information = 0;
 
@@ -468,7 +852,8 @@ RbfPreSetInfo(
         return FLT_PREOP_COMPLETE;
     }
 
-    /* Failure: allow real delete (fail-open), just log */
+    /* Failure: allow real delete (fail-open), just log + count */
+    InterlockedIncrement64((volatile LONG64 *)&G.Stats.RenameFail);
     DbgPrint("[RBF] rename failed 0x%X, allowing real delete\n", status);
     ExFreePoolWithTag(storePath.Buffer, RBF_TAG);
     if (sidStr.Buffer) ExFreePoolWithTag(sidStr.Buffer, RBF_TAG);
@@ -515,9 +900,10 @@ NTSTATUS DriverEntry(
     RtlZeroMemory(&G, sizeof(G));
     KeInitializeSpinLock(&G.QueueLock);
     InitializeListHead(&G.NotifyQueue);
-    KeInitializeEvent(&G.NotifyEvent, NotificationEvent, FALSE);
+    KeInitializeEvent(&G.NotifyEvent, SynchronizationEvent, FALSE);
     G.QueueActive = TRUE;
     G.ClientPort = NULL;
+    G.SendThreadHandle = NULL;
 
     /* Default StoreRoot (reserved, paths derived from source volume) */
     RtlInitUnicodeString(&G.StoreRoot, L"\\??\\C:\\RBStore");
@@ -537,9 +923,24 @@ NTSTATUS DriverEntry(
                                NULL, sd);
     status = FltCreateCommunicationPort(
         G.Filter, &G.ServerPort, &oa, NULL,
-        RbfPortConnect, RbfPortDisconnect, NULL, 1);
+        RbfPortConnect, RbfPortDisconnect,
+        (PFLT_MESSAGE_NOTIFY)RbfPortMessage, 1);
     FltFreeSecurityDescriptor(sd);
-    if (!NT_SUCCESS(status)) { FltUnregisterFilter(G.Filter); RbfFreeConfig(); return status; }
+    if (!NT_SUCCESS(status)) {
+        FltUnregisterFilter(G.Filter);
+        RbfFreeConfig();
+        return status;
+    }
+
+    /* Dedicated async notification sender thread (single consumer). */
+    status = PsCreateSystemThread(&G.SendThreadHandle, THREAD_ALL_ACCESS,
+                                  NULL, NULL, NULL, RbfSendThread, NULL);
+    if (!NT_SUCCESS(status)) {
+        FltCloseCommunicationPort(G.ServerPort);
+        FltUnregisterFilter(G.Filter);
+        RbfFreeConfig();
+        return status;
+    }
 
     /* Altitude string (some WDK versions require it in registry; INF already sets it) */
     RtlInitUnicodeString(&altitude, RBF_ALTITUDE);
@@ -547,6 +948,12 @@ NTSTATUS DriverEntry(
 
     status = FltStartFiltering(G.Filter);
     if (!NT_SUCCESS(status)) {
+        G.QueueActive = FALSE;
+        KeSetEvent(&G.NotifyEvent, IO_NO_INCREMENT, FALSE);
+        KeWaitForSingleObject(G.SendThreadHandle, Executive, KernelMode,
+                              FALSE, NULL);
+        ZwClose(G.SendThreadHandle);
+        G.SendThreadHandle = NULL;
         FltCloseCommunicationPort(G.ServerPort);
         FltUnregisterFilter(G.Filter);
         RbfFreeConfig();

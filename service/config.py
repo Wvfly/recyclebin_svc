@@ -9,12 +9,15 @@ REG_KEY = r"SOFTWARE\RecycleBin"
 
 DEFAULTS = {
     "StoreRoot": r"C:\RBStore",
-    "QuotaMB": 5120,            # 每用户配额(MB)
+    "QuotaMB": 5120,            # 每用户回收站配额(MB)
     "RetentionDays": 30,        # 保留天数
     "EnableRestApi": 0,         # 是否开启管理 API
     "RestApiPort": 8800,        # 管理 API 端口
+    "RestApiToken": "",         # REST 访问令牌 (X-Auth-Token, 空则不鉴权)
+    "DiskFreeMinMB": 5120,      # 暂存区所在卷剩余空间水位(MB), 低于则启动清理
+    "StagedBatch": 500,         # 维护线程每轮落地暂存条目的批大小
     "PortName": r"\RecycleBinPort",
-    # 受保护共享根 (NT 风格或 DOS 风格均可, 驱动内部归一)
+    # 受保护共享根 (DOS 形式; 驱动侧使用 NT 形式, 由 deploy.ps1 转换写入)
     "ProtectedPaths": [r"D:\Share", r"E:\Public"],
 }
 
@@ -54,10 +57,14 @@ def load_config():
     v = _read_reg_str(key, "StoreRoot")
     if v:
         cfg["StoreRoot"] = v
-    for name in ("QuotaMB", "RetentionDays", "EnableRestApi", "RestApiPort"):
+    for name in ("QuotaMB", "RetentionDays", "EnableRestApi", "RestApiPort",
+                 "DiskFreeMinMB", "StagedBatch"):
         d = _read_reg_dword(key, name)
         if d is not None:
             cfg[name] = d
+    v = _read_reg_str(key, "RestApiToken")
+    if v is not None:
+        cfg["RestApiToken"] = v
     return cfg
 
 # 供其它模块直接 import

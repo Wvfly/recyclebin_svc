@@ -20,15 +20,15 @@ if not exist Build mkdir Build
 
 echo === Compiling rbminiflt.c ===
 if "%CFG%"=="Debug" (
-    %BIN%\cl.exe /c /kernel /W4 /wd4324 /Zi /Od /D_AMD64_ /D_WIN64 /FoBuild\rbminiflt_dbg.obj rbminiflt.c
+    "%BIN%\cl.exe" /c /kernel /W4 /wd4324 /Zi /Od /D_AMD64_ /D_WIN64 /FoBuild\rbminiflt_dbg.obj rbminiflt.c
     if errorlevel 1 goto :err
     echo === Linking rbminiflt.sys (Debug + PDB) ===
-    %BIN%\link.exe /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /DEBUG /PDB:rbminiflt.pdb /OUT:rbminiflt.sys Build\rbminiflt_dbg.obj fltMgr.lib ntoskrnl.lib BufferOverflowK.lib
+    "%BIN%\link.exe" /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /DEBUG /PDB:rbminiflt.pdb /OUT:rbminiflt.sys Build\rbminiflt_dbg.obj fltMgr.lib ntoskrnl.lib BufferOverflowK.lib
 ) else (
-    %BIN%\cl.exe /c /kernel /W4 /wd4324 /O2 /D_AMD64_ /D_WIN64 /FoBuild\rbminiflt.obj rbminiflt.c
+    "%BIN%\cl.exe" /c /kernel /W4 /wd4324 /O2 /D_AMD64_ /D_WIN64 /FoBuild\rbminiflt.obj rbminiflt.c
     if errorlevel 1 goto :err
     echo === Linking rbminiflt.sys (Release) ===
-    %BIN%\link.exe /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /RELEASE /OUT:rbminiflt.sys Build\rbminiflt.obj fltMgr.lib ntoskrnl.lib BufferOverflowK.lib
+    "%BIN%\link.exe" /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /RELEASE /OUT:rbminiflt.sys Build\rbminiflt.obj fltMgr.lib ntoskrnl.lib BufferOverflowK.lib
 )
 if errorlevel 1 goto :err
 

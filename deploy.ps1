@@ -1,54 +1,116 @@
 # deploy.ps1 - 部署 RecycleBin for SMB
 # 以管理员 PowerShell 运行
-# 用途: 创建暂存区目录、安装驱动、注册用户态服务
-
+# 用途: 创建暂存区目录、写入配置(驱动+用户态)、安装驱动、注册用户态服务
 $ErrorActionPreference = "Stop"
 
 $Root   = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $DriverDir = Join-Path $Root "driver"
 $SvcDir    = Join-Path $Root "service"
 
-# 受保护共享根 (DOS 形式), 部署时解析为 NT 卷路径写入注册表
+# ============================================================
+# 配置 (可按环境修改)
+# ============================================================
+# 受保护共享根 (DOS 形式), 部署时解析为 NT 卷路径写入驱动注册表
 $ProtectedDos = @("D:\Share", "E:\Public")
+# 用户态配置 (HKLM\SOFTWARE\RecycleBin)
+$UserCfg = @{
+    StoreRoot     = "C:\RBStore"      # 元数据库存放位置 (落地目标为同卷 $Recycle.Bin)
+    QuotaMB       = 5120              # 每用户回收站配额 (MB)
+    RetentionDays = 30                # 保留天数
+    EnableRestApi = 1                 # 开启管理 REST API
+    RestApiPort   = 8800
+    RestApiToken  = "change-me"       # REST 访问令牌 (留空则不鉴权)
+    DiskFreeMinMB = 5120              # 磁盘剩余水位 (MB), 低于则启动清理
+}
 
-function DosToNt($dos) {
-    # D:\Share -> \Device\HarddiskVolumeN\Share
+# ============================================================
+# 路径转换: D:\Share -> \Device\HarddiskVolumeN\Share
+# 用 QueryDosDevice 获得盘符对应的 NT 设备名, 与驱动内
+# FltGetFileNameInformation(NORMALIZED) 输出的路径形式一致。
+# ============================================================
+Add-Type @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class DosPath {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern uint QueryDosDevice(string lpDeviceName,
+                                             StringBuilder lpTargetPath,
+                                             uint ucchMax);
+}
+"@
+
+function DosToNt([string]$dos) {
     if ($dos -match '^([A-Za-z]):\\(.*)$') {
         $drive = $Matches[1] + ":"
-        $rest  = $Matches[2]
-        $vol = (Get-Item "FileSystem::$drive").Target
-        # Target 形如 \\?\Volume{guid}\
-        $dev = (Get-CimInstance Win32_Volume | Where-Object { $_.DriveLetter -eq $drive } |
-                Select-Object -First 1).DeviceID
-        # DeviceID 形如 \\?\Volume{guid}\
-        # 转为 \Device\HarddiskVolumeN\ 需查询; 简化用 GLOBALROOT 形式
-        $nt = "\GLOBALROOT$dev$rest" -replace '\\\\', '\'
-        return $nt
+        $sb = New-Object System.Text.StringBuilder 1024
+        [void][DosPath]::QueryDosDevice($drive, $sb, 1024)
+        $dev = $sb.ToString()
+        if ([string]::IsNullOrEmpty($dev)) {
+            Write-Warning "无法解析盘符 $drive 的设备路径 (挂载点?), 原样使用: $dos"
+            return $dos
+        }
+        # dev 形如 \Device\HarddiskVolume3; 组合成 NT 路径
+        $rest = $Matches[2]
+        if ($rest) { return "$dev\$rest" }
+        return $dev
     }
     return $dos
 }
 
-Write-Host "[1/4] 解析受保护路径并写入注册表"
-$NtPaths = $ProtectedDos | ForEach-Object { DosToNt $_ }
-$regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\rbminiflt\Parameters"
-if (-not (Test-Path $regPath)) { New-Item -Force $regPath | Out-Null }
-Set-ItemProperty $regPath "ProtectedPaths" $NtPaths -Type MultiString
+function Ensure-RegKey([string]$path) {
+    if (-not (Test-Path $path)) { New-Item -Force $path | Out-Null }
+}
 
-Write-Host "[2/4] 安装内核驱动 (rbminiflt.inf)"
+Write-Host "[1/5] 解析受保护路径并写入注册表"
+$NtPaths = $ProtectedDos | ForEach-Object { DosToNt $_ }
+$drvReg = "HKLM:\SYSTEM\CurrentControlSet\Services\rbminiflt\Parameters"
+Ensure-RegKey $drvReg
+Set-ItemProperty $drvReg "ProtectedPaths" ([string[]]$NtPaths) -Type MultiString
+Write-Host "  ProtectedPaths:"
+$NtPaths | ForEach-Object { Write-Host "    $_" }
+
+$userReg = "HKLM:\SOFTWARE\RecycleBin"
+Ensure-RegKey $userReg
+Set-ItemProperty $userReg "ProtectedPaths" ([string[]]$ProtectedDos) -Type MultiString
+foreach ($k in $UserCfg.Keys) {
+    $v = $UserCfg[$k]
+    if ($v -is [int]) { Set-ItemProperty $userReg $k $v -Type DWord }
+    else              { Set-ItemProperty $userReg $k ([string]$v) -Type String }
+}
+Write-Host "  用户态配置已写入 $userReg"
+
+Write-Host "[2/5] 创建暂存区根目录"
+$storeRoot = $UserCfg["StoreRoot"]
+if (-not (Test-Path $storeRoot)) {
+    New-Item -ItemType Directory -Force $storeRoot | Out-Null
+    # 隐藏 + 系统属性, 避免共享用户看到
+    $attrib = (Get-ItemProperty -Path $storeRoot -Name Attributes -ErrorAction SilentlyContinue).Attributes
+    Set-ItemProperty -Path $storeRoot -Name Attributes -Value ($attrib -bor 0x2 -bor 0x4)
+}
+Write-Host "  StoreRoot: $storeRoot"
+
+Write-Host "[3/5] 安装内核驱动 (rbminiflt.inf)"
 $inf = Join-Path $DriverDir "rbminiflt.inf"
-$sys = Join-Path $DriverDir "x64\Release\rbminiflt.sys"
+# build.cmd 输出在 driver\ 根目录; VS 输出在 x64\Release\ 目录, 两者都兼容
+$sys = Join-Path $DriverDir "rbminiflt.sys"
+if (-not (Test-Path $sys)) {
+    $alt = Join-Path $DriverDir "x64\Release\rbminiflt.sys"
+    if (Test-Path $alt) { $sys = $alt }
+}
 if (Test-Path $sys) {
     Copy-Item $sys "$env:SystemRoot\system32\drivers\rbminiflt.sys" -Force
 } else {
-    Write-Warning "未找到 rbminiflt.sys, 请先编译驱动 (VS + WDK)"
+    Write-Warning "未找到 rbminiflt.sys, 请先编译驱动 (driver\build.cmd Release)"
 }
+# pnputil 从 INF 同目录解析源文件, 确保 sys 在 driver\ 下
 pnputil /add-driver $inf /install | Out-Null
 Write-Host "  驱动已注册 (Altitude 370030)"
 
-Write-Host "[3/4] 启动驱动"
+Write-Host "[4/5] 启动驱动"
 try { sc.exe start rbminiflt } catch { Write-Warning "驱动启动失败, 检查签名/测试模式" }
 
-Write-Host "[4/4] 注册用户态服务为 SYSTEM 自启"
+Write-Host "[5/5] 注册用户态服务为 SYSTEM 自启"
 $py = (Get-Command python).Source
 $svcBin = Join-Path $SvcDir "rb_service.py"
 sc.exe create RecycleBinSvc binPath= "`"$py`" `"$svcBin`" run" type= own start= auto obj= LocalSystem
