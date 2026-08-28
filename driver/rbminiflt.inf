@@ -1,0 +1,64 @@
+;
+; rbminiflt.inf - 纯文件系统 Mini-Filter 驱动安装信息
+; 注意: 这是 Mini-Filter, 不是 KMDF, 不要包含 [*.NT.Wdf] 段
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = "ActivityMonitor"        ; Mini-Filter 所属类
+ClassGuid   = {b86dff51-a1b9-4a26-abc7-7f6c5c8c7e12}
+Provider    = %ManufacturerName%
+DriverVer   = 08/28/2026,1.0.0.0
+CatalogFile = rbminiflt.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12                   ; %windir%\system32\drivers
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+rbminiflt.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...16299
+
+[Standard.NT$ARCH$.10.0...16299]
+%rbminiflt.DeviceDesc% = rbminiflt_Device, root\rbminiflt
+
+[rbminiflt_Device.NT]
+CopyFiles = File_Copy
+
+[File_Copy]
+rbminiflt.sys
+
+; ---- 服务安装 ----
+[rbminiflt_Device.NT.Services]
+AddService = rbminiflt,, rbminiflt_Service_Inst
+
+[rbminiflt_Service_Inst]
+DisplayName    = %rbminiflt.SVCDESC%
+ServiceType    = 2                    ; SERVICE_FILE_SYSTEM_DRIVER
+StartType      = 1                    ; SERVICE_SYSTEM_START (随系统启动)
+ErrorControl   = 1                    ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\rbminiflt.sys
+Dependencies   = FltMgr
+
+; ---- Mini-Filter 实例 / Altitude 注册 ----
+; Altitude 370030 属于 Activity Monitor 范围
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\rbminiflt]
+"Altitude" = "370030"
+"Flags" = 0x0
+
+; ---- 配置参数 (受保护路径 / 暂存区) ----
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\rbminiflt\Parameters]
+; 受保护共享根 (REG_MULTI_SZ), 例: D:\Share
+; "ProtectedPaths"=hex(7):...  由安装脚本或手动填写
+"StoreRoot" = "C:\\RBStore"
+
+[Strings]
+ManufacturerName = "RecycleBin for SMB"
+DiskName         = "rbminiflt Installation Disk"
+rbminiflt.DeviceDesc = "RecycleBin Mini-Filter Driver"
+rbminiflt.SVCDESC   = "RecycleBin for SMB File Share Driver"
