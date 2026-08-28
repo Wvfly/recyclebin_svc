@@ -361,3 +361,30 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# ==================================================================
+# RecycleBin for SMB - project-specific build artifacts
+# ==================================================================
+
+# Compiled driver binary (built by driver\build.cmd)
+*.sys
+
+# Compiled service binaries (service_c\rbservice.exe, service_go\rbapi.exe)
+*.exe
+
+# Generated at build time by db\gen_schema.ps1 from db\schema.sql.
+# schema.sql is the source of truth; this header is derived output.
+service_c/schema_sql.h
+
+# Third-party SQLite amalgamation (~9 MB).
+# Not vendored: build.cmd downloads it if missing. See service_c\build.cmd.
+service_c/sqlite3.c
+service_c/sqlite3.h
+
+# Build noise accidentally captured from shell redirection (not a symbol list)
+driver/syms.txt
+
+# Runtime data
+*.db
+*.db-wal
+*.db-shm

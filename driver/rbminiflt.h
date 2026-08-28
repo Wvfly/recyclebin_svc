@@ -1,8 +1,14 @@
 /*
  * rbminiflt.h - Shared constants and driver<->user mode message structures
  *
- * The user-mode service (rb_service.py) mirrors RBF_NOTIFICATION / RBF_REPLY /
- * RBF_STATS using ctypes (field layout must match exactly).
+ * The user-mode service (service_c/rbservice.exe) mirrors RBF_NOTIFICATION /
+ * RBF_REPLY / RBF_STATS in service_c/rbf_protocol.h, which carries compile-time
+ * static asserts on the byte layout. Change a struct here and the service fails
+ * to BUILD rather than silently mis-parsing notifications at runtime.
+ *
+ * Note: rbf_protocol.h cannot simply #include this file because ntifs.h /
+ * fltKernel.h are kernel-only. Keep the two wire structs in sync; the asserts
+ * in rbf_protocol.h enforce it.
  */
 #ifndef _RBMINIFLT_H_
 #define _RBMINIFLT_H_

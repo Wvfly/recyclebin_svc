@@ -1,9 +1,21 @@
 # Bugfix 报告
 
 - 项目：Windows 文件共享回收站 (RecycleBin for SMB)
-- 范围：内核 Mini-Filter 驱动 (`rbminiflt`) + 用户态服务 (Python) + 部署脚本
+- 范围：内核 Mini-Filter 驱动 (`rbminiflt`) + 用户态服务 + 部署脚本
 - 日期：2026-08-28
-- 结论：驱动 Release 构建零错误零警告（`rbminiflt.sys` 15360B），Python 模块编译通过，关键格式/逻辑均已验证
+- 结论：驱动 Release 构建零错误零警告（`rbminiflt.sys` 15360B），关键格式/逻辑均已验证
+
+> **📌 历史说明**
+>
+> 本报告记录的是对**初版 Python 实现**（原 `service/rb_service.py`、
+> `service/recyclebin_lib.py`、`service/config.py`）的修复。
+>
+> 该 Python 实现**已被移除**，用户态已用 C（`service_c/rbservice.exe`）
+> 重写，管理 API 用 Go（`service_go/rbapi.exe`）实现。
+>
+> 下列修复中**与语言无关的设计结论**（扁平化暂存目录、真实 SID 获取、
+> `$I` v1 格式、多卷水位、同卷 rename 约束等）已在 C 版中保留并延续；
+> 涉及具体文件名/代码位置的部分仅作历史参考。
 
 ---
 

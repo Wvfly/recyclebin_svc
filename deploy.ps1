@@ -1,11 +1,10 @@
 # deploy.ps1 - 部署 RecycleBin for SMB
 # 以管理员 PowerShell 运行
-# 用途: 创建暂存区目录、写入配置(驱动+用户态)、安装驱动、注册用户态服务
+# 用途: 创建暂存区目录、写入配置、安装驱动、注册核心服务(C)与管理 API(Go)
 $ErrorActionPreference = "Stop"
 
 $Root   = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $DriverDir = Join-Path $Root "driver"
-$SvcDir    = Join-Path $Root "service"
 
 # ============================================================
 # 配置 (可按环境修改)
@@ -110,11 +109,38 @@ Write-Host "  驱动已注册 (Altitude 370030)"
 Write-Host "[4/5] 启动驱动"
 try { sc.exe start rbminiflt } catch { Write-Warning "驱动启动失败, 检查签名/测试模式" }
 
-Write-Host "[5/5] 注册用户态服务为 SYSTEM 自启"
-$py = (Get-Command python).Source
-$svcBin = Join-Path $SvcDir "rb_service.py"
-sc.exe create RecycleBinSvc binPath= "`"$py`" `"$svcBin`" run" type= own start= auto obj= LocalSystem
-sc.exe description RecycleBinSvc "RecycleBin for SMB - 远程删除拦截回收站服务"
-sc.exe start RecycleBinSvc
+Write-Host "[5/6] 安装核心服务 rbservice.exe (C, SYSTEM 自启)"
+$CsvcDir = Join-Path $Root "service_c"
+$coreBin = Join-Path $CsvcDir "rbservice.exe"
+if (-not (Test-Path $coreBin)) {
+    Write-Warning "未找到 rbservice.exe, 请先编译 (service_c\build.cmd Release)"
+} else {
+    sc.exe create RecycleBinSvc binPath= "`"$coreBin`"" type= own start= auto obj= LocalSystem
+    sc.exe description RecycleBinSvc "RecycleBin for SMB - 删除拦截核心服务 (落地/配额/还原)"
+    # 崩溃后自动重启, 避免服务掉线产生无法落地的孤儿文件
+    sc.exe failure RecycleBinSvc reset= 86400 actions= restart/5000/restart/10000/restart/30000
+    sc.exe start RecycleBinSvc
+}
+
+Write-Host "[6/6] 安装管理 API rbapi.exe (Go, 可选)"
+$ApiDir = Join-Path $Root "service_go"
+$apiBin = Join-Path $ApiDir "rbapi.exe"
+if (-not (Test-Path $apiBin)) {
+    Write-Warning "未找到 rbapi.exe, 跳过 REST API (cd service_go; go build -o rbapi.exe .)"
+} elseif ($UserCfg["EnableRestApi"] -ne 1) {
+    Write-Host "  EnableRestApi=0, 跳过 REST API 安装"
+} else {
+    $port = $UserCfg["RestApiPort"]
+    sc.exe create RecycleBinApi binPath= "`"$apiBin`" --addr 127.0.0.1:$port" type= own start= auto obj= LocalSystem
+    sc.exe description RecycleBinApi "RecycleBin for SMB - 管理 REST API"
+    sc.exe failure RecycleBinApi reset= 86400 actions= restart/5000/restart/10000/restart/30000
+    sc.exe start RecycleBinApi
+    Write-Host "  REST API 已启动: http://127.0.0.1:$port"
+}
 
 Write-Host "部署完成。"
+Write-Host ""
+Write-Host "验证:"
+Write-Host "  sc.exe query RecycleBinSvc"
+Write-Host "  sc.exe query RecycleBinApi"
+Write-Host "  Invoke-RestMethod http://127.0.0.1:$($UserCfg['RestApiPort'])/health -Headers @{'X-Auth-Token'='$($UserCfg['RestApiToken'])'}"

@@ -38,12 +38,31 @@
 
 ## 5. 用户态职责
 
-- `rb_service.py`: 端口读线程 + 维护线程
-- `recyclebin_lib.py`:
-  - 把 `\RBStore` 文件落地为标准 `$Recycle.Bin\<SID>\$Rxxxx` + `$Ixxxx`
-  - 用 WTS 把内核传来的 `S-SESSION-<id>` 解析为真实用户 SID
-  - 配额 (`QuotaMB`) 与过期 (`RetentionDays`) 清理
-  - SQLite 元数据: 谁、什么文件、何时、从哪台机器删的
+用户态由**两个独立进程**组成，通过共享 SQLite 协作（详见 `README.md` 架构章节）：
+
+```
+rbservice.exe (C, SYSTEM)          rbapi.exe (Go, 可选)
+  端口读线程 + 维护线程                只读查询 + 命令入队
+  唯一的文件系统写者                    从不碰文件系统
+        │                                   │
+        └──────────► recycle.db ◄───────────┘
+                     (WAL, 单写者)
+```
+
+**`rbservice.exe` (C)** — 核心，必须运行：
+- 读内核端口通知 → 写 SQLite (`status=staged`)
+- 维护线程：暂存区 → 同卷 `$Recycle.Bin\<SID>\$Rxxxx` + `$Ixxxx`
+- 用 TokenUser/WTS 取真实用户 SID
+- 配额 / 过期 / 多卷磁盘水位清理
+- 执行 `ops` 表里的还原命令（Go 侧只入队）
+- 优雅停机：收到 STOP 后跑最后一轮落地，避免孤儿文件
+
+**`rbapi.exe` (Go)** — 管理 API，`EnableRestApi=1` 时才装：
+- 只读查询 `items`（以 `mode=ro` 打开，物理上无法改坏元数据）
+- 还原请求写入 `ops` 表，由 C 侧执行并回写状态
+
+> 原 Python 实现 (`service/`) 已移除。C 版带来三个关键改进：
+> 真正的 SCM 服务（优雅停机）、零运行时依赖、协议结构编译期校验。
 
 ## 6. 已知限制 / 后续
 

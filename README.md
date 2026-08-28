@@ -59,12 +59,36 @@
             6. 异步入队通知 → 通信端口 \RecycleBinPort
                               │
                               ▼
-        RecycleBinSvc (SYSTEM 服务, Python)
+        RecycleBinSvc = rbservice.exe (C, SYSTEM, 唯一文件系统写者)
            - 读端口通知 → 写 SQLite 元数据 (status=staged)
            - 维护线程(30s): 暂存区 → 同卷 $Recycle.Bin (status=landed)
            - 配额 / 过期 / 多卷磁盘水位清理
-           - 可选 REST 管理 API (127.0.0.1)
+           - 消费 ops 表执行还原
+           - 优雅停机: STOP 前跑最后一轮落地
+                              │
+                              ▼
+                        recycle.db (SQLite, WAL)
+                              ▲
+                              │  只读查询 + ops 入队
+        RecycleBinApi = rbapi.exe (Go, 可选, 127.0.0.1)
+           - 从不碰文件系统
 ```
+
+### 两个服务如何解耦
+
+采用**共享 SQLite + 独立进程**：
+
+| 契约 | 保障机制 |
+|---|---|
+| 进程隔离 | 一方崩溃不影响另一方；Go 挂了 C 照常拦截 |
+| 文件系统 | Go 以 `mode=ro` 打开 `items`，**物理上无法改坏元数据** |
+| 命令传递 | Go 往 `ops` 表插入请求，C 执行并回写 `state`/`message` |
+| 业务规则 | 「能否还原」只由 C 判断，Go 不复制该逻辑 |
+| DB schema | `db/schema.sql` 唯一真相；C 建表，Go 启动时校验 |
+| 版本一致 | `user_version` 校验，不匹配**两侧都拒绝启动** |
+
+> 解耦换来了进程级稳定性，代价是引入数据契约。上面后三行就是把这个契约
+> 从「运行期静默失败」拉回「启动期快速失败」的机制。
 
 ### 为什么是「内核 rename + COMPLETE」而不是「问用户态」
 
@@ -126,11 +150,26 @@ recyclebin_svc/
     rbminiflt.vcxproj           驱动工程
     build.cmd                   命令行构建脚本
     syms.txt                    符号导出清单
-  service/                    用户态 SYSTEM 服务 (Python 3.10+)
-    rb_service.py               服务主程序 (端口读线程 + 维护线程 + REST)
-    recyclebin_lib.py           回收站落地 / $I 元数据 / 配额 / 还原
-    config.py                   配置加载 (注册表优先, 回退内置默认)
-    requirements.txt
+  service_c/                  核心服务 (C, SYSTEM, 零依赖)
+    rbservice.c                 SCM 入口 + 优雅停机 + 维护线程
+    rbdb.c                      SQLite 封装 (WAL, 单写者)
+    rbstore.c                   $Recycle.Bin 落地 + $I 元数据
+    rbpolicy.c                  配额 / 过期 / 多卷水位
+    rbrestore.c                 还原执行 + ops 队列消费
+    rbport.c                    内核通信端口读取
+    rbvol.c                     NT<->DOS 卷映射 + SID 解析
+    rbconfig.c                  注册表配置
+    rblog.c                     Windows 事件日志
+    rbf_protocol.h              协议结构 + 编译期布局断言
+    schema_sql.h                [生成物] 由 db\schema.sql 生成
+    sqlite3.c/h                 静态链接 amalgamation
+  service_go/                  管理 REST API (Go, 可选)
+    main.go                     配置 + 优雅停机
+    api/api.go                  HTTP 端点 + Token 鉴权
+    db/db.go                    只读查询 + ops 入队
+  db/
+    schema.sql                  **数据库 schema 唯一真相**
+    gen_schema.ps1              生成 service_c/schema_sql.h
   docs/
     design.md                   设计说明 (范式选型/通信模型/限制)
     bugfix-report.md            本轮 bugfix 详细报告
@@ -155,13 +194,18 @@ Restart-Computer
 cd c:\RecycleBin\smb_intercept\recyclebin_svc\driver
 .\build.cmd Release
 
-# 3) 装依赖
-pip install -r ..\service\requirements.txt
+# 3) 编译核心服务 (VS2022, 无外部依赖)
+cd ..\service_c
+.\build.cmd Release
 
-# 4) 改配置 (务必确认 StoreRoot 与共享同卷!)
+# 4) 编译管理 API (可选, 需要 Go 1.22+)
+cd ..\service_go
+go build -o rbapi.exe .
+
+# 5) 改配置 (务必确认 StoreRoot 与共享同卷!)
 notepad ..\deploy.ps1
 
-# 5) 管理员 PowerShell 一键部署
+# 6) 管理员 PowerShell 一键部署
 cd ..
 powershell -ExecutionPolicy Bypass -File .\deploy.ps1
 ```
@@ -177,8 +221,11 @@ powershell -ExecutionPolicy Bypass -File .\deploy.ps1
 | OS | Windows Server 2016+ / Win10 1809+（x64） |
 | 权限 | 管理员 PowerShell |
 | 驱动 | 已编译产出 `driver\rbminiflt.sys` |
-| Python | 3.10+，且 `Get-Command python` 可解析 |
-| 依赖 | `pip install -r service\requirements.txt`（仅可选 psutil） |
+| 核心服务 | 已编译产出 `service_c\rbservice.exe`（**零运行时依赖**） |
+| 管理 API | 可选，需 Go 1.22+ 编译 `service_go\rbapi.exe` |
+| 构建工具 | VS2022（C 服务）；PowerShell（schema 生成，仅构建期） |
+
+> 核心服务是原生 exe，**目标服务器无需安装 Python 或任何运行时**。
 
 ### 部署步骤
 
@@ -241,9 +288,10 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Services\rbminiflt\Parameters" ^
       /v ProtectedPaths /t REG_MULTI_SZ /d "\Device\HarddiskVolume3\Share" /f
 reg add "HKLM\SOFTWARE\RecycleBin" /v StoreRoot /t REG_SZ /d "D:\RBStore" /f
 
-python service\rb_service.py run    # 前台调试
+service_c\rbservice.exe console    # 前台调试 (Ctrl+C 停止)
+service_c\rbservice.exe once       # 跑一轮维护就退出 (手工清空积压)
 
-sc.exe create RecycleBinSvc binPath= "\"C:\Python312\python.exe\" \"C:\path\service\rb_service.py\" run" type= own start= auto obj= LocalSystem
+sc.exe create RecycleBinSvc binPath= "C:\path\service_c\rbservice.exe" type= own start= auto obj= LocalSystem
 sc.exe start RecycleBinSvc
 ```
 
@@ -423,18 +471,72 @@ cd driver
 > 是**手写自相对 SD**（纯字节布局），不依赖任何缺失 API。详见
 > `docs/bugfix-report.md` 的 B2 条目。
 
-### 用户态
+### 核心服务 (C)
 
 ```powershell
-python -m py_compile service\rb_service.py service\recyclebin_lib.py service\config.py
-python service\rb_service.py run       # 前台调试
+cd service_c
+.\build.cmd Release      # 产出 rbservice.exe（自动从 db\schema.sql 重新生成 DDL）
+.\build.cmd Debug        # 调试版
+
+rbservice.exe console              # 前台运行（Ctrl+C 停止）
+rbservice.exe once                 # 跑一轮维护就退出
+rbservice.exe once --db D:\x\recycle.db   # 针对指定库维护（无需改注册表）
 ```
 
-### 驱动 ↔ 用户态协议
+### 管理 API (Go)
+
+```powershell
+cd service_go
+go build -o rbapi.exe .
+```
+
+### 契约验证（改完 schema 必跑）
+
+```powershell
+python db\verify_contract.py      # 9 项：Go 侧防护 + 跨进程集成
+python db\verify_c_contract.py    # 7 项：C 侧版本防护 + ops 往返
+```
+
+这两个脚本会**故意破坏契约**（改版本号、改列名、插非法状态），
+断言服务**拒绝启动**而不是带病运行。改动 `db\schema.sql` 后必跑。
+
+### 驱动 ↔ 服务协议
 
 `RBF_NOTIFICATION` / `RBF_REPLY` / `RBF_STATS` 在 `driver\rbminiflt.h` 与
-`service\rb_service.py`（ctypes）中各有一份定义，**必须严格对齐**（`#pragma pack(1)`
-+ `_pack_ = 1`，字段顺序与宽度一致）。改动一侧必须同步改另一侧。
+`service_c\rbf_protocol.h` 中各有一份定义。
+
+**`rbf_protocol.h` 带编译期静态断言**（`typedef char[...]` 技巧），
+字段顺序或宽度不一致 → **编译失败**，而不是运行时静默解析错位。
+改驱动结构体后如果忘了同步，构建就会挡住你。
+
+### 数据库 schema 唯一真相
+
+`db\schema.sql` 是 recycle.db 的**唯一定义处**：
+
+```
+db\schema.sql  ──gen_schema.ps1──▶  service_c\schema_sql.h  ──编译进──▶  rbservice.exe
+                                                                            │
+                                                                       建表/修补
+                                                                            ▼
+                                                                       recycle.db
+                                                                            ▲
+                                                           启动时校验列名+版本 │
+                                                                       rbapi.exe
+```
+
+- **C 侧**：唯一建表者。启动时执行内嵌 DDL（全部 `IF NOT EXISTS`，可自动修补缺失对象）
+- **Go 侧**：启动时用 `PRAGMA table_info` + `PRAGMA user_version` 校验，
+  **不匹配直接拒绝启动**，而不是运行到一半报 500
+
+**改 schema 的正确姿势**：
+
+1. 编辑 `db\schema.sql`
+2. 升 `RB_SCHEMA_VERSION`（`service_c/rbsvc.h`）和 `SchemaVersion`（`service_go/db/db.go`）
+3. 更新 Go 侧 `expectedItemCols`
+4. 重新构建两侧
+
+> ⚠️ 只改一侧会让服务**启动即失败** —— 这是刻意设计的快速失败，
+> 好过带着错误的列映射跑起来静默损坏数据。
 
 ---
 
