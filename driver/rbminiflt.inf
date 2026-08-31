@@ -52,11 +52,17 @@ Dependencies   = FltMgr
 "Altitude" = "370030"
 "Flags" = 0x0
 
-; ---- 配置参数 (受保护路径 / 暂存区) ----
+; ---- 配置参数 (受保护路径 / 暂存失败策略) ----
+;
+; 由 deploy.ps1 的 [1/6] 步骤写入, 这里保持干净:
+;   ProtectedPaths  REG_MULTI_SZ  受保护共享根 (NT 形式, 驱动拦截依据)
+;   FailClosed      REG_DWORD     1=暂存失败时拒绝删除保住数据 (默认)
+;
+; 注意: 暂存区位置 (StoreRoot) 不在驱动侧配置。驱动一律把文件 rename 到
+; 【源卷】的 \RBStore\<Sid>\ 下, 该值无法也无需在这里指定。
+; 用户态服务读取的是 HKLM\SOFTWARE\RecycleBin\StoreRoot, 由 deploy.ps1
+; 写入 —— 查配置时请以那个键为准, 不要看驱动 Parameters 键。
 [HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\rbminiflt\Parameters]
-; 受保护共享根 (REG_MULTI_SZ), 例: D:\Share
-; "ProtectedPaths"=hex(7):...  由安装脚本或手动填写
-"StoreRoot" = "C:\\RBStore"
 
 [Strings]
 ManufacturerName = "RecycleBin for SMB"
