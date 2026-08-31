@@ -29,6 +29,75 @@ static WCHAR *U8ToWLocal(const char *s)
 }
 
 /*
+ * RB-06: is this destination allowed to receive a restored file?
+ *
+ * This service runs as SYSTEM and performs the rename itself, so an
+ * unvalidated destination is an arbitrary-write primitive: anyone able to
+ * queue an op (that is, anyone holding the REST token) could restore a file
+ * into C:\Windows\System32 or anywhere else on the box.
+ *
+ * The request does not arrive as a trusted in-process call -- it comes through
+ * the shared `ops` table -- so the check has to live here, next to the rename,
+ * and not in the caller that queued it.
+ */
+static int DestIsAllowed(const WCHAR *dstDos, WCHAR *reasonBuf, DWORD cch)
+{
+    DWORD i;
+    int configured;
+
+    if (!dstDos || dstDos[0] == L'\0') return 0;
+
+    /* Drive-absolute only. This rejects UNC (\\server\share), device paths
+       (\\?\, \\.\) and anything relative before we compare prefixes. */
+    if (dstDos[0] == L'\\' || dstDos[1] != L':') {
+        if (reasonBuf) swprintf_s(reasonBuf, cch,
+            L"rejected: destination must be a drive-absolute path");
+        return 0;
+    }
+
+    /* Reject '..' components: "D:\Share\..\..\Windows" passes a naive prefix
+       test but escapes the share entirely. */
+    {
+        const WCHAR *p = dstDos;
+        while (*p) {
+            if (p[0] == L'.' && p[1] == L'.' && (p[2] == L'\\' || p[2] == L'\0')) {
+                if (reasonBuf) swprintf_s(reasonBuf, cch,
+                    L"rejected: destination must not contain '..'");
+                return 0;
+            }
+            p++;
+        }
+    }
+
+    configured = (g_Config.ProtectedPaths != NULL && g_Config.ProtectedCount > 0);
+    if (!configured) {
+        /* Fail closed: with no allow-list there is nothing to validate
+           against, so refuse rather than perform a SYSTEM-level rename. */
+        if (reasonBuf) swprintf_s(reasonBuf, cch,
+            L"rejected: no protected paths configured");
+        return 0;
+    }
+
+    for (i = 0; i < g_Config.ProtectedCount; i++) {
+        const WCHAR *prefix = g_Config.ProtectedPaths[i];
+        size_t plen;
+
+        if (!prefix || prefix[0] == L'\0') continue;
+        plen = wcslen(prefix);
+
+        if (_wcsnicmp(dstDos, prefix, plen) != 0) continue;
+
+        /* Must be the share itself or something beneath it, so that
+           "D:\Share" does not also authorise "D:\ShareSecret\...". */
+        if (dstDos[plen] == L'\0' || dstDos[plen] == L'\\') return 1;
+    }
+
+    if (reasonBuf) swprintf_s(reasonBuf, cch,
+        L"rejected: destination is outside the protected shares");
+    return 0;
+}
+
+/*
  * Restores item `itemId` back to its original path (or `argOverride` if given).
  * Returns 1 on success, 0 on failure; `msgBuf` receives a human-readable reason.
  */
@@ -80,6 +149,15 @@ int RestoreItemById(LONG64 itemId, const WCHAR *argOverride,
     if (!dstDos) {
         if (msgBuf) swprintf_s(msgBuf, cchMsg,
                                L"cannot resolve destination volume");
+        goto cleanup;
+    }
+
+    /* RB-06: validate before ANY filesystem work. This rename runs as SYSTEM,
+       so a caller-supplied destination outside the protected shares would be
+       an arbitrary write. */
+    if (!DestIsAllowed(dstDos, msgBuf, cchMsg)) {
+        LogWarn(L"[restore] rejected destination for id=%lld: %s",
+                itemId, dstDos);
         goto cleanup;
     }
 

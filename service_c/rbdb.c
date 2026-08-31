@@ -111,6 +111,10 @@ static int DbEnsureSchema(void)
     return 1;
 }
 
+/* Forward declaration: WToU8 is static and defined below, but the backup
+   helpers earlier in this file need it. */
+static char *WToU8(const WCHAR *w);
+
 /* When set, overrides <StoreRoot>\recycle.db with an explicit file path.
    Supplied by the --db switch; NULL in normal service operation. */
 const WCHAR *g_DbPathOverride = NULL;
@@ -184,6 +188,109 @@ int DbOpen(const WCHAR *storeRoot)
 
     LogInfo(L"database opened: %s (WAL, schema v%d)", dbPath, RB_SCHEMA_VERSION);
     return 1;
+}
+
+/* ================================================================== */
+/* Backup and integrity  (RB-11)                                       */
+/* ================================================================== */
+
+/*
+ * Copy the live database to another file using SQLite's online backup API.
+ *
+ * The database is the ONLY thing that knows where a recycled file originally
+ * lived. Lose it and every staged file becomes an unlabelled blob: present on
+ * disk, invisible to restore, and impossible to clean up. Nothing else in the
+ * system can reconstruct those rows, so this is the difference between an
+ * incident and an outage.
+ *
+ * The backup API takes a consistent snapshot while the service keeps writing,
+ * so this never needs to stop the delete path.
+ */
+int DbBackupTo(const WCHAR *destPath)
+{
+    sqlite3        *dst = NULL;
+    sqlite3_backup *bk  = NULL;
+    char           *destUtf8 = NULL;
+    int             rc;
+
+    if (!g_Db || !destPath || !destPath[0]) return -1;
+
+    destUtf8 = WToU8(destPath);
+    if (!destUtf8) {
+        LogError(L"[backup] path conversion failed: %s", destPath);
+        return -1;
+    }
+
+    rc = sqlite3_open_v2(destUtf8, &dst,
+                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
+    if (rc != SQLITE_OK) {
+        LogError(L"[backup] cannot create %s: %S", destPath,
+                 sqlite3_errmsg(dst));
+        if (dst) sqlite3_close(dst);
+        free(destUtf8);
+        return -1;
+    }
+
+    bk = sqlite3_backup_init(dst, "main", g_Db, "main");
+    if (!bk) {
+        LogError(L"[backup] backup_init failed: %S", sqlite3_errmsg(dst));
+        sqlite3_close(dst);
+        free(destUtf8);
+        return -1;
+    }
+
+    /* Copy everything in one call; the database is small enough that
+       step(-1) completes without holding anything for long. */
+    rc = sqlite3_backup_step(bk, -1);
+    sqlite3_backup_finish(bk);
+
+    if (rc != SQLITE_DONE) {
+        LogError(L"[backup] incomplete (rc=%d): %S", rc, sqlite3_errmsg(dst));
+        sqlite3_close(dst);
+        free(destUtf8);
+        return -1;
+    }
+
+    sqlite3_close(dst);
+    free(destUtf8);
+    LogInfo(L"[backup] wrote %s", destPath);
+    return 0;
+}
+
+/*
+ * Run PRAGMA integrity_check. A database that fails this is already
+ * corrupt -- WAL recovery only replays committed frames, so the moment we
+ * detect it we must stop trusting the file and keep the last known-good
+ * backup rather than keep writing into a damaged image.
+ */
+int DbCheckIntegrity(void)
+{
+    sqlite3_stmt *st = NULL;
+    int  ok = 0;
+    int  rc;
+
+    if (!g_Db) return -1;
+
+    EnterCriticalSection(&g_DbLock);
+
+    rc = sqlite3_prepare_v2(g_Db, "PRAGMA integrity_check", -1, &st, NULL);
+    if (rc != SQLITE_OK) {
+        DbLogError("prepare integrity_check");
+        LeaveCriticalSection(&g_DbLock);
+        return -1;
+    }
+
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *res = sqlite3_column_text(st, 0);
+        ok = (res && strcmp((const char *)res, "ok") == 0);
+        if (!ok) {
+            LogError(L"[integrity] database reports: %S", res ? res : (const unsigned char *)"unknown");
+        }
+    }
+    sqlite3_finalize(st);
+
+    LeaveCriticalSection(&g_DbLock);
+    return ok ? 1 : 0;
 }
 
 void DbClose(void)
@@ -348,6 +455,104 @@ void DbFreeItemList(RBSVC_ITEM *list, int count)
 /* Writes                                                             */
 /* ------------------------------------------------------------------ */
 
+/* 1 = store_path known to the database, 0 = unknown (orphan), -1 = error.
+   Used by the staging reconciliation sweep (RB-05). */
+int DbStorePathExists(const WCHAR *storePathNt)
+{
+    sqlite3_stmt *st = NULL;
+    const char *sql = "SELECT 1 FROM items WHERE store_path=? LIMIT 1";
+    char *sp = NULL;
+    int found = 0;
+
+    if (!g_Db || !storePathNt) return -1;
+
+    sp = WToU8(storePathNt);
+    if (!sp) return -1;
+
+    EnterCriticalSection(&g_DbLock);
+
+    if (sqlite3_prepare_v2(g_Db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, sp, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) found = 1;
+    } else {
+        DbLogError("prepare store_path exists");
+        found = -1;
+    }
+
+    if (st) sqlite3_finalize(st);
+    LeaveCriticalSection(&g_DbLock);
+
+    free(sp);
+    return found;
+}
+
+/* RB-09: bound the size of `items`.
+ *
+ * Rows in a terminal state ('restored', 'purged') are the only remaining
+ * audit trail of a deletion -- the data they describe has already left the
+ * store -- but they never stop accumulating. At a few million deletions a day
+ * the table reaches hundreds of millions of rows, which slows every query
+ * (the substring search in particular) and grows the database file without
+ * limit.
+ *
+ * Deleting in batches keeps each transaction short, so the sweeper cannot
+ * hold the write lock long enough to stall the delete path that shares this
+ * database.
+ */
+int DbReapTerminalRows(DWORD keepDays)
+{
+    const char *sql =
+        "DELETE FROM items WHERE id IN ("
+        "  SELECT id FROM items"
+        "  WHERE status IN ('restored','purged')"
+        "    AND delete_time < ?"
+        "  LIMIT 1000)";
+    int total = 0;
+    int batch;
+
+    if (!g_Db) return -1;
+
+    /* Guard against a misconfiguration wiping the audit trail: 0 would mean
+       "delete every terminal row immediately". */
+    if (keepDays == 0) keepDays = DEF_TERMINAL_KEEP_DAYS;
+
+    EnterCriticalSection(&g_DbLock);
+
+    do {
+        sqlite3_stmt *st = NULL;
+        double cutoff = (double)time(NULL) - ((double)keepDays * 86400.0);
+
+        batch = 0;
+        if (sqlite3_prepare_v2(g_Db, sql, -1, &st, NULL) != SQLITE_OK) {
+            DbLogError("prepare terminal reaper");
+            if (st) sqlite3_finalize(st);
+            LeaveCriticalSection(&g_DbLock);
+            return -1;
+        }
+
+        sqlite3_bind_double(st, 1, cutoff);
+        if (sqlite3_step(st) != SQLITE_DONE) {
+            DbLogError("step terminal reaper");
+            sqlite3_finalize(st);
+            LeaveCriticalSection(&g_DbLock);
+            return -1;
+        }
+
+        batch = sqlite3_changes(g_Db);
+        sqlite3_finalize(st);
+        total += batch;
+
+    } while (batch > 0 && total < RBSVC_MAX_REAP_PER_PASS);
+
+    LeaveCriticalSection(&g_DbLock);
+
+    if (total > 0) {
+        LogInfo(L"[reap] removed %d terminal item row(s) older than %lu day(s)",
+                total, keepDays);
+    }
+    return total;
+}
+
 LONG64 DbAddItem(const RBF_NOTIFICATION *note)
 {
     sqlite3_stmt *st = NULL;
@@ -363,12 +568,13 @@ LONG64 DbAddItem(const RBF_NOTIFICATION *note)
     /* Kernel sends SID with a leading '\\' as a path separator; strip it so
        REST lookups and $Recycle.Bin directory names match. */
     WCHAR sidBuf[RBF_MAX_NAME];
-    const WCHAR *raw = note->SidString;
+    const WCHAR *raw = RBF_NOTIFY_SID(note);
     if (*raw == L'\\') raw++;
     wcsncpy_s(sidBuf, RBF_MAX_NAME, raw, _TRUNCATE);
 
-    orig  = WToU8(note->FilePath);
-    store = WToU8(note->StorePath);
+    /* Payloads live after the variable-length header -- see rbf_protocol.h. */
+    orig  = WToU8(RBF_NOTIFY_PATH(note));
+    store = WToU8(RBF_NOTIFY_STOREPATH(note));
     sid   = WToU8(sidBuf);
 
     now = (double)time(NULL);

@@ -13,10 +13,16 @@
 
 #pragma comment(lib, "fltlib.lib")
 
-/* FILTER_MESSAGE_HEADER as defined in fltuser.h */
+/* FILTER_MESSAGE_HEADER as defined in fltuser.h.
+ *
+ * Notifications are variable length, so the payload area is a flat byte
+ * buffer sized for the largest legal message. The driver sends only the
+ * bytes it used (RBF_NOTIFICATION.TotalSize) and FilterGetMessage reports
+ * how many arrived. That keeps this struct near 4.7 KB instead of the old
+ * fixed ~64 KB (RB-01 / RB-07). */
 typedef struct _RB_MSG_BUFFER {
     FILTER_MESSAGE_HEADER Header;
-    RBF_NOTIFICATION      Note;
+    BYTE                  Payload[RBF_NOTIFY_MAX_SIZE];
 } RB_MSG_BUFFER;
 
 static HANDLE g_Port = NULL;
@@ -87,15 +93,36 @@ DWORD WINAPI PortThreadProc(LPVOID param)
             continue;
         }
 
-        /* Persist. Failure here must not kill the reader thread. */
+        /* Validate before parsing. The payload is variable length and
+           addressed by offsets, so a malformed or truncated message must be
+           rejected rather than dereferenced. */
         {
-            LONG64 id = DbAddItem(&buf.Note);
-            if (id < 0) {
-                LogError(L"failed to persist notification for %s",
-                         buf.Note.FilePath);
-            } else {
-                LogInfo(L"intercepted delete id=%lld: %s",
-                        id, buf.Note.FilePath);
+            RBF_NOTIFICATION *note = (RBF_NOTIFICATION *)buf.Payload;
+            /* ReplyLength covers the header plus the payload. */
+            ULONG avail = (buf.Header.ReplyLength >= sizeof(FILTER_MESSAGE_HEADER))
+                          ? (ULONG)(buf.Header.ReplyLength - sizeof(FILTER_MESSAGE_HEADER))
+                          : 0;
+
+            if (avail < sizeof(RBF_NOTIFICATION) ||
+                note->Magic != RBF_NOTIFY_MAGIC ||
+                note->TotalSize < sizeof(RBF_NOTIFICATION) ||
+                note->TotalSize > avail)
+            {
+                LogError(L"malformed notification (len=%lu magic=0x%08lx), ignored",
+                         avail, note->Magic);
+                continue;
+            }
+
+            /* Persist. Failure here must not kill the reader thread. */
+            {
+                LONG64 id = DbAddItem(note);
+                if (id < 0) {
+                    LogError(L"failed to persist notification for %s",
+                             RBF_NOTIFY_PATH(note));
+                } else {
+                    LogInfo(L"intercepted delete id=%lld: %s",
+                            id, RBF_NOTIFY_PATH(note));
+                }
             }
         }
     }

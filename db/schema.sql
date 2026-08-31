@@ -61,6 +61,11 @@ CREATE INDEX IF NOT EXISTS idx_items_status      ON items(status);
 CREATE INDEX IF NOT EXISTS idx_items_status_sid  ON items(status, sid);
 CREATE INDEX IF NOT EXISTS idx_items_delete_time ON items(delete_time);
 
+-- RB-09: supports the terminal-row reaper, which sweeps ('restored','purged')
+-- rows older than the archive window. Without it that sweep is a full scan of
+-- the largest table in the database, once per hour, forever.
+CREATE INDEX IF NOT EXISTS idx_items_terminal ON items(status, delete_time);
+
 
 -- ---------------------------------------------------------------------------
 -- ops: command queue. rbapi.exe INSERTs, rbservice.exe executes and updates.

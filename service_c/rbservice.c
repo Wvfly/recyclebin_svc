@@ -32,6 +32,13 @@ static SERVICE_STATUS_HANDLE g_StatusHandle = NULL;
 static SERVICE_STATUS        g_Status;
 static HANDLE g_PortThread  = NULL;
 static HANDLE g_MaintThread = NULL;
+static HANDLE g_OpsThread   = NULL;   /* RB-10: fast-lane restore commands */
+
+/* RB-05: throttles the staging orphan sweep (see rbsvc.h) */
+time_t g_LastReconcile = 0;
+
+/* RB-11: throttles the database backup (see rbsvc.h) */
+time_t g_LastBackup = 0;
 
 /* Declared in rbpolicy.c / rbrestore.c */
 int RestoreDrainOps(void);
@@ -65,8 +72,13 @@ void ReportServiceStatus(DWORD state, DWORD exitCode, DWORD waitHint)
 /* Maintenance thread                                                  */
 /* ------------------------------------------------------------------ */
 
-/* One full pass. Called on a timer AND once more during shutdown. */
-static void MaintenancePass(void)
+/* One full pass. Called on a timer AND once more during shutdown.
+ *
+ * drainOps: while the service is running, restore commands are handled by the
+ * dedicated ops thread (RB-10) and this must be 0 to avoid two threads
+ * racing over the same ops rows. One-shot and shutdown passes pass 1 so that
+ * pending commands are still served without that thread. */
+static void MaintenancePass(int drainOps)
 {
     RBSVC_ITEM *items = NULL;
     int n, i, landed = 0;
@@ -96,8 +108,11 @@ static void MaintenancePass(void)
 
     if (landed > 0) LogInfo(L"[maint] landed %d entries", landed);
 
-    /* 2) Execute restore commands issued by the Go REST service */
-    RestoreDrainOps();
+    /* 2) Restore commands. While running, the dedicated ops thread owns these
+          (RB-10) -- a 30 s maintenance period meant a user clicking "restore"
+          could wait up to half a minute with nothing happening. One-shot and
+          shutdown passes drain them here instead. */
+    if (drainOps) RestoreDrainOps();
 
     /* 3) Retention */
     PolicyPurgeExpired(g_Config.RetentionDays);
@@ -107,6 +122,86 @@ static void MaintenancePass(void)
 
     /* 5) Per-user quota */
     PolicyEnforceQuota(g_Config.QuotaMB);
+
+    /* 6) Staging orphan sweep (RB-05).
+          Throttled: a full tree walk is far too expensive for a 30 s pass,
+          and orphans are a slow-burn problem, not a per-second one. */
+    {
+        time_t now = time(NULL);
+        if (now - g_LastReconcile >= (time_t)RBSVC_RECON_INTERVAL) {
+            g_LastReconcile = now;
+            ReconcileStaging(g_Config.OrphanGraceDays);
+            /* RB-09: both are slow-burn housekeeping, so they share a pass. */
+            DbReapTerminalRows(g_Config.TerminalKeepDays);
+        }
+
+        /* 7) Database backup + integrity (RB-11).
+              Daily. The DB is the only record of where a recycled file
+              belongs, so check it before backing it up: copying a corrupt
+              image over the last good one would destroy the recovery path. */
+        if (now - g_LastBackup >= (time_t)RBSVC_BACKUP_INTERVAL) {
+            int healthy = DbCheckIntegrity();
+
+            if (healthy < 0) {
+                LogError(L"[backup] integrity check could not run; backup skipped");
+            } else if (healthy == 0) {
+                LogError(L"[backup] database is CORRUPT - backup skipped so the "
+                         L"last known-good copy is preserved");
+            } else {
+                WCHAR dest[MAX_PATH];
+
+                if (_snwprintf_s(dest, ARRAYSIZE(dest), _TRUNCATE,
+                                 L"%s\\recycle.db.bak", ConfigStoreRoot()) >= 0) {
+                    if (DbBackupTo(dest) == 0) {
+                        g_LastBackup = now;
+                    } else {
+                        LogError(L"[backup] backup failed; will retry next hour");
+                    }
+                }
+            }
+
+            /* Even on failure, wait an hour rather than retrying every 30 s. */
+            if (g_LastBackup == 0) g_LastBackup = now - (time_t)RBSVC_BACKUP_INTERVAL
+                                                  + (time_t)RBSVC_RECON_INTERVAL;
+        }
+    }
+}
+
+/* RB-10: restore commands get their own fast lane.
+ *
+ * Landing files, enforcing quota and purging expired entries are all batch
+ * work that is perfectly happy on a 30 s cadence. A restore is not: it is a
+ * user sitting in front of a UI waiting for a file to come back. Polling the
+ * ops table from the maintenance thread tied that interactive operation to
+ * the batch cadence (and RBSVC_OPS_POLL_MS was never even wired up), so a
+ * restore could sit unserved for the better part of a minute.
+ *
+ * This thread only does one cheap indexed SELECT every couple of seconds, so
+ * it costs nothing and keeps restores responsive. */
+static DWORD WINAPI OpsThreadProc(LPVOID param)
+{
+    (void)param;
+
+    /* Brief delay so the port thread is up and the DB is open. */
+    if (WaitForSingleObject(g_StopEvent, 2000) == WAIT_OBJECT_0)
+        return 0;
+
+    while (WaitForSingleObject(g_StopEvent, RBSVC_OPS_POLL_MS) != WAIT_OBJECT_0) {
+        __try {
+            RestoreDrainOps();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            LogError(L"[ops] unhandled exception draining restore commands");
+        }
+    }
+
+    /* Drain once more on the way out so a restore queued just before
+       shutdown is not silently abandoned in 'pending'. */
+    __try {
+        RestoreDrainOps();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        /* already stopping; nothing useful left to do */
+    }
+    return 0;
 }
 
 static DWORD WINAPI MaintainThreadProc(LPVOID param)
@@ -117,9 +212,15 @@ static DWORD WINAPI MaintainThreadProc(LPVOID param)
     if (WaitForSingleObject(g_StopEvent, 3000) == WAIT_OBJECT_0)
         return 0;
 
+    /* Run one sweep soon after start-up: any orphan left behind by the
+       previous run (or by a service outage) is exactly what we want to
+       find early rather than an hour later. */
+    g_LastReconcile = time(NULL) - (time_t)RBSVC_RECON_INTERVAL
+                      + RBSVC_RECON_STARTUP_DELAY;
+
     while (WaitForSingleObject(g_StopEvent, RBSVC_MAINTAIN_MS) != WAIT_OBJECT_0) {
         __try {
-            MaintenancePass();
+            MaintenancePass(0);   /* ops are the OpsThread's job while running */
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             LogError(L"[maint] unhandled exception in maintenance pass");
         }
@@ -155,11 +256,16 @@ DWORD WINAPI ServiceCtrlHandlerEx(DWORD ctrl, DWORD eventType,
             if (WaitForSingleObject(g_MaintThread, 20000) != WAIT_OBJECT_0)
                 LogWarn(L"maintenance thread did not exit within 20s");
         }
+        if (g_OpsThread) {
+            if (WaitForSingleObject(g_OpsThread, 10000) != WAIT_OBJECT_0)
+                LogWarn(L"ops thread did not exit within 10s");
+        }
 
         /* Final pass: land anything staged just before shutdown so we do not
-           leave orphans behind that no DB row will ever claim. */
+           leave orphans behind that no DB row will ever claim, and serve any
+           restore still sitting in the ops table. */
         __try {
-            MaintenancePass();
+            MaintenancePass(1);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             LogError(L"exception during shutdown maintenance pass");
         }
@@ -173,6 +279,15 @@ DWORD WINAPI ServiceCtrlHandlerEx(DWORD ctrl, DWORD eventType,
 
     case SERVICE_CONTROL_INTERROGATE:
         ReportServiceStatus(g_Status.dwCurrentState, NO_ERROR, 0);
+        return NO_ERROR;
+
+    case RBSVC_CTRL_RELOAD_CONFIG:
+        /* RB-12: re-read HKLM\SOFTWARE\RecycleBin without a restart.
+           Changing retention, quota or the watermark used to mean restarting
+           the service, which on a production file server means a change
+           window. The driver's own settings still need a reboot -- see the
+           comment on RBSVC_CTRL_RELOAD_CONFIG. */
+        ReloadConfig();
         return NO_ERROR;
 
     default:
@@ -222,9 +337,9 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR *argv)
     g_PortThread = CreateThread(NULL, 0, PortThreadProc,
                                 g_Config.PortName, 0, NULL);
     g_MaintThread = CreateThread(NULL, 0, MaintainThreadProc, NULL, 0, NULL);
-    (void)g_MaintThread; /* referenced in the check below */
+    g_OpsThread   = CreateThread(NULL, 0, OpsThreadProc, NULL, 0, NULL);
 
-    if (!g_PortThread || !g_MaintThread) {
+    if (!g_PortThread || !g_MaintThread || !g_OpsThread) {
         LogErrorWin(GetLastError(), L"worker thread creation failed");
         SetEvent(g_StopEvent);
         DbClose();
@@ -242,6 +357,8 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR *argv)
 
     CloseHandle(g_PortThread);
     CloseHandle(g_MaintThread);
+    if (g_OpsThread) CloseHandle(g_OpsThread);
+    g_OpsThread = NULL;
     CloseHandle(g_StopEvent);
     g_StopEvent = NULL;
 }
@@ -311,7 +428,9 @@ static int RunOnce(void)
     g_StopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (!g_StopEvent) { DbClose(); LogShutdown(); return 1; }
 
-    MaintenancePass();
+    /* One-shot: no worker threads are running, so drain ops here or a
+       pending restore would be left hanging in 'pending' forever (RB-10). */
+    MaintenancePass(1);
 
     CloseHandle(g_StopEvent);
     g_StopEvent = NULL;
@@ -356,6 +475,7 @@ static int RunConsole(void)
     g_PortThread  = CreateThread(NULL, 0, PortThreadProc,
                                  g_Config.PortName, 0, NULL);
     g_MaintThread = CreateThread(NULL, 0, MaintainThreadProc, NULL, 0, NULL);
+    g_OpsThread   = CreateThread(NULL, 0, OpsThreadProc, NULL, 0, NULL);
 
     fwprintf(stderr, L"running in console mode; Ctrl+C to stop\n");
 
@@ -363,11 +483,14 @@ static int RunConsole(void)
 
     WaitForSingleObject(g_PortThread, 10000);
     WaitForSingleObject(g_MaintThread, 15000);
+    if (g_OpsThread) WaitForSingleObject(g_OpsThread, 5000);
 
-    MaintenancePass();
+    MaintenancePass(1);
 
     CloseHandle(g_PortThread);
     CloseHandle(g_MaintThread);
+    if (g_OpsThread) CloseHandle(g_OpsThread);
+    g_OpsThread = NULL;
     CloseHandle(g_StopEvent);
     g_StopEvent = NULL;
 

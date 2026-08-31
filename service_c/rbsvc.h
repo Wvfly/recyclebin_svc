@@ -59,6 +59,39 @@
 #define DEF_RETENTION_DAYS   30
 #define DEF_DISKFREE_MIN_MB  5120
 #define DEF_STAGED_BATCH     500
+/* Days an untracked staging file is kept before the reconciliation sweep
+   reclaims it (RB-05). Long enough to survive a service outage. */
+#define DEF_ORPHAN_GRACE_DAYS 7
+/* Days a terminal ('restored' / 'purged') item row is kept for audit before
+   the reaper deletes it (RB-09). The row is the only audit trail of what was
+   deleted, so this is deliberately longer than the file retention itself. */
+#define DEF_TERMINAL_KEEP_DAYS 90
+/* Upper bound on rows removed per maintenance pass, so a huge backlog after a
+   long outage is drained over several passes instead of blocking the writer. */
+#define RBSVC_MAX_REAP_PER_PASS 50000
+/* RB-11: database backup cadence and retention. Daily by default; the backup
+   is the only thing that can reconstruct where a recycled file belongs. */
+#define RBSVC_BACKUP_INTERVAL   86400
+#define RBSVC_BACKUP_KEEP       7
+
+/* RB-12: custom service control code that re-reads the user-mode registry
+   configuration in place, so changing retention/quota/watermark no longer
+   needs a service restart (and therefore a change window).
+   Send it with:  sc control RecycleBinSvc 128
+   Note: this covers only the HKLM\SOFTWARE\RecycleBin settings. The driver's
+   own values (ProtectedPaths, FailClosed) live under the driver's Parameters
+   key and are read once at load time -- those still require a reboot. */
+#define RBSVC_CTRL_RELOAD_CONFIG 128
+/* Minimum interval between reconciliation sweeps (seconds). A full tree walk
+   is too expensive to run on every 30 s maintenance pass. */
+#define RBSVC_RECON_INTERVAL  3600
+/* How long after start-up the first sweep runs (seconds) -- soon enough to
+   surface orphans left behind by a previous run or a service outage. */
+#define RBSVC_RECON_STARTUP_DELAY 120
+/* Path bound for the staging tree walk. MAX_PATH (260) is too small for
+   <StoreRoot>\<Sid>\<seq>_<name>; entries that would overflow are counted as
+   errors and skipped rather than truncated. */
+#define RBSVC_MAX_RECON_PATH  1024
 #define DEF_PORT_NAME        L"\\RecycleBinPort"
 #define DEF_PROTECTED        L"D:\\Share"
 
@@ -99,6 +132,8 @@ typedef struct _RBSVC_CONFIG {
     DWORD   RetentionDays;
     DWORD   DiskFreeMinMB;
     DWORD   StagedBatch;
+    DWORD   OrphanGraceDays;  /* RB-05: reclaim untracked staging files after N days */
+    DWORD   TerminalKeepDays; /* RB-09: keep restored/purged rows this long, then reap */
 } RBSVC_CONFIG;
 
 /* ------------------------------------------------------------------ */
@@ -126,6 +161,10 @@ typedef struct _RBSVC_ITEM {
 /* Config                                                              */
 /* ------------------------------------------------------------------ */
 void ConfigLoad(RBSVC_CONFIG *cfg);
+
+/* RB-12: re-read the registry configuration in place. 1 = adopted,
+   0 = rejected (the previous configuration stays active). */
+int  ReloadConfig(void);
 void ConfigFree(RBSVC_CONFIG *cfg);
 const WCHAR *ConfigStoreRoot(void);   /* live pointer to g_Config */
 
@@ -152,6 +191,21 @@ extern const WCHAR *g_DbPathOverride;
 
 int  DbOpen(const WCHAR *storeRoot);   /* opens <storeRoot>\recycle.db, creates schema */
 void DbClose(void);
+
+/* 1 = store_path present in items, 0 = orphan, -1 = error (RB-05) */
+int    DbStorePathExists(const WCHAR *storePathNt);
+
+/* Delete terminal ('restored'/'purged') rows older than keepDays (RB-09).
+   Returns rows deleted, or -1 on error. The backing file is already gone by
+   then -- this only bounds the table so queries stay fast. */
+int    DbReapTerminalRows(DWORD keepDays);
+
+/* RB-11: online backup via SQLite's backup API -- never needs to stop writes.
+   Returns 0 on success, -1 on failure. */
+int    DbBackupTo(const WCHAR *destPath);
+
+/* RB-11: PRAGMA integrity_check. 1 = healthy, 0 = corrupt, -1 = cannot run. */
+int    DbCheckIntegrity(void);
 
 LONG64 DbAddItem(const RBF_NOTIFICATION *note);
 int    DbSetLanded(LONG64 id, const WCHAR *recyclePath, const WCHAR *origPathDos);
@@ -194,6 +248,8 @@ void VolInit(void);
 WCHAR *VolNtToDos(const WCHAR *ntPath);
 /* Returns drive root for a DOS path, e.g. L"D:\\" into caller buffer */
 int  VolDriveOf(const WCHAR *dosPath, WCHAR *driveOut, DWORD cch);
+/* D:\RBStore\... -> \Device\HarddiskVolumeN\RBStore\... (allocates; caller free) */
+WCHAR *VolDosToNt(const WCHAR *dosPath);
 
 /* ------------------------------------------------------------------ */
 /* SID                                                                 */
@@ -221,6 +277,14 @@ int  PolicyPurgeExpired(DWORD retentionDays);
 int  PolicyDiskWatermark(DWORD minFreeMB);
 
 /* ------------------------------------------------------------------ */
+/* Staging reconciliation (RB-05)                                      */
+/* ------------------------------------------------------------------ */
+/* Walks <StoreRoot> and reclaims files that no items row points at -- the
+   footprint of a notification that never reached the service. Returns the
+   number of files reclaimed (>=0), or -1 if the sweep could not run. */
+int  ReconcileStaging(DWORD graceDays);
+
+/* ------------------------------------------------------------------ */
 /* Restore (executed here on behalf of Go REST)                        */
 /* ------------------------------------------------------------------ */
 /* Returns 1 ok, 0 fail. Message written into buf. */
@@ -244,6 +308,14 @@ void ReportServiceStatus(DWORD state, DWORD exitCode, DWORD waitHint);
 
 /* Global stop signal shared by all worker threads */
 extern HANDLE g_StopEvent;
+
+/* Last time the staging reconciliation sweep ran (unix epoch seconds).
+   Owned by the maintenance thread; see RBSVC_RECON_INTERVAL (RB-05). */
+extern time_t g_LastReconcile;
+
+/* Last time the database was backed up (unix epoch seconds).
+   Owned by the maintenance thread; see RBSVC_BACKUP_INTERVAL (RB-11). */
+extern time_t g_LastBackup;
 
 /* Live configuration, loaded once in ServiceMain (defined in rbconfig.c) */
 extern RBSVC_CONFIG g_Config;

@@ -94,6 +94,8 @@ void ConfigLoad(RBSVC_CONFIG *cfg)
     cfg->RetentionDays = DEF_RETENTION_DAYS;
     cfg->DiskFreeMinMB = DEF_DISKFREE_MIN_MB;
     cfg->StagedBatch   = DEF_STAGED_BATCH;
+    cfg->OrphanGraceDays = DEF_ORPHAN_GRACE_DAYS;
+    cfg->TerminalKeepDays = DEF_TERMINAL_KEEP_DAYS;
     cfg->ProtectedCount = 0;
     cfg->ProtectedPaths = NULL;
 
@@ -118,6 +120,10 @@ void ConfigLoad(RBSVC_CONFIG *cfg)
     cfg->RetentionDays = RegReadDword(key, L"RetentionDays", DEF_RETENTION_DAYS);
     cfg->DiskFreeMinMB = RegReadDword(key, L"DiskFreeMinMB", DEF_DISKFREE_MIN_MB);
     cfg->StagedBatch   = RegReadDword(key, L"StagedBatch",   DEF_STAGED_BATCH);
+    cfg->OrphanGraceDays = RegReadDword(key, L"OrphanGraceDays",
+                                        DEF_ORPHAN_GRACE_DAYS);
+    cfg->TerminalKeepDays = RegReadDword(key, L"TerminalKeepDays",
+                                         DEF_TERMINAL_KEEP_DAYS);
 
     cfg->ProtectedPaths = RegReadMultiSz(key, L"ProtectedPaths",
                                          &cfg->ProtectedCount);
@@ -136,6 +142,62 @@ void ConfigLoad(RBSVC_CONFIG *cfg)
             L"watermark=%lu MB protected=%lu",
             cfg->StoreRoot, cfg->QuotaMB, cfg->RetentionDays,
             cfg->DiskFreeMinMB, cfg->ProtectedCount);
+}
+
+/* RB-12: re-read the configuration while the service is running.
+ *
+ * Returns 1 if the new configuration was adopted, 0 if it was rejected.
+ *
+ * The new values are decoded into a scratch struct and only swapped in once
+ * they look sane. Reading straight into g_Config would leave the service
+ * running with half-applied settings if the registry were edited mid-write,
+ * or with a pathological value such as RetentionDays = 0 that would start
+ * deleting files the moment the next maintenance pass ran.
+ */
+int ReloadConfig(void)
+{
+    RBSVC_CONFIG next;
+    RBSVC_CONFIG prev = g_Config;
+    DWORD i;
+
+    ConfigLoad(&next);
+
+    /* Retention of 0 would purge everything on the next pass. */
+    if (next.RetentionDays == 0) {
+        LogError(L"[reload] rejected: RetentionDays must be >= 1");
+        return 0;
+    }
+
+    /* A store root that does not exist yet is fine -- we create it -- but an
+       empty value would put the database in the wrong place. */
+    if (!next.StoreRoot || next.StoreRoot[0] == L'\0') {
+        LogError(L"[reload] rejected: StoreRoot is empty");
+        return 0;
+    }
+
+    /* Swap first, then release the old path list: ConfigLoad allocates a
+       fresh array, so `next` never aliases `prev`'s pointers. */
+    g_Config = next;
+    if (prev.ProtectedPaths) {
+        for (i = 0; i < prev.ProtectedCount; i++) free(prev.ProtectedPaths[i]);
+        free(prev.ProtectedPaths);
+    }
+
+    LogInfo(L"[reload] configuration reloaded "
+            L"(store=%s, retention=%lu d, quota=%lu MB, "
+            L"orphan_grace=%lu d, terminal_keep=%lu d)",
+            g_Config.StoreRoot, g_Config.RetentionDays, g_Config.QuotaMB,
+            g_Config.OrphanGraceDays, g_Config.TerminalKeepDays);
+
+    if (_wcsicmp(prev.StoreRoot, g_Config.StoreRoot) != 0) {
+        /* Everything else takes effect on the next pass, but the database is
+           opened once at startup, so moving it needs a restart. Say so rather
+           than letting the operator believe the move succeeded. */
+        LogWarn(L"[reload] StoreRoot changed but the database path is fixed at "
+                L"startup; restart the service to move the store");
+    }
+
+    return 1;
 }
 
 void ConfigFree(RBSVC_CONFIG *cfg)

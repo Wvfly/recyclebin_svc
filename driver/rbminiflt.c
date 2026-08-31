@@ -89,6 +89,20 @@ NTSTATUS RbfLoadConfig(VOID)
                              kvpi, kvpiLen, &resultLen);
     UNREFERENCED_PARAMETER(status);
 
+    /* FailClosed (REG_DWORD) -- RB-04.
+       1 (default) refuses a delete we cannot stage instead of letting the
+       file be destroyed. 0 restores the legacy fail-open behaviour, which
+       silently loses data; only enable it deliberately as an emergency
+       bypass when the staging volume is unhealthy. */
+    RtlInitUnicodeString(&keyName, L"FailClosed");
+    status = ZwQueryValueKey(hKey, &keyName, KeyValuePartialInformation,
+                             kvpi, kvpiLen, &resultLen);
+    if (NT_SUCCESS(status) && kvpi->Type == REG_DWORD &&
+        kvpi->DataLength >= sizeof(ULONG)) {
+        G.FailClosed = (*(PULONG)kvpi->Data) ? 1 : 0;
+    }
+    DbgPrint("[RBF] FailClosed=%lu\n", G.FailClosed);
+
     /* ProtectedPaths (REG_MULTI_SZ)
        Registry must contain NT-style prefixes (e.g.
          \Device\HarddiskVolume2\Share
@@ -506,45 +520,237 @@ NTSTATUS RbfBuildStorePath(_In_ PCUNICODE_STRING SidString,
 }
 
 /* ============================================================
+ * Variable-length notification allocation  (RB-01 / RB-07)
+ *
+ * A fixed RBF_NOTIFICATION used to be ~64 KB, which cannot live on the 24 KB
+ * kernel stack -- declaring one as a local in the pre-callback bugchecked on
+ * the first intercepted delete. Callers now allocate exactly the bytes they
+ * need from paged pool and keep only a pointer on the stack, so stack usage
+ * no longer scales with RBF_MAX_PATH and a queued entry costs what the
+ * request actually needs instead of the worst case.
+ * ========================================================== */
+
+/* Copy Src into the payload slot at Offset and return its length in bytes,
+   excluding the terminating NUL. CapacityBytes must include room for that
+   NUL. The result is always NUL terminated and WCHAR aligned. */
+static ULONG
+RbfNotifySetStr(
+    _Inout_        PRBF_NOTIFICATION Note,
+    _In_           ULONG             Offset,
+    _In_           ULONG             CapacityBytes,
+    _In_opt_       PCUNICODE_STRING  Src)
+{
+    PWCH  dst   = (PWCH)((PUCHAR)Note + Offset);
+    ULONG bytes = 0;
+    ULONG max;
+
+    if (!Note || CapacityBytes < sizeof(WCHAR)) return 0;
+    max = CapacityBytes - sizeof(WCHAR);
+
+    if (Src && Src->Buffer && Src->Length >= sizeof(WCHAR)) {
+        bytes = Src->Length;
+        if (bytes > max) bytes = max;
+        bytes -= (bytes % sizeof(WCHAR));
+        RtlCopyMemory(dst, Src->Buffer, bytes);
+    }
+    dst[bytes / sizeof(WCHAR)] = L'\0';
+    return bytes;
+}
+
+/* Allocate a notification sized for the three payloads. Each *Bytes
+   argument is a byte count that must include room for the NUL.
+   Free with RbfNotifyFree(), or hand it to RbfQueueNotify() which takes
+   ownership. */
+NTSTATUS
+RbfAllocNotify(
+    _In_      ULONG                PathBytes,
+    _In_      ULONG                StoreBytes,
+    _In_      ULONG                SidBytes,
+    _Outptr_  PRBF_NOTIFICATION   *OutNote)
+{
+    ULONG pathBytes, storeBytes, sidBytes;
+    ULONG total;
+    PRBF_NOTIFICATION note;
+
+    *OutNote = NULL;
+
+    /* Clamp to the configured maxima. This runs after the rename succeeded,
+       so the file is already staged: dropping the notification would turn it
+       into an invisible orphan, hence truncate rather than fail. */
+    pathBytes  = min(PathBytes,  (ULONG)RBF_MAX_PATH * sizeof(WCHAR));
+    storeBytes = min(StoreBytes, (ULONG)RBF_MAX_PATH * sizeof(WCHAR));
+    sidBytes   = min(SidBytes,   (ULONG)RBF_MAX_NAME * sizeof(WCHAR));
+
+    if (pathBytes  < sizeof(WCHAR)) pathBytes  = sizeof(WCHAR);
+    if (storeBytes < sizeof(WCHAR)) storeBytes = sizeof(WCHAR);
+    if (sidBytes   < sizeof(WCHAR)) sidBytes   = sizeof(WCHAR);
+
+    pathBytes  -= (pathBytes  % sizeof(WCHAR));
+    storeBytes -= (storeBytes % sizeof(WCHAR));
+    sidBytes   -= (sidBytes   % sizeof(WCHAR));
+
+    total = (ULONG)sizeof(RBF_NOTIFICATION) + pathBytes + storeBytes + sidBytes;
+    if (total > RBF_NOTIFY_MAX_SIZE) return STATUS_BUFFER_OVERFLOW;
+
+    note = (PRBF_NOTIFICATION)ExAllocatePool2(POOL_FLAG_PAGED, total, RBF_TAG);
+    if (!note) return STATUS_INSUFFICIENT_RESOURCES;
+
+    RtlZeroMemory(note, total);
+
+    note->Magic           = RBF_NOTIFY_MAGIC;
+    note->TotalSize       = total;
+    note->PathOffset      = (ULONG)sizeof(RBF_NOTIFICATION);
+    note->StorePathOffset = note->PathOffset + pathBytes;
+    note->SidOffset       = note->StorePathOffset + storeBytes;
+
+    *OutNote = note;
+    return STATUS_SUCCESS;
+}
+
+/* Each setter derives its own capacity from the neighbouring offset, so it
+   can never write past the end of the allocation. */
+VOID RbfNotifySetPath(_Inout_ PRBF_NOTIFICATION Note, _In_opt_ PCUNICODE_STRING Src)
+{
+    if (!Note) return;
+    Note->PathLength = RbfNotifySetStr(
+        Note, Note->PathOffset,
+        Note->StorePathOffset - Note->PathOffset, Src);
+}
+
+VOID RbfNotifySetStorePath(_Inout_ PRBF_NOTIFICATION Note, _In_opt_ PCUNICODE_STRING Src)
+{
+    if (!Note) return;
+    Note->StorePathLength = RbfNotifySetStr(
+        Note, Note->StorePathOffset,
+        Note->SidOffset - Note->StorePathOffset, Src);
+}
+
+VOID RbfNotifySetSid(_Inout_ PRBF_NOTIFICATION Note, _In_opt_ PCUNICODE_STRING Src)
+{
+    if (!Note) return;
+    Note->SidLength = RbfNotifySetStr(
+        Note, Note->SidOffset,
+        Note->TotalSize - Note->SidOffset, Src);
+}
+
+VOID RbfNotifyFree(_In_ PRBF_NOTIFICATION Note)
+{
+    if (Note) ExFreePoolWithTag(Note, RBF_TAG);
+}
+
+/* ============================================================
  * Async notification queue (bounded) + async send worker
  * ========================================================== */
+
+/* ============================================================
+ * Queue slot reservation  (RB-08)
+ *
+ * A burst of deletes -- `rd /s`, a cleanup job, a backup rotation -- produces
+ * one notification per file. When the bounded queue fills, the old code
+ * dropped the notification AFTER the file had already been renamed into
+ * staging, so every dropped notification silently became an orphan: a staged
+ * file with no database row, invisible to restore, outside quota accounting,
+ * and never purged. Those accumulate until the shared volume fills up.
+ *
+ * Reserving inverts the order. The callback takes a queue slot before it
+ * stages anything, so "queue is full" is discovered while the file is still
+ * untouched and the delete can simply be refused (fail-closed). The staged
+ * file can then never outlive its notification.
+ * ========================================================== */
+BOOLEAN RbfReserveQueueSlot(VOID)
+{
+    KIRQL   irql;
+    BOOLEAN ok = FALSE;
+
+    KeAcquireSpinLock(&G.QueueLock, &irql);
+    if (G.Reserved < RBF_QUEUE_MAX) {
+        G.Reserved++;
+        ok = TRUE;
+    }
+    KeReleaseSpinLock(&G.QueueLock, irql);
+
+    return ok;
+}
+
+/* Release a reservation that was never converted into a queued entry. */
+VOID RbfReleaseQueueSlot(VOID)
+{
+    KIRQL irql;
+
+    KeAcquireSpinLock(&G.QueueLock, &irql);
+    if (G.Reserved > 0) G.Reserved--;
+    KeReleaseSpinLock(&G.QueueLock, irql);
+}
+
+/* Convert a reservation into a queued entry. Caller holds no lock. */
+static VOID RbfCommitQueueSlot(VOID)
+{
+    KIRQL irql;
+
+    KeAcquireSpinLock(&G.QueueLock, &irql);
+    if (G.Reserved > 0) G.Reserved--;
+    G.QueueDepth++;
+    if (G.QueueDepth > G.MaxQueueDepth) G.MaxQueueDepth = G.QueueDepth;
+    KeReleaseSpinLock(&G.QueueLock, irql);
+}
+
+/* Takes ownership of Note and frees it on every failure path.
+   Assumes a slot was reserved via RbfReserveQueueSlot(); the reservation is
+   always released here, on both success and failure. */
 NTSTATUS RbfQueueNotify(_In_ PRBF_NOTIFICATION Note)
 {
     PRBF_NOTIFY_NODE node;
     KIRQL irql;
     PFLT_PORT port;
 
-    if (!G.QueueActive) return STATUS_DEVICE_NOT_READY;
+    /* Reject anything that is not a well-formed notification rather than
+       walking off its offsets. */
+    if (!Note ||
+        Note->Magic != RBF_NOTIFY_MAGIC ||
+        Note->TotalSize < sizeof(RBF_NOTIFICATION) ||
+        Note->TotalSize > RBF_NOTIFY_MAX_SIZE) {
+        RbfReleaseQueueSlot();
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!G.QueueActive) {
+        RbfNotifyFree(Note);
+        RbfReleaseQueueSlot();
+        InterlockedIncrement64((volatile LONG64 *)&G.Stats.NotifyDropped);
+        return STATUS_DEVICE_NOT_READY;
+    }
 
     /* Snapshot the client port under the queue lock. */
     KeAcquireSpinLock(&G.QueueLock, &irql);
     port = G.ClientPort;
     KeReleaseSpinLock(&G.QueueLock, irql);
     if (port == NULL) {
+        RbfNotifyFree(Note);
+        RbfReleaseQueueSlot();
         InterlockedIncrement64((volatile LONG64 *)&G.Stats.NotifyDropped);
         return STATUS_PORT_DISCONNECTED;
     }
 
     node = ExAllocatePool2(POOL_FLAG_PAGED, sizeof(RBF_NOTIFY_NODE), RBF_TAG);
     if (!node) {
+        RbfNotifyFree(Note);
+        RbfReleaseQueueSlot();
         InterlockedIncrement64((volatile LONG64 *)&G.Stats.NotifyDropped);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlCopyMemory(&node->Notification, Note, sizeof(RBF_NOTIFICATION));
-    node->Port = port;
+    node->Notification = Note;
+    node->Size         = Note->TotalSize;
+    node->Port         = port;
 
+    /* The slot was reserved before staging, so the queue cannot be over
+       capacity here -- this insert is the reservation being honoured. */
     KeAcquireSpinLock(&G.QueueLock, &irql);
-    if (G.QueueDepth >= RBF_QUEUE_MAX) {
-        KeReleaseSpinLock(&G.QueueLock, irql);
-        InterlockedIncrement64((volatile LONG64 *)&G.Stats.NotifyQueueFull);
-        ExFreePoolWithTag(node, RBF_TAG);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
     InsertTailList(&G.NotifyQueue, &node->Entry);
+    if (G.Reserved > 0) G.Reserved--;
     G.QueueDepth++;
     if (G.QueueDepth > G.MaxQueueDepth) G.MaxQueueDepth = G.QueueDepth;
-    G.Stats.QueueDepth = G.QueueDepth;
+    G.Stats.QueueDepth    = G.QueueDepth;
     G.Stats.MaxQueueDepth = G.MaxQueueDepth;
     KeReleaseSpinLock(&G.QueueLock, irql);
 
@@ -590,8 +796,9 @@ VOID RbfSendThread(_In_ PVOID Context)
                    port is still open. */
                 LARGE_INTEGER timeout;
                 timeout.QuadPart = -30LL * 10 * 1000 * 1000; /* 100ns units */
+                /* Send only the bytes this notification actually uses. */
                 status = FltSendMessage(G.Filter, &port,
-                                        &node->Notification, sizeof(RBF_NOTIFICATION),
+                                        node->Notification, node->Size,
                                         NULL, NULL, &timeout);
             }
             if (NT_SUCCESS(status)) {
@@ -599,6 +806,7 @@ VOID RbfSendThread(_In_ PVOID Context)
             } else {
                 InterlockedIncrement64((volatile LONG64 *)&G.Stats.NotifyDropped);
             }
+            RbfNotifyFree(node->Notification);
             ExFreePoolWithTag(node, RBF_TAG);
         }
     }
@@ -619,6 +827,7 @@ VOID RbfFlushQueue(VOID)
                                  RBF_NOTIFY_NODE, Entry);
         G.QueueDepth--;
         KeReleaseSpinLock(&G.QueueLock, irql);
+        RbfNotifyFree(node->Notification);
         ExFreePoolWithTag(node, RBF_TAG);
     }
 }
@@ -737,6 +946,41 @@ NTSTATUS RbfPortMessage(
 }
 
 /* ============================================================
+ * Fail-open / fail-closed decision  (RB-04)
+ *
+ * Every point where the driver cannot stage a delete used to fall back to
+ * "allow the real delete", silently and permanently destroying the very file
+ * this product exists to protect. Those failures now all route through here:
+ *
+ *   fail-closed (1, default) -- complete the request with STATUS_ACCESS_DENIED.
+ *       The data survives and the user simply retries once staging is healthy.
+ *   fail-open   (0, legacy)  -- let the delete proceed and lose the file.
+ *
+ * Both branches are counted, so a sick staging area is visible in the
+ * statistics instead of hiding behind a string of invisible data losses.
+ * ========================================================== */
+static FLT_PREOP_CALLBACK_STATUS
+RbfFailDelete(
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_    PCWSTR             Reason,
+    _In_    NTSTATUS           FailureStatus)
+{
+    if (!G.FailClosed) {
+        DbgPrint("[RBF] %ws failed 0x%X, allowing real delete (fail-open)\n",
+                 Reason, FailureStatus);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    InterlockedIncrement64((volatile LONG64 *)&G.Stats.DeleteDenied);
+    DbgPrint("[RBF] %ws failed 0x%X, denying delete (fail-closed)\n",
+             Reason, FailureStatus);
+
+    Data->IoStatus.Status      = STATUS_ACCESS_DENIED;
+    Data->IoStatus.Information = 0;
+    return FLT_PREOP_COMPLETE;
+}
+
+/* ============================================================
  * Core: Pre delete callback
  * ========================================================== */
 FLT_PREOP_CALLBACK_STATUS
@@ -749,7 +993,7 @@ RbfPreSetInfo(
     PFLT_FILE_NAME_INFORMATION    nameInfo = NULL;
     FILE_STANDARD_INFORMATION     stdInfo;
     UNICODE_STRING                storePath = {0};
-    RBF_NOTIFICATION              note = {0};
+    PRBF_NOTIFICATION             note = NULL;   /* paged pool, never on stack */
     NTSTATUS                      status;
     ULONG                         sessionId = 0;
 
@@ -779,7 +1023,7 @@ RbfPreSetInfo(
         FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
         &nameInfo);
     if (!NT_SUCCESS(status))
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        return RbfFailDelete(Data, L"get file name", status);
 
     FltParseFileNameInformation(nameInfo);
 
@@ -797,25 +1041,38 @@ RbfPreSetInfo(
     status = RbfGetRequestorSid(Data, sessionId, &sidStr);
     if (!NT_SUCCESS(status)) {
         FltReleaseFileNameInformation(nameInfo);
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        return RbfFailDelete(Data, L"get requestor sid", status);
+    }
+
+    /* 5.2 Reserve a notification slot BEFORE staging (RB-08).
+          A burst of deletes (rd /s, cleanup jobs) can outrun the queue; if we
+          only discovered that after the rename, every dropped notification
+          would leave an unrecoverable orphan in staging. Checking here means
+          a full queue refuses the delete while the data is still intact. */
+    if (!RbfReserveQueueSlot()) {
+        InterlockedIncrement64((volatile LONG64 *)&G.Stats.NotifyQueueFull);
+        ExFreePoolWithTag(sidStr.Buffer, RBF_TAG);
+        FltReleaseFileNameInformation(nameInfo);
+        return RbfFailDelete(Data, L"notification queue full",
+                             STATUS_INSUFFICIENT_RESOURCES);
     }
 
     /* 5.5 Ensure staging directories exist: <vol>\RBStore and <vol>\RBStore\<sid> */
     status = RbfEnsureStoreDir(&nameInfo->Volume, &sidStr);
     if (!NT_SUCCESS(status)) {
-        /* Cannot stage -> fail-open (allow real delete). */
-        DbgPrint("[RBF] ensure store dir failed 0x%X, allowing real delete\n", status);
+        RbfReleaseQueueSlot();
         ExFreePoolWithTag(sidStr.Buffer, RBF_TAG);
         FltReleaseFileNameInformation(nameInfo);
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        return RbfFailDelete(Data, L"ensure store dir", status);
     }
 
     /* 6. Build staging target path: <Vol>\RBStore\<Sid>\<rel> */
     status = RbfBuildStorePath(&sidStr, &nameInfo->Name, &storePath);
     if (!NT_SUCCESS(status)) {
+        RbfReleaseQueueSlot();
         if (sidStr.Buffer) ExFreePoolWithTag(sidStr.Buffer, RBF_TAG);
         FltReleaseFileNameInformation(nameInfo);
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        return RbfFailDelete(Data, L"build store path", status);
     }
 
     /* 7. Execute rename to staging */
@@ -826,25 +1083,37 @@ RbfPreSetInfo(
         Data->IoStatus.Status      = STATUS_SUCCESS;
         Data->IoStatus.Information = 0;
 
-        /* 8. Fill notification and async enqueue (non-blocking) */
-        note.PathLength      = nameInfo->Name.Length;
-        note.StorePathLength = storePath.Length;
-        note.FileSize        = 0;
-        note.SessionId       = sessionId;
-        note.IsDirectory     = 0;
-        if (NT_SUCCESS(FltQueryInformationFile(
-                FltObjects->Instance, FltObjects->FileObject,
-                &stdInfo, sizeof(stdInfo), FileStandardInformation, NULL))) {
-            note.FileSize = stdInfo.EndOfFile.QuadPart;
-            note.IsDirectory = stdInfo.Directory;
+        /* 8. Build a variable-length notification and enqueue it (RB-01).
+              Allocated from paged pool, so the pre-callback's stack frame
+              stays at a few dozen bytes instead of ~64 KB. */
+        note = NULL;
+        status = RbfAllocNotify(nameInfo->Name.Length + sizeof(WCHAR),
+                                storePath.Length      + sizeof(WCHAR),
+                                sidStr.Length         + sizeof(WCHAR),
+                                &note);
+        if (!NT_SUCCESS(status)) {
+            /* The rename already succeeded, so the file sits in staging with
+               no database row: an orphan. Count the drop so it shows up in
+               the statistics instead of failing silently. */
+            InterlockedIncrement64((volatile LONG64 *)&G.Stats.NotifyDropped);
+            DbgPrint("[RBF] alloc notify failed 0x%X, staged file orphaned\n",
+                     status);
+        } else {
+            RbfNotifySetPath(note, &nameInfo->Name);
+            RbfNotifySetStorePath(note, &storePath);
+            RbfNotifySetSid(note, &sidStr);
+            note->FileSize    = 0;
+            note->SessionId   = sessionId;
+            note->IsDirectory = 0;
+            if (NT_SUCCESS(FltQueryInformationFile(
+                    FltObjects->Instance, FltObjects->FileObject,
+                    &stdInfo, sizeof(stdInfo), FileStandardInformation, NULL))) {
+                note->FileSize    = stdInfo.EndOfFile.QuadPart;
+                note->IsDirectory = stdInfo.Directory;
+            }
+            RbfQueueNotify(note);   /* takes ownership, frees on failure */
+            note = NULL;
         }
-        RtlCopyMemory(note.FilePath, nameInfo->Name.Buffer,
-                      min(nameInfo->Name.Length, RBF_MAX_PATH * sizeof(WCHAR)));
-        RtlCopyMemory(note.StorePath, storePath.Buffer,
-                      min(storePath.Length, RBF_MAX_PATH * sizeof(WCHAR)));
-        if (sidStr.Length < RBF_MAX_NAME * sizeof(WCHAR))
-            RtlCopyMemory(note.SidString, sidStr.Buffer, sidStr.Length);
-        RbfQueueNotify(&note);
 
         ExFreePoolWithTag(storePath.Buffer, RBF_TAG);
         if (sidStr.Buffer) ExFreePoolWithTag(sidStr.Buffer, RBF_TAG);
@@ -852,13 +1121,14 @@ RbfPreSetInfo(
         return FLT_PREOP_COMPLETE;
     }
 
-    /* Failure: allow real delete (fail-open), just log + count */
+    /* Staging failed. The file is untouched so far -- decide whether the
+       delete may proceed and destroy it, per the fail-closed policy. */
     InterlockedIncrement64((volatile LONG64 *)&G.Stats.RenameFail);
-    DbgPrint("[RBF] rename failed 0x%X, allowing real delete\n", status);
+    RbfReleaseQueueSlot();
     ExFreePoolWithTag(storePath.Buffer, RBF_TAG);
     if (sidStr.Buffer) ExFreePoolWithTag(sidStr.Buffer, RBF_TAG);
     FltReleaseFileNameInformation(nameInfo);
-    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    return RbfFailDelete(Data, L"rename to staging", status);
 }
 
 /* ============================================================
@@ -907,6 +1177,10 @@ NTSTATUS DriverEntry(
 
     /* Default StoreRoot (reserved, paths derived from source volume) */
     RtlInitUnicodeString(&G.StoreRoot, L"\\??\\C:\\RBStore");
+
+    /* RB-04: never destroy data silently. RbfLoadConfig() may still turn this
+       off explicitly via Parameters\FailClosed = 0. */
+    G.FailClosed = 1;
 
     RbfLoadConfig();
 

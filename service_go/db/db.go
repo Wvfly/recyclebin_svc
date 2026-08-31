@@ -20,6 +20,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go driver, no cgo required
@@ -300,6 +301,27 @@ func (d *DB) ListItems(limit, offset int, status, sid string) ([]Item, error) {
 	return scanItems(rows)
 }
 
+// likeEscape neutralises the LIKE metacharacters in user input (RB-09).
+//
+// Without it a search for "50%" silently becomes "match anything", and a
+// search for "_" matches every single-character path. The ESCAPE clause below
+// tells SQLite which character introduces a literal %, _ or backslash, so the
+// caller's text is matched verbatim.
+func likeEscape(s string) string {
+	const esc = `\`
+	var b strings.Builder
+	b.Grow(len(s) * 2)
+
+	for _, r := range s {
+		switch r {
+		case '%', '_', '\\':
+			b.WriteString(esc)
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 // SearchItems performs a substring match on the original path.
 func (d *DB) SearchItems(pattern string, limit int) ([]Item, error) {
 	if limit <= 0 {
@@ -309,8 +331,12 @@ func (d *DB) SearchItems(pattern string, limit int) ([]Item, error) {
 		limit = 1000
 	}
 
-	q := "SELECT " + itemCols + " FROM items WHERE orig_path LIKE ? ORDER BY id DESC LIMIT ?"
-	rows, err := d.ro.Query(q, "%"+pattern+"%", limit)
+	// The surrounding % are intentional wildcards; anything inside the user's
+	// pattern is escaped so it is matched literally (RB-09).
+	q := "SELECT " + itemCols +
+		" FROM items WHERE orig_path LIKE ? ESCAPE '\\'" +
+		" ORDER BY id DESC LIMIT ?"
+	rows, err := d.ro.Query(q, "%"+likeEscape(pattern)+"%", limit)
 	if err != nil {
 		return nil, err
 	}

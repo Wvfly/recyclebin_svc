@@ -22,9 +22,16 @@
 #define RBF_TAG             'rbfR'      /* Pool tag */
 #define RBF_PORT_NAME       L"\\RecycleBinPort"
 #define RBF_ALTITUDE        L"370030"   /* Activity Monitor range */
-/* Path buffer (WCHAR count). Kept <= 16383 so that
-   MaximumLength (= count*sizeof(WCHAR)) fits in a USHORT. */
-#define RBF_MAX_PATH        16383
+/* Path buffer (WCHAR count).
+ *
+ * Was 16383, which made one RBF_NOTIFICATION roughly 64 KB -- far beyond the
+ * 24 KB kernel stack, so declaring one as a local in a pre-callback
+ * overflowed the stack and bugchecked on the very first intercepted delete
+ * (RB-01). Notifications are now VARIABLE LENGTH: a fixed 48-byte header plus
+ * only as many path bytes as the request actually needs, allocated from paged
+ * pool. 1024 WCHAR still covers every realistic share layout while keeping
+ * the worst case near 5 KB. */
+#define RBF_MAX_PATH        1024
 #define RBF_MAX_NAME        256
 
 /* Maximum number of protected path entries cached in driver */
@@ -36,18 +43,48 @@
 /* User-mode -> driver commands (RBF_REPLY.Ack) */
 #define RBF_CMD_QUERY_STATS 1
 
-/* Driver -> user-mode notification */
+/* Sanity tag written into every notification so a malformed or stale buffer
+   can be rejected instead of parsed. */
+#define RBF_NOTIFY_MAGIC    0x52424654UL   /* 'RBFT' */
+
+/* Upper bound on one serialized notification (header + payload), in bytes. */
+#define RBF_NOTIFY_MAX_SIZE ((ULONG)(sizeof(RBF_NOTIFICATION) + \
+    ((RBF_MAX_PATH + RBF_MAX_PATH + RBF_MAX_NAME) * sizeof(WCHAR))))
+
+/* Driver -> user-mode notification.
+ *
+ * VARIABLE LENGTH -- never declare one of these on the stack. Layout:
+ *
+ *   [ header ][ FilePath UTF16+NUL ][ StorePath UTF16+NUL ][ Sid UTF16+NUL ]
+ *
+ * Offsets are byte offsets from the start of the header. The *Length fields
+ * count payload bytes EXCLUDING the terminating NUL, which is the same
+ * convention the old fixed-layout struct used, so user-mode parsing
+ * semantics are unchanged.
+ *
+ * Allocate with RbfAllocNotify() and fill with RbfNotifySetPath() /
+ * RbfNotifySetStorePath() / RbfNotifySetSid().
+ */
 #pragma pack(push, 1)
 typedef struct _RBF_NOTIFICATION {
-    WCHAR   FilePath[RBF_MAX_PATH];   /* Original full path (NT form) */
-    ULONG   PathLength;               /* Bytes (excluding NULL) */
-    WCHAR   StorePath[RBF_MAX_PATH];  /* Staging target path (NT form) */
-    ULONG   StorePathLength;
-    ULONG64 FileSize;                 /* Bytes */
-    ULONG   SessionId;                /* Requestor session ID */
-    ULONG   IsDirectory;              /* 1 = directory */
-    WCHAR   SidString[RBF_MAX_NAME];  /* Requestor SID string */
+    ULONG   Magic;              /* RBF_NOTIFY_MAGIC */
+    ULONG   TotalSize;          /* header + all payload, in bytes */
+    ULONG   PathOffset;         /* FilePath, byte offset from struct start */
+    ULONG   PathLength;         /* bytes, excluding NUL */
+    ULONG   StorePathOffset;    /* staging path, byte offset */
+    ULONG   StorePathLength;    /* bytes, excluding NUL */
+    ULONG   SidOffset;          /* requestor SID string, byte offset */
+    ULONG   SidLength;          /* bytes, excluding NUL */
+    ULONG64 FileSize;           /* bytes */
+    ULONG   SessionId;          /* requestor session ID */
+    ULONG   IsDirectory;        /* 1 = directory */
 } RBF_NOTIFICATION, *PRBF_NOTIFICATION;
+
+/* Payload accessors. The offsets come from the header, so a truncated buffer
+   is always addressed inside its own TotalSize. */
+#define RBF_NOTIFY_PATH(n)      ((PWCH)((PUCHAR)(n) + (n)->PathOffset))
+#define RBF_NOTIFY_STOREPATH(n) ((PWCH)((PUCHAR)(n) + (n)->StorePathOffset))
+#define RBF_NOTIFY_SID(n)       ((PWCH)((PUCHAR)(n) + (n)->SidOffset))
 
 /* User-mode -> driver command */
 typedef struct _RBF_REPLY {
@@ -62,16 +99,23 @@ typedef struct _RBF_STATS {
     ULONG64 NotifySent;       /* delivered to user-mode */
     ULONG64 NotifyDropped;    /* dropped (no client / alloc failure / send error) */
     ULONG64 NotifyQueueFull;  /* dropped because queue was full */
+    ULONG64 DeleteDenied;     /* fail-closed: delete refused, data preserved */
     ULONG   QueueDepth;       /* current queue depth */
     ULONG   MaxQueueDepth;    /* high-water mark */
 } RBF_STATS, *PRBF_STATS;
 #pragma pack(pop)
 
-/* Async notification queue node (fire-and-forget) */
+/* Async notification queue node (fire-and-forget).
+ *
+ * Holds a POINTER to a pool-allocated, variable-length notification -- never
+ * an inline copy -- so the node stays small regardless of path length and
+ * the queue's memory footprint tracks actual usage instead of the maximum
+ * possible path (RB-07). */
 typedef struct _RBF_NOTIFY_NODE {
-    LIST_ENTRY      Entry;
-    PFLT_PORT       Port;           /* client port snapshot at enqueue time */
-    RBF_NOTIFICATION Notification;
+    LIST_ENTRY        Entry;
+    PFLT_PORT         Port;         /* client port snapshot at enqueue time */
+    ULONG             Size;         /* bytes of *Notification */
+    PRBF_NOTIFICATION Notification; /* paged pool, owned by this node */
 } RBF_NOTIFY_NODE, *PRBF_NOTIFY_NODE;
 
 /* Protected path cache entry */
@@ -90,8 +134,14 @@ typedef struct _RBF_GLOBAL {
     KSPIN_LOCK      QueueLock;
     LIST_ENTRY      NotifyQueue;
     BOOLEAN         QueueActive;
-    ULONG           QueueDepth;
+    ULONG           QueueDepth;    /* entries sitting in NotifyQueue */
     ULONG           MaxQueueDepth;
+    /* Slots handed out to callbacks that have decided to stage a file but
+       have not enqueued their notification yet (RB-08).
+       Effective occupancy is QueueDepth + Reserved; a slot must be reserved
+       BEFORE the rename so that a full queue can never turn a staged file
+       into an orphan. */
+    ULONG           Reserved;
 
     /* Async send thread (single consumer, serialized by design) */
     KEVENT          NotifyEvent;
@@ -99,6 +149,13 @@ typedef struct _RBF_GLOBAL {
 
     /* Statistics (visible to user-mode via RBF_CMD_QUERY_STATS) */
     RBF_STATS       Stats;
+
+    /* Fail-closed policy (RB-04).
+     *   1 = refuse a delete we cannot stage, so data is never destroyed
+     *       silently (recommended, and the default)
+     *   0 = legacy fail-open: let the real delete through and lose the file
+     * Registry: Parameters\FailClosed (REG_DWORD). */
+    ULONG           FailClosed;
 
     /* Monotonic sequence for flat staging names (<seq>_<basename>) */
     ULONG64         StageSeq;
@@ -141,7 +198,25 @@ NTSTATUS RbfMoveToStore(_In_ PCFLT_RELATED_OBJECTS FltObjects,
                         _In_ PFILE_OBJECT FileObject,
                         _In_ PCUNICODE_STRING StorePath);
 
-/* Notification queue */
+/* Notification allocation / fill (variable length, paged pool) */
+NTSTATUS RbfAllocNotify(_In_     ULONG               PathBytes,
+                        _In_     ULONG               StoreBytes,
+                        _In_     ULONG               SidBytes,
+                        _Outptr_ PRBF_NOTIFICATION  *OutNote);
+VOID     RbfNotifySetPath(_Inout_  PRBF_NOTIFICATION Note,
+                          _In_opt_ PCUNICODE_STRING  Src);
+VOID     RbfNotifySetStorePath(_Inout_  PRBF_NOTIFICATION Note,
+                               _In_opt_ PCUNICODE_STRING  Src);
+VOID     RbfNotifySetSid(_Inout_  PRBF_NOTIFICATION Note,
+                         _In_opt_ PCUNICODE_STRING  Src);
+VOID     RbfNotifyFree(_In_ PRBF_NOTIFICATION Note);
+
+/* Queue slot reservation (RB-08): reserve BEFORE staging so a full queue is
+   detected while the file is still untouched. */
+BOOLEAN  RbfReserveQueueSlot(VOID);
+VOID     RbfReleaseQueueSlot(VOID);
+
+/* Notification queue -- takes ownership of Note and of the reserved slot */
 NTSTATUS RbfQueueNotify(_In_ PRBF_NOTIFICATION Note);
 VOID     RbfFlushQueue(VOID);
 VOID     RbfSendThread(_In_ PVOID Context);

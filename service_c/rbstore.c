@@ -249,9 +249,27 @@ void StoreDeleteEntry(const RBSVC_ITEM *item)
               : VolNtToDos(primary);
     if (!dos) return;
 
+    /* RB-08: a directory delete is staged as a whole subtree, so reclaiming
+       it needs RemoveDirectoryW -- DeleteFileW always fails on a directory
+       and would leave the tree in staging forever. Try the directory form
+       first; it fails harmlessly on files. */
+    if (!RemoveDirectoryW(dos)) {
+        DWORD err = GetLastError();
+
+        if (err == ERROR_DIRECTORY_NOT_SUPPORTED ||
+            err == ERROR_FILE_NOT_FOUND ||
+            err == ERROR_PATH_NOT_FOUND ||
+            err == ERROR_DIRECTORY) {
+            /* Not a directory, or already gone: fall through to file delete. */
+        } else {
+            LogErrorWin(err, L"[purge] remove directory failed %s", dos);
+        }
+    }
+
     if (!DeleteFileW(dos)) {
         DWORD err = GetLastError();
-        if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) {
+        if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND &&
+            err != ERROR_ACCESS_DENIED) {
             LogErrorWin(err, L"[purge] delete failed %s", dos);
         }
     }

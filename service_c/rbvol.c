@@ -73,6 +73,34 @@ void VolInit(void)
 }
 
 /* Returns allocated DOS path, or NULL if no volume matches. */
+/* Reverse of VolNtToDos, needed to look a staging file up in the database
+   (items.store_path is stored in NT form, while we enumerate staging through
+   the DOS path). Returns an allocated string; caller free(). */
+WCHAR *VolDosToNt(const WCHAR *dosPath)
+{
+    int i;
+    WCHAR *out;
+    size_t devLen, restLen;
+
+    if (!dosPath || dosPath[0] == L'\0' || dosPath[1] != L':') return NULL;
+    if (!g_VolInited) VolInit();
+
+    for (i = 0; i < g_VolCount; i++) {
+        if (_wcsnicmp(dosPath, g_Vols[i].Drive, 2) != 0) continue;
+
+        devLen  = wcslen(g_Vols[i].Device);
+        restLen = wcslen(dosPath + 2);
+
+        out = (WCHAR *)malloc((devLen + restLen + 2) * sizeof(WCHAR));
+        if (!out) return NULL;
+
+        memcpy(out, g_Vols[i].Device, devLen * sizeof(WCHAR));
+        memcpy(out + devLen, dosPath + 2, (restLen + 1) * sizeof(WCHAR));
+        return out;
+    }
+    return NULL;   /* drive not in the map */
+}
+
 WCHAR *VolNtToDos(const WCHAR *ntPath)
 {
     int i, best = -1, bestLen = 0;

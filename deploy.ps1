@@ -27,6 +27,12 @@ $Root   = $PSScriptRoot
 # ============================================================
 # 受保护共享根 (DOS 形式), 部署时解析为 NT 卷路径写入驱动注册表
 $ProtectedDos = @("D:\Share")
+
+# 暂存失败时的策略 (RB-04)
+#   1 = 拒绝删除, 保住数据 (默认, 生产推荐)
+#   0 = 放行真删, 文件永久丢失 —— 仅作为暂存区故障时的应急旁路
+$FailClosed = 1
+
 # 用户态配置 (HKLM\SOFTWARE\RecycleBin)
 $UserCfg = @{
     StoreRoot     = "D:\RBStore"      # 必须与 $ProtectedDos 同卷!
@@ -193,6 +199,15 @@ Ensure-RegKey $drvReg
 Set-ItemProperty $drvReg "ProtectedPaths" ([string[]]$NtPaths) -Type MultiString
 Write-Host "  ProtectedPaths:"
 $NtPaths | ForEach-Object { Write-Host "    $_" }
+
+# RB-04: 无法暂存时拒绝删除, 而不是静默真删
+Set-ItemProperty $drvReg "FailClosed" $FailClosed -Type DWord
+if ($FailClosed -eq 1) {
+    Write-Host "  FailClosed = 1 (暂存失败时拒绝删除, 数据不丢)"
+} else {
+    Write-Host ""
+    Write-Host "  [!] 警告: FailClosed=0, 暂存失败将放行真删 (数据永久丢失)" -ForegroundColor Yellow
+}
 
 $userReg = "HKLM:\SOFTWARE\RecycleBin"
 Ensure-RegKey $userReg
