@@ -26,7 +26,7 @@ $Root   = $PSScriptRoot
 # 多卷保护当前不支持 (需驱动改造为"拷贝+删源")。
 # ============================================================
 # 受保护共享根 (DOS 形式), 部署时解析为 NT 卷路径写入驱动注册表
-$ProtectedDos = @("D:\Share")
+$ProtectedDos = @("E:\tmp\share")
 
 # 暂存失败时的策略 (RB-04)
 #   1 = 拒绝删除, 保住数据 (默认, 生产推荐)
@@ -35,12 +35,12 @@ $FailClosed = 1
 
 # 用户态配置 (HKLM\SOFTWARE\RecycleBin)
 $UserCfg = @{
-    StoreRoot     = "D:\RBStore"      # 必须与 $ProtectedDos 同卷!
+    StoreRoot     = "E:\RBStore"      # 必须与 $ProtectedDos 同卷!
     QuotaMB       = 5120              # 每用户回收站配额 (MB)
     RetentionDays = 30                # 保留天数
     EnableRestApi = 1                 # 开启管理 REST API
     RestApiPort   = 8800
-    RestApiToken  = "change-me"       # REST 访问令牌 —— 务必改掉! (留空则不鉴权)
+    RestApiToken  = ""                # REST 访问令牌 —— 留空则不鉴权 (本机部署建议), 设值则启用 token 校验
     DiskFreeMinMB = 5120              # 磁盘剩余水位 (MB), 低于则启动清理
 }
 
@@ -142,13 +142,16 @@ if ($badPaths.Count -gt 0) {
 
 Write-Host "  OK: StoreRoot (卷 $storeDrive) 与所有受保护共享同卷"
 
-# REST 令牌仍是默认值则告警 (不阻断: API 只监听 127.0.0.1, 但弱口令仍是隐患)
+# REST 令牌提示 (不阻断: API 只监听 127.0.0.1)
 if ($UserCfg["EnableRestApi"] -eq 1) {
     $tok = [string]$UserCfg["RestApiToken"]
-    if ($tok -eq "" -or $tok -eq "change-me") {
+    if ($tok -eq "") {
+        Write-Host ""
+        Write-Host "  [i] RestApiToken 为空: REST API 未启用鉴权 (仅本机 127.0.0.1, 可接受)" -ForegroundColor Cyan
+        Write-Host ""
+    } elseif ($tok -eq "change-me") {
         Write-Host ""
         Write-Host "  [!] 警告: RestApiToken 仍为默认值, 建议改成强随机值" -ForegroundColor Yellow
-        Write-Host "      REST API 仅监听 127.0.0.1, 风险有限, 但仍应修改。"
         Write-Host ""
     }
 }
@@ -223,9 +226,16 @@ Write-Host "[2/6] 创建暂存区根目录"
 $storeRoot = $UserCfg["StoreRoot"]
 if (-not (Test-Path $storeRoot)) {
     New-Item -ItemType Directory -Force $storeRoot | Out-Null
-    # 隐藏 + 系统属性, 避免共享用户看到
-    $attrib = (Get-ItemProperty -Path $storeRoot -Name Attributes -ErrorAction SilentlyContinue).Attributes
-    Set-ItemProperty -Path $storeRoot -Name Attributes -Value ($attrib -bor 0x2 -bor 0x4)
+}
+# 隐藏 + 系统属性, 避免共享用户看到。
+# 注意: PowerShell 的 Set-ItemProperty 对"目录"不支持设置 Attributes
+# (仅文件有效), 旧写法会导致部署在 [2/6] 中断。改用 .NET
+# File.SetAttributes, 对目录同样有效, 且目录已存在时重跑也能幂等补上。
+try {
+    [System.IO.File]::SetAttributes($storeRoot,
+        [System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System)
+} catch {
+    Write-Warning "设置暂存区隐藏/系统属性失败: $($_.Exception.Message)"
 }
 Write-Host "  StoreRoot: $storeRoot"
 
@@ -243,8 +253,51 @@ if ($sys) {
     Write-Warning "未找到 rbminiflt.sys, 请先运行 build_all.cmd Release"
 }
 if ($inf) {
-    pnputil /add-driver $inf /install | Out-Null
-    Write-Host "  驱动已注册 (Altitude 370030)"
+    # 不要吞掉 pnputil 输出: 未签名驱动 + 未开启 testsigning 时这里会
+    # "Access is denied" 而静默失败, 导致 [4/6] sc start 报 1060 (服务不存在)。
+    pnputil /add-driver $inf /install
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "pnputil 安装驱动失败 (exit $LASTEXITCODE): 第三方 INF 无数字签名,"
+        Write-Warning "  setupapi 的签名检查不受 testsigning 豁免 (testsigning 只豁免内核加载器)。"
+        Write-Warning "  回退: 按 legacy 文件系统驱动方式直接注册服务 (testsigning 已开启时内核可加载未签名驱动)。"
+        # 确保 sys 就位 (复制到 system32\drivers 这一步上面已做, 这里兜底)
+        if (-not (Test-Path "$env:SystemRoot\system32\drivers\rbminiflt.sys")) {
+            if ($sys) { Copy-Item $sys "$env:SystemRoot\system32\drivers\rbminiflt.sys" -Force }
+        }
+        # 服务已存在则跳过创建 (重跑场景), 否则创建 (模拟 INF 的 Services 段)
+        sc.exe query rbminiflt | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            sc.exe create rbminiflt type= filesys start= system error= normal `
+                binPath= "\SystemRoot\system32\drivers\rbminiflt.sys" depend= FltMgr | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "  sc create rbminiflt 失败 (exit $LASTEXITCODE), 驱动未注册"
+            }
+        }
+        # Mini-Filter 注册信息 (模拟 INF 的 [HKEY...Services\rbminiflt] 节)
+        $svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\rbminiflt"
+        if (-not (Test-Path $svcKey)) { New-Item -Force $svcKey | Out-Null }
+        Set-ItemProperty $svcKey Altitude "370030" -Type String
+        Set-ItemProperty $svcKey Flags 0 -Type DWord
+        Set-ItemProperty $svcKey Group "FSFilter Activity Monitor" -Type String
+        # Mini-Filter 实例注册: FltMgr 要求 Services\rbminiflt\Instances\<实例>\
+        # 存在 Altitude/Flags, 否则 FltRegisterFilter 返回 0xC0000034
+        # (STATUS_OBJECT_NAME_NOT_FOUND), sc start 表现为 exit 2。
+        $instKey = "$svcKey\Instances"
+        if (-not (Test-Path $instKey)) { New-Item -Force $instKey | Out-Null }
+        Set-ItemProperty $instKey "DefaultInstance" "RecycleBin Instance" -Type String
+        $instChild = "$instKey\RecycleBin Instance"
+        if (-not (Test-Path $instChild)) { New-Item -Force $instChild | Out-Null }
+        Set-ItemProperty $instChild Altitude "370030" -Type String
+        Set-ItemProperty $instChild Flags 0 -Type DWord
+        # Parameters 由 [1/6] 写入; 若服务键被删过导致丢失则补写
+        $parKey = "$svcKey\Parameters"
+        if (-not (Test-Path $parKey)) { New-Item -Force $parKey | Out-Null }
+        Set-ItemProperty $parKey "ProtectedPaths" ([string[]]$NtPaths) -Type MultiString
+        Set-ItemProperty $parKey "FailClosed" $FailClosed -Type DWord
+        Write-Host "  驱动已按 legacy 方式注册 (Altitude 370030, testsigning)"
+    } else {
+        Write-Host "  驱动已注册 (Altitude 370030)"
+    }
 } else {
     Write-Warning "未找到 rbminiflt.inf, 跳过驱动注册"
 }

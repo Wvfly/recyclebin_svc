@@ -94,8 +94,10 @@
 #define RBSVC_MAX_RECON_PATH  1024
 
 /* RB-13: how often the driver counters are sampled into driver_stats.
-   These are cumulative counters, so a few seconds of lag costs nothing; the
-   high-water queue depth in the driver covers the in-between peaks. */
+   Sampling happens on the port thread (rbport.c PortThreadProc) by timing out
+   the overlapped FilterGetMessage wait. These are cumulative counters, so a
+   few seconds of lag costs nothing; the high-water queue depth in the driver
+   covers the in-between peaks. */
 #define RBSVC_STATS_INTERVAL     5
 /* RB-13: a snapshot older than this is treated as "driver offline" rather
    than "idle", so a dead driver is never reported as healthy zeros. */

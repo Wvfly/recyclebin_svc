@@ -4,6 +4,7 @@
 - 范围：内核 Mini-Filter 驱动 (`rbminiflt`) + C 核心服务 (`rbservice`) + Go 管理 API (`rbapi`) + 数据模型 + 部署链路
 - 日期：2026-08-31
 - 本轮成果：**修复 10 项**（P0 × 4、P1 × 6），另修正原评估中的 2 处判断偏差
+- 追加轮次：**蓝屏实测修复 2 项**（RB-27 / RB-28，2026-08-31 两次 BSOD dump 定位）
 
 > 文档关系
 >
@@ -35,6 +36,13 @@
 | RB-18 | P1 | 深层目录还原失败（`CreateDirectoryW` 只建一级） | 已修复 |
 | RB-19 | P1 | 删除大目录树极慢（每文件重复创建目录） | 已修复 |
 | RB-22 | P1 | `FileDispositionInformationEx` 未拦截，可绕过整树真删 | 已修复 |
+
+### 蓝屏实测（第三轮，同日追加）
+
+| 编号 | 级别 | 问题 | 状态 |
+|---|---|---|---|
+| RB-27 | P0 | `RbfPortMessage` 回调 7 参数签名 vs FltMgr 实际 6 参数 → 参数错位把 `InputBufferLength`(=4) 当指针解引用 → **0x3B** | 已修复 |
+| RB-28 | P0 | 卸载路径把 `PsCreateSystemThread` 返回的句柄当内核对象指针传给 `KeWaitForSingleObject` → **0xA** | 已修复 |
 
 **未包含在本轮**：RB-02 驱动签名（外部流程，需采购证书 + 提交 Dev Center，2–6 周）、RB-03 Pre 回调重构（需测试机 + Driver Verifier，风险高，暂缓）、RB-20 / RB-21（属结构性设计优化，收益/风险比低于上述三项，待单独立项）。
 
@@ -218,6 +226,74 @@ if (fic == FileDispositionInformation) {
 
 ---
 
+## 三之三、蓝屏实测修复（RB-27 / RB-28）
+
+> **背景**：2026-08-31 测试机连续两次蓝屏，先后分析两份 `MEMORY.DMP`
+> 转储（15:12 与 16:39），分别定位为**消息回调参数错位**与**卸载路径
+> 句柄误用**。两项都是驱动在真实机器上的首个端到端暴露——此前契约测试
+> 不经过内核消息路径，未能捕获。
+
+### RB-27 消息回调参数错位（0x3B）
+
+**问题**：`RbfPortMessage` 声明为 7 参数签名（含 `ServerPortCookie`），
+而 FltMgr 消息回调实际只传 6 参数——`ServerPortCookie` 只能通过
+`FltGetServerPortCookie()` 单独查询。参数在寄存器层面左移一位：
+
+| 寄存器 | FltMgr 实际传入 | 回调误认为 |
+|---|---|---|
+| r8 | `InputBufferLength` = 4 | `InputBuffer` 指针 |
+| r9 | `OutputBuffer` 指针 | `InputBufferLength` |
+
+**崩溃现场**：`cmp dword ptr [r8],1` 解引用地址 `0x4` → `c0000005` →
+Bugcheck `0x3B`。触发者是服务端每 `RBSVC_STATS_INTERVAL` 秒发送的 4 字节
+`RBF_REPLY`（stats 采样轮询）——**连接建立并开始轮询后必崩**。
+
+**修复**：签名改回 FltMgr 标准 6 参数（移除 `ServerPortCookie` 形参），
+`FltCreateCommunicationPort` 回调指针不再强转；需要时用
+`FltGetServerPortCookie(ClientPort)` 获取。
+
+**反汇编核对**：修复前驱动含 `cmp [r8],1`（`41 83 38 01`）特征码；修复后
+该特征为 0 次，代之以 `cmp [rdx],1`（`83 3a 01`）——解引用正确的
+`InputBuffer` 指针。
+
+### RB-28 卸载路径句柄当对象指针（0xA）
+
+**问题**：`PsCreateSystemThread` 返回**句柄**，`RbfUnload` 却把句柄值直接
+传给 `KeWaitForSingleObject`。dump 中 `G.SendThreadHandle` 槽位（`G+0x58`）
+= `0xffffffff800098e0`（无效地址），崩溃线程正等待该"对象"：
+
+```
+Bugcheck 0xA IRQL_NOT_LESS_OR_EQUAL
+Arg1 = ffffffff800098e0      ← G.SendThreadHandle 的值
+Arg2 = 2 (IRQL=DISPATCH_LEVEL)
+崩溃指令 nt!KeWaitForSingleObject+0x18e: lock bts [rdi],7
+```
+
+调用链：`System → IopLoadUnloadDriver → FltpMiniFilterDriverUnload
+→ FltpDoUnloadFilter（持 FilterManagerMutex）→ RbfUnload`。
+**只要 send thread 创建成功，卸载必崩**；`DriverEntry` 的
+`FltStartFiltering` 失败路径同样中招。
+
+**修复**：新增 `RbfStopSendThread()`：
+
+- `ObReferenceObjectByHandle` 把句柄转成 `PETHREAD` 对象指针
+- `KeWaitForSingleObject(对象, Executive, KernelMode, FALSE, NULL)` 等待线程退出
+  （APC_LEVEL 下等待对象指针合法；`KernelMode` 允许触碰非页面池）
+- `ObDereferenceObject` + `ZwClose(句柄)`
+
+`RbfUnload` 与 `DriverEntry` 失败路径均改用它。
+
+**反汇编核对**：新驱动 IAT 新增 `ObReferenceObjectByHandle` 导入；
+`RbfStopSendThread` 反汇编确认 `ObReferenceObjectByHandle` →
+`KeWaitForSingleObject(ThreadObj)` → `ObDereferenceObject` → `ZwClose`
+序列完整。
+
+> **共性问题提示（RB-27 / RB-28）**：两次蓝屏分析均靠 dump 反汇编发现，
+> 此前存在"源码看似已修、产物实际未编译进去"的版本漂移。本次修复后必须
+> **以构建产物为准**（反汇编/IAT 核对）再部署，避免再次踩坑。
+
+---
+
 ## 四、验证
 
 每项修复均执行全量重新编译（`build_all.cmd Release`）并运行两套契约测试：
@@ -229,6 +305,11 @@ if (fic == FileDispositionInformation) {
 | 驱动 / C 服务 / Go API 编译 | 全部成功，**零警告** |
 
 第二轮（RB-18 / RB-19 / RB-22）完成后同样通过全量编译与契约测试。
+
+第三轮（RB-27 / RB-28）修复后再次全量构建：驱动签名成功，契约验证
+`verify_contract.py` 9/9 + `verify_c_contract.py` 10/10 通过；并用
+`dumpbin /disasm` 与 IAT 核对新驱动已包含两项修复（RB-27：无
+`cmp [r8],1` 特征码；RB-28：IAT 新增 `ObReferenceObjectByHandle`）。
 
 ### 契约测试捕获的真实回归
 
@@ -250,6 +331,15 @@ if (fic == FileDispositionInformation) {
 **建议**：RB-02 应尽早启动 —— 它是纯外部依赖，且 HLK 测试套件会反向暴露驱动实现缺陷，可能影响 RB-03 的整改方向。
 
 **风险提示**：本轮修复**仅经过编译与契约验证**。内核路径（RB-01、RB-04、RB-08、RB-19、RB-22）的正确性需要在配备 Driver Verifier 的测试机上做真实删除拦截压测后才能确认，当前环境不具备该条件。
+
+RB-27 / RB-28 虽已修复并经反汇编核对，但**尚未部署到目标机实测**。
+部署 `target\Release\` 全套后需验证：
+
+1. 服务端 stats 轮询（`RBSVC_STATS_INTERVAL` 心跳）不再触发 0x3B —— 对应 RB-27
+2. `sc stop` / 驱动更新卸载路径不再触发 0xA —— 对应 RB-28
+3. 核对系统 `System32\drivers\rbminiflt.sys` 的 SHA256 与构建产物一致，
+   避免再次出现"源码已修、部署的还是旧版"的版本漂移（此前系统里部署的是
+   16:03:58 构建版，未含任何修复）。
 
 RB-19 的指纹缓存是新增的内核状态，压测时应重点验证：
 多用户并发删除、缓存淘汰轮转、以及删除 `\RBStore` 后的自愈路径。

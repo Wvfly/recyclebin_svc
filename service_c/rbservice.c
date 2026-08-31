@@ -40,9 +40,6 @@ time_t g_LastReconcile = 0;
 /* RB-11: throttles the database backup (see rbsvc.h) */
 time_t g_LastBackup = 0;
 
-/* RB-13: throttles driver counter sampling (see rbsvc.h) */
-time_t g_LastStatsSample = 0;
-
 /* Declared in rbpolicy.c / rbrestore.c */
 int RestoreDrainOps(void);
 
@@ -193,13 +190,11 @@ static DWORD WINAPI OpsThreadProc(LPVOID param)
         __try {
             RestoreDrainOps();
 
-            /* RB-13: publish the driver counters every few seconds so
-               rbapi.exe can show real delete/deny/drop numbers instead of a
-               permanently unavailable /stats endpoint. */
-            if (time(NULL) - g_LastStatsSample >= (time_t)RBSVC_STATS_INTERVAL) {
-                g_LastStatsSample = time(NULL);
-                PortSampleStats();
-            }
+            /* RB-13: driver counters are sampled by the port thread
+               (see rbport.c PortThreadProc). Sending QUERY_STATS from a
+               second thread while the port thread is parked in
+               FilterGetMessage tears the parked read down on every sample
+               (E_FAIL reconnect loop), so sampling must not happen here. */
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             LogError(L"[ops] unhandled exception draining restore commands");
         }

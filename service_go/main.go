@@ -15,9 +15,16 @@
 //	rbapi.exe --db <path> --addr 127.0.0.1:8800 --token <t>
 //	rbapi.exe --help
 //
-// Run as a Windows service with:
+// Windows service: the binary detects it was launched by the Service Control
+// Manager and switches to service mode automatically, so it is safe to run
+// under:
 //
 //	sc create RecycleBinApi binPath= "<path>\rbapi.exe" start= auto obj= LocalSystem
+//
+// (The service reports Running to the SCM before the HTTP listener is
+// up, so the SCM never times out waiting on the DB-open retry window. A
+// startup failure still stops the service with a non-zero exit code and the
+// SCM failure actions restart it.)
 package main
 
 import (
@@ -35,11 +42,16 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows/registry"
+	"golang.org/x/sys/windows/svc"
+
 	"rbapi/api"
 	"rbapi/db"
 )
 
 const regKey = `SOFTWARE\RecycleBin`
+
+// serviceName must match the SCM service name used by deploy.ps1.
+const serviceName = "RecycleBinApi"
 
 // config holds the runtime settings for the API service.
 type config struct {
@@ -106,7 +118,7 @@ func main() {
 	flag.Parse()
 
 	if *showVer {
-		fmt.Println("rbapi 1.0.0 (RecycleBin for SMB management API)")
+		fmt.Println("rbapi 1.1.0 (RecycleBin for SMB management API)")
 		return
 	}
 
@@ -125,11 +137,114 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
 	log.Printf("rbapi starting: %s", cfg)
 
+	// Same binary, two modes: launched by the SCM -> Windows service;
+	// launched from a console / shell -> plain foreground process.
+	if isSvc, err := svc.IsWindowsService(); err == nil && isSvc {
+		if err := svc.Run(serviceName, &apiService{cfg: cfg}); err != nil {
+			log.Fatalf("service run failed: %v", err)
+		}
+		return
+	} else if err != nil {
+		log.Printf("svc.IsWindowsService: %v (falling back to foreground)", err)
+	}
+
+	runForeground(cfg)
+}
+
+// ---------------------------------------------------------------------------
+// Foreground mode (console, debugging, manual --db/--addr/--token usage)
+// ---------------------------------------------------------------------------
+
+func runForeground(cfg config) {
+	stop := make(chan struct{})
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		<-sigCh
+		close(stop)
+	}()
+
+	if err := serve(cfg, stop); err != nil {
+		log.Fatalf("server error: %v", err)
+	}
+	log.Println("stopped")
+}
+
+// ---------------------------------------------------------------------------
+// Windows service mode
+// ---------------------------------------------------------------------------
+
+// apiService implements svc.Handler. Execute runs on the SCM dispatch thread.
+type apiService struct {
+	cfg   config
+	stop  chan struct{}
+	errCh chan error
+}
+
+func (s *apiService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
+	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
+	s.stop = make(chan struct{})
+	s.errCh = make(chan error, 1)
+
+	changes <- svc.Status{State: svc.StartPending}
+
+	// Start the HTTP server in the background. Open the DB and bind the
+	// listener off the SCM thread so the SCM never blocks on our startup.
+	go func() {
+		if err := serve(s.cfg, s.stop); err != nil {
+			s.errCh <- err
+		}
+	}()
+
+	// Report Running immediately. The DB open retry window (up to ~60s when
+	// rbservice.exe is still creating the schema) must not keep the service
+	// in StartPending, or the SCM gives up and kills it (events 7000/7009).
+	// A genuine failure still surfaces via errCh and stops the service.
+	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
+	log.Printf("service %s running", serviceName)
+
+	for {
+		select {
+		case c := <-r:
+			switch c.Cmd {
+			case svc.Interrogate:
+				changes <- c.CurrentStatus
+			case svc.Stop, svc.Shutdown:
+				log.Println("stop requested by SCM")
+				close(s.stop)
+				changes <- svc.Status{State: svc.StopPending}
+				select {
+				case err := <-s.errCh:
+					if err != nil {
+						log.Printf("server error during stop: %v", err)
+					}
+				case <-time.After(15 * time.Second):
+					log.Println("forced stop after shutdown timeout")
+				}
+				changes <- svc.Status{State: svc.Stopped}
+				return false, 0
+			}
+		case err := <-s.errCh:
+			// Fatal startup / runtime error (DB unusable, bind failed, ...).
+			log.Printf("server error: %v", err)
+			changes <- svc.Status{State: svc.Stopped}
+			return false, 1
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Shared server startup (both modes)
+// ---------------------------------------------------------------------------
+
+// serve opens the database, registers the HTTP handlers and serves until
+// stop is closed. It returns nil for a graceful shutdown.
+func serve(cfg config, stop <-chan struct{}) error {
 	// The C service creates the schema; wait briefly for the file to appear so
 	// starting both services simultaneously works.
 	database, err := openWithRetry(cfg.DBPath, 30, 2*time.Second)
 	if err != nil {
-		log.Fatalf("cannot open database %s: %v", cfg.DBPath, err)
+		return fmt.Errorf("cannot open database %s: %w", cfg.DBPath, err)
 	}
 	defer database.Close()
 
@@ -154,12 +269,10 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	// Graceful shutdown on Ctrl+C / service stop
+	// Graceful shutdown when stop fires (Ctrl+C in foreground mode, SCM stop
+	// request in service mode).
 	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-		<-sigCh
-
+		<-stop
 		log.Println("shutting down...")
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -171,10 +284,9 @@ func main() {
 	log.Printf("listening on %s", cfg.Addr)
 	if err := httpSrv.ListenAndServe(); err != nil &&
 		!errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("server error: %v", err)
+		return err
 	}
-
-	log.Println("stopped")
+	return nil
 }
 
 // openWithRetry waits for the database file to exist (the C service may still

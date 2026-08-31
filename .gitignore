@@ -391,3 +391,15 @@ driver/syms.txt
 *.db
 *.db-wal
 *.db-shm
+
+# ==================================================================
+# BSOD / kernel triage scratch files (2026-08-31, RB-27 / RB-28)
+# Local debugging artifacts; not part of the source tree.
+# ==================================================================
+kd_*.txt
+driver_disasm*.txt
+analyze_dump*.cmd
+analyze_new*.cmd
+check_lock.ps1
+run_analyze.ps1
+service_c/build_err.txt

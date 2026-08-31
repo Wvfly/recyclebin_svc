@@ -759,8 +759,8 @@ db\schema.sql  ──gen_schema.ps1──▶  service_c\schema_sql.h  ──编�
 |---|---|
 | [docs/design.md](docs/design.md) | 设计说明（范式选型 / 通信模型 / 限制） |
 | [docs/bugfix-report.md](docs/bugfix-report.md) | 初版 Python 实现的历史修复记录（B1–B7） |
-| [docs/buglist.md](docs/buglist.md) | 现存问题清单与整改排期（RB-01 ~ RB-17） |
-| [docs/bugfix-production.md](docs/bugfix-production.md) | 生产就绪度修复记录（本轮 10 项） |
+| [docs/buglist.md](docs/buglist.md) | 现存问题清单与整改排期（RB-01 ~ RB-28） |
+| [docs/bugfix-production.md](docs/bugfix-production.md) | 生产就绪度修复记录（累计 15 项，含蓝屏实测 RB-27 / RB-28） |
 
 ---
 

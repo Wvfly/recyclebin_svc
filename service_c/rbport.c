@@ -72,15 +72,61 @@ static int PortConnect(const WCHAR *portName)
     return 1;
 }
 
+/* Validate and persist one notification. The payload is variable length and
+ * addressed by offsets, so a malformed or truncated message must be rejected
+ * rather than dereferenced. Failure to persist must not kill the reader. */
+static void PortHandleMessage(const RB_MSG_BUFFER *buf, ULONG avail)
+{
+    const RBF_NOTIFICATION *note = (const RBF_NOTIFICATION *)buf->Payload;
+    /* Payload size comes from the actual transfer size, not from the header:
+     * FILTER_MESSAGE_HEADER only reports ReplyLength (0 for a fire-and-forget
+     * notification) and has no payload-length field in WDK 26100. The async
+     * path passes bytes-16 from GetOverlappedResult; the sync path passes
+     * RBF_NOTIFY_MAX_SIZE and relies on TotalSize + Magic self validation. */
+
+    if (avail < sizeof(RBF_NOTIFICATION) ||
+        note->Magic != RBF_NOTIFY_MAGIC ||
+        note->TotalSize < sizeof(RBF_NOTIFICATION) ||
+        note->TotalSize > avail)
+    {
+        LogError(L"malformed notification (len=%lu magic=0x%08lx), ignored",
+                 avail, note->Magic);
+        return;
+    }
+
+    {
+        LONG64 id = DbAddItem(note);
+        if (id < 0) {
+            LogError(L"failed to persist notification for %s",
+                     RBF_NOTIFY_PATH(note));
+        } else {
+            LogInfo(L"intercepted delete id=%lld: %s",
+                    id, RBF_NOTIFY_PATH(note));
+        }
+    }
+}
+
 DWORD WINAPI PortThreadProc(LPVOID param)
 {
     const WCHAR *portName = (const WCHAR *)param;
+    HANDLE hMsgEvent;
     int connected = 0;
+    time_t lastSample = 0;
 
     PortInit();
 
+    /* Completion event for the overlapped FilterGetMessage (manual reset). */
+    hMsgEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!hMsgEvent) {
+        LogErrorWin(GetLastError(), L"CreateEvent failed in port thread");
+        return 1;
+    }
+
     while (WaitForSingleObject(g_StopEvent, 0) != WAIT_OBJECT_0) {
         RB_MSG_BUFFER buf;
+        OVERLAPPED ov;
+        DWORD bytes = 0;
+        DWORD wait;
         HRESULT hr;
 
         if (!connected) {
@@ -92,64 +138,94 @@ DWORD WINAPI PortThreadProc(LPVOID param)
                 continue;
             }
             connected = 1;
+            lastSample = 0;   /* snapshot the counters right after (re)connect */
             LogInfo(L"connected to kernel port %s", portName);
         }
 
         ZeroMemory(&buf, sizeof(buf));
+        ZeroMemory(&ov, sizeof(ov));
+        ov.hEvent = hMsgEvent;
+        ResetEvent(hMsgEvent);
 
+        /* The kernel port carries ONE in-flight message per connection.
+         * A synchronous FilterGetMessage parked here is torn down by
+         * FilterSendMessage(QUERY_STATS) sent from the ops thread every
+         * RBSVC_STATS_INTERVAL seconds -- observed as an endless
+         * "FilterGetMessage failed (hr=0x80004005), reconnecting" loop while
+         * the driver was up, with notify_dropped climbing. The read is
+         * overlapped so the wait can time out, cancel itself, and take the
+         * stats sample on THIS thread: no other caller ever sends on the
+         * same connection while the read is parked. */
         hr = FilterGetMessage(g_Port, &buf.Header,
                               sizeof(RB_MSG_BUFFER) - sizeof(FILTER_MESSAGE_HEADER),
-                              NULL);
+                              &ov);
 
-        if (FAILED(hr)) {
-            /* Port went away (driver unloaded / restarting) -- reconnect */
-            connected = 0;
-            EnterCriticalSection(&g_PortLock);
-            PortCloseLocked();
-            LeaveCriticalSection(&g_PortLock);
-            LogWarn(L"FilterGetMessage failed (hr=0x%08lx), reconnecting", hr);
-            if (WaitForSingleObject(g_StopEvent, RBSVC_RECONNECT_MS) == WAIT_OBJECT_0)
-                break;
-            continue;
-        }
+        if (hr == HRESULT_FROM_WIN32(ERROR_IO_PENDING)) {
+            wait = WaitForSingleObject(hMsgEvent, RBSVC_STATS_INTERVAL * 1000);
 
-        /* Validate before parsing. The payload is variable length and
-           addressed by offsets, so a malformed or truncated message must be
-           rejected rather than dereferenced. */
-        {
-            RBF_NOTIFICATION *note = (RBF_NOTIFICATION *)buf.Payload;
-            /* ReplyLength covers the header plus the payload. */
-            ULONG avail = (buf.Header.ReplyLength >= sizeof(FILTER_MESSAGE_HEADER))
-                          ? (ULONG)(buf.Header.ReplyLength - sizeof(FILTER_MESSAGE_HEADER))
-                          : 0;
-
-            if (avail < sizeof(RBF_NOTIFICATION) ||
-                note->Magic != RBF_NOTIFY_MAGIC ||
-                note->TotalSize < sizeof(RBF_NOTIFICATION) ||
-                note->TotalSize > avail)
-            {
-                LogError(L"malformed notification (len=%lu magic=0x%08lx), ignored",
-                         avail, note->Magic);
+            if (wait == WAIT_OBJECT_0) {
+                /* Message arrived. */
+                if (!GetOverlappedResult(g_Port, &ov, &bytes, FALSE)) {
+                    DWORD err = GetLastError();
+                    if (err == ERROR_OPERATION_ABORTED)
+                        continue;            /* cancelled: loop back around */
+                    /* Port died while we were parked. */
+                    connected = 0;
+                    EnterCriticalSection(&g_PortLock);
+                    PortCloseLocked();
+                    LeaveCriticalSection(&g_PortLock);
+                    LogWarn(L"FilterGetMessage failed (err=%lu), reconnecting", err);
+                    if (WaitForSingleObject(g_StopEvent, RBSVC_RECONNECT_MS) == WAIT_OBJECT_0)
+                        break;
+                    continue;
+                }
+                PortHandleMessage(&buf,
+                                  (bytes > (DWORD)sizeof(FILTER_MESSAGE_HEADER))
+                                      ? bytes - (DWORD)sizeof(FILTER_MESSAGE_HEADER)
+                                      : 0);
                 continue;
             }
 
-            /* Persist. Failure here must not kill the reader thread. */
-            {
-                LONG64 id = DbAddItem(note);
-                if (id < 0) {
-                    LogError(L"failed to persist notification for %s",
-                             RBF_NOTIFY_PATH(note));
-                } else {
-                    LogInfo(L"intercepted delete id=%lld: %s",
-                            id, RBF_NOTIFY_PATH(note));
-                }
+            /* Timeout: no notification within the sample interval. Cancel the
+             * parked read on this thread, wait for the cancellation to land,
+             * then sample the counters. The OVERLAPPED is only reused after
+             * the cancellation completes. */
+            CancelIoEx(g_Port, &ov);
+            WaitForSingleObject(hMsgEvent, INFINITE);
+            GetOverlappedResult(g_Port, &ov, &bytes, FALSE); /* aborted: expected */
+
+            if (WaitForSingleObject(g_StopEvent, 0) == WAIT_OBJECT_0)
+                break;
+
+            if (time(NULL) - lastSample >= (time_t)RBSVC_STATS_INTERVAL) {
+                lastSample = time(NULL);
+                PortSampleStats();
             }
+            continue;
         }
+
+        if (SUCCEEDED(hr)) {
+            /* Message was available immediately; the transfer size is not
+             * reported on the synchronous path, so rely on TotalSize + Magic
+             * validation against the fixed buffer bound. */
+            PortHandleMessage(&buf, RBF_NOTIFY_MAX_SIZE);
+            continue;
+        }
+
+        /* Genuine failure: port went away (driver unloaded / restarting). */
+        connected = 0;
+        EnterCriticalSection(&g_PortLock);
+        PortCloseLocked();
+        LeaveCriticalSection(&g_PortLock);
+        LogWarn(L"FilterGetMessage failed (hr=0x%08lx), reconnecting", hr);
+        if (WaitForSingleObject(g_StopEvent, RBSVC_RECONNECT_MS) == WAIT_OBJECT_0)
+            break;
     }
 
     EnterCriticalSection(&g_PortLock);
     PortCloseLocked();
     LeaveCriticalSection(&g_PortLock);
+    CloseHandle(hMsgEvent);
 
     LogInfo(L"port thread exiting");
     return 0;

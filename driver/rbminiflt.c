@@ -36,18 +36,21 @@
 #define SECURITY_DESCRIPTOR_REVISION (1)
 #endif
 
-/* Staging-dir DACL builder. Layout (self-relative, 44 bytes):
+/* Staging-dir DACL builder. Layout (self-relative, 48 bytes):
    SECURITY_DESCRIPTOR_RELATIVE (20) | ACL (8) | ACE_HEADER (4) | Mask (4)
-   | SID bytes (8, S-1-0-0 Everyone).
+   | SID (12, S-1-1-0 Everyone/World).
    ACE grants Everyone: add-file/add-subdir/list/traverse/read-attrs/sync. */
 #pragma pack(push, 1)
 typedef struct _RBF_STAGING_SD {
-    SECURITY_DESCRIPTOR_RELATIVE Sd;       /* off 0,  size 20 */
-    ACL                          Acl;      /* off 20, size 8  */
-    ACE_HEADER                   AceHeader;/* off 28, size 4  */
-    ACCESS_MASK                  AceMask;  /* off 32, size 4  */
-    UCHAR                        SidBytes[8]; /* off 36, S-1-0-0 */
-} RBF_STAGING_SD;
+    SECURITY_DESCRIPTOR_RELATIVE Sd;         /* off 0,  size 20 */
+    ACL                          Acl;        /* off 20, size 8  */
+    ACE_HEADER                   AceHeader;  /* off 28, size 4  */
+    ACCESS_MASK                  AceMask;    /* off 32, size 4  */
+    UCHAR                        SidRevision;    /* off 36 */
+    UCHAR                        SidSubAuthCount;/* off 37 */
+    UCHAR                        SidAuthority[6];/* off 38, big-endian */
+    ULONG                        SidSubAuth0;    /* off 44, little-endian */
+} RBF_STAGING_SD;  /* total 48 */
 #pragma pack(pop)
 
 RBF_GLOBAL G;
@@ -254,7 +257,11 @@ NTSTATUS RbfGetRequestorSid(_In_ PFLT_CALLBACK_DATA Data,
                     SidString->MaximumLength = (USHORT)(RBF_MAX_NAME * sizeof(WCHAR));
                     gotReal = TRUE;
                 }
-                ExFreePoolWithTag(sidNoSlash.Buffer, RBF_TAG);
+                /* RtlConvertSidToUnicodeString allocated this with its own
+                   internal tag; freeing with ExFreePoolWithTag(..., RBF_TAG)
+                   mismatches the tag and bugchecks BAD_POOL_CALLER under
+                   Driver Verifier / pool-tag checking. Use plain ExFreePool. */
+                ExFreePool(sidNoSlash.Buffer);
             } else {
                 DbgPrint("[RBF] SID conversion failed 0x%X, fallback\n", status);
             }
@@ -363,24 +370,22 @@ NTSTATUS RbfCreateDirectory(_In_ PCUNICODE_STRING DirPath)
 
     sd.Acl.AclRevision = ACL_REVISION;
     sd.Acl.Sbz1 = 0;
-    sd.Acl.AclSize = (USHORT)(sizeof(ACL) + 4 + 4 + 8); /* ACL + ACE = 24 */
+    sd.Acl.AclSize = (USHORT)(sizeof(ACL) + 4 + 4 + 12); /* ACL + ACE = 28 */
     sd.Acl.AceCount = 1;
     sd.Acl.Sbz2 = 0;
 
     sd.AceHeader.AceType = ACCESS_ALLOWED_ACE_TYPE;
     sd.AceHeader.AceFlags = 0;
-    sd.AceHeader.AceSize = (USHORT)(4 + 4 + 8); /* header+mask+sid = 16 */
+    sd.AceHeader.AceSize = (USHORT)(4 + 4 + 12); /* header+mask+sid = 20 */
     sd.AceMask = FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_LIST_DIRECTORY |
                  FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
-    /* SID = S-1-0-0 (Everyone): rev=1, subauth=0, authority=0x000000000001 */
-    sd.SidBytes[0] = 1;
-    sd.SidBytes[1] = 0;
-    sd.SidBytes[2] = 0;
-    sd.SidBytes[3] = 0;
-    sd.SidBytes[4] = 0;
-    sd.SidBytes[5] = 0;
-    sd.SidBytes[6] = 0;
-    sd.SidBytes[7] = 1;
+    /* SID = S-1-1-0 (Everyone/World): rev=1, subauth=1,
+       authority=0x000000000001, subauth0=0 */
+    sd.SidRevision     = 1;
+    sd.SidSubAuthCount = 1;
+    sd.SidAuthority[0] = 0; sd.SidAuthority[1] = 0; sd.SidAuthority[2] = 0;
+    sd.SidAuthority[3] = 0; sd.SidAuthority[4] = 0; sd.SidAuthority[5] = 1;
+    sd.SidSubAuth0     = 0;
 
     psd = (PSECURITY_DESCRIPTOR)&sd;
 
@@ -1006,6 +1011,33 @@ NTSTATUS RbfInstanceQueryTeardown(
     return STATUS_SUCCESS;
 }
 
+/* RB-28: PsCreateSystemThread() returns a HANDLE (a handle-table index), not
+   a kernel object pointer.  Passing the HANDLE straight to
+   KeWaitForSingleObject() dereferences a garbage address -- the dumped
+   G.SendThreadHandle slot contained 0xffffffff800098e0 -- and bugchecks with
+   0xA IRQL_NOT_LESS_OR_EQUAL in the unload path.  Reference the ETHREAD
+   through the handle first and wait on the object.  Safe at APC_LEVEL (FltMgr
+   invokes FilterUnload while holding FilterManagerMutex). */
+static NTSTATUS RbfStopSendThread(VOID)
+{
+    PETHREAD ThreadObj = NULL;
+    NTSTATUS status;
+
+    if (!G.SendThreadHandle)
+        return STATUS_SUCCESS;
+
+    status = ObReferenceObjectByHandle(G.SendThreadHandle,
+                                       THREAD_TERMINATE, NULL,
+                                       KernelMode, (PVOID*)&ThreadObj, NULL);
+    if (NT_SUCCESS(status)) {
+        KeWaitForSingleObject(ThreadObj, Executive, KernelMode, FALSE, NULL);
+        ObDereferenceObject(ThreadObj);
+    }
+    ZwClose(G.SendThreadHandle);
+    G.SendThreadHandle = NULL;
+    return status;
+}
+
 NTSTATUS RbfUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags)
 {
     UNREFERENCED_PARAMETER(Flags);
@@ -1013,18 +1045,16 @@ NTSTATUS RbfUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags)
 
     /* Wake and wait for the send thread to exit. */
     KeSetEvent(&G.NotifyEvent, IO_NO_INCREMENT, FALSE);
-    if (G.SendThreadHandle) {
-        KeWaitForSingleObject(G.SendThreadHandle, Executive, KernelMode,
-                              FALSE, NULL);
-        ZwClose(G.SendThreadHandle);
-        G.SendThreadHandle = NULL;
-    }
+    RbfStopSendThread();
 
     RbfFlushQueue();
     if (G.ServerPort) FltCloseCommunicationPort(G.ServerPort);
     if (G.Filter)     FltUnregisterFilter(G.Filter);
     RbfFreeConfig();
-    if (G.StoreRoot.Buffer) ExFreePoolWithTag(G.StoreRoot.Buffer, RBF_TAG);
+    /* G.StoreRoot.Buffer points at a static string literal bound by
+       RtlInitUnicodeString() in DriverEntry; it is NEVER pool-allocated.
+       Freeing it here bugchecks (BAD_POOL_HEADER / BAD_POOL_CALLER) on
+       every unload / shutdown -- do not free. */
     return STATUS_SUCCESS;
 }
 
@@ -1127,19 +1157,27 @@ VOID RbfPortDisconnect(_In_opt_ PVOID ConnectionCookie)
              "notification(s)\n", dropped);
 }
 
-/* Handle user-mode -> driver commands (RBF_CMD_QUERY_STATS). */
+/* Handle user-mode -> driver commands (RBF_CMD_QUERY_STATS).
+ *
+ * NOTE (RB-27): this callback MUST match the 6-parameter PFLT_MESSAGE_NOTIFY
+ * declared by the current WDK (10.0.26100): (PortCookie, InputBuffer,
+ * InputBufferLength, OutputBuffer, OutputBufferLength, ReturnOutputBufferLength).
+ * The legacy 7-parameter form (ClientPort, ServerPortCookie, ...) is what the
+ * old Win10 WDK headers declared, but FltMgr has always invoked the callback
+ * without ServerPortCookie - so a 7-parameter implementation reads
+ * InputBufferLength out of r8 as if it were the InputBuffer pointer and
+ * bugchecks 0x3B (AV) on dereference. Keep this signature in lockstep with
+ * fltKernel.h PFLT_MESSAGE_NOTIFY. */
 NTSTATUS RbfPortMessage(
-    _In_ PFLT_PORT ClientPort,
-    _In_opt_ PVOID ServerPortCookie,
+    _In_opt_ PVOID PortCookie,
     _In_reads_bytes_opt_(InputBufferLength) PVOID InputBuffer,
     _In_ ULONG InputBufferLength,
-    _Out_writes_bytes_opt_(OutputBufferLength) PVOID OutputBuffer,
+    _Out_writes_bytes_to_opt_(OutputBufferLength, *ReturnOutputBufferLength) PVOID OutputBuffer,
     _In_ ULONG OutputBufferLength,
     _Out_ PULONG ReturnOutputBufferLength)
 {
     PRBF_REPLY reply;
-    UNREFERENCED_PARAMETER(ClientPort);
-    UNREFERENCED_PARAMETER(ServerPortCookie);
+    UNREFERENCED_PARAMETER(PortCookie);
 
     if (ReturnOutputBufferLength) *ReturnOutputBufferLength = 0;
     if (!InputBuffer || InputBufferLength < sizeof(RBF_REPLY))
@@ -1236,6 +1274,12 @@ RbfPreSetInfo(
             (PFILE_DISPOSITION_INFORMATION)
             Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
 
+        /* Malformed/dispatching requests may carry a too-short (or empty)
+           buffer; never read past it. */
+        if (Data->Iopb->Parameters.SetFileInformation.Length < sizeof(BOOLEAN) ||
+            dispInfo == NULL)
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
         if (!dispInfo->DeleteFile)
             return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
@@ -1243,6 +1287,11 @@ RbfPreSetInfo(
         PFILE_DISPOSITION_INFORMATION_EX dispInfoEx =
             (PFILE_DISPOSITION_INFORMATION_EX)
             Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
+
+        if (Data->Iopb->Parameters.SetFileInformation.Length <
+                sizeof(FILE_DISPOSITION_INFORMATION_EX) ||
+            dispInfoEx == NULL)
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
         /* FILE_DISPOSITION_DO_NOT_DELETE (0) clears a pending delete rather
            than requesting one; ignore those. */
@@ -1453,7 +1502,7 @@ NTSTATUS DriverEntry(
     status = FltCreateCommunicationPort(
         G.Filter, &G.ServerPort, &oa, NULL,
         RbfPortConnect, RbfPortDisconnect,
-        (PFLT_MESSAGE_NOTIFY)RbfPortMessage, 1);
+        RbfPortMessage, 1);
     FltFreeSecurityDescriptor(sd);
     if (!NT_SUCCESS(status)) {
         FltUnregisterFilter(G.Filter);
@@ -1479,10 +1528,7 @@ NTSTATUS DriverEntry(
     if (!NT_SUCCESS(status)) {
         G.QueueActive = FALSE;
         KeSetEvent(&G.NotifyEvent, IO_NO_INCREMENT, FALSE);
-        KeWaitForSingleObject(G.SendThreadHandle, Executive, KernelMode,
-                              FALSE, NULL);
-        ZwClose(G.SendThreadHandle);
-        G.SendThreadHandle = NULL;
+        RbfStopSendThread();
         FltCloseCommunicationPort(G.ServerPort);
         FltUnregisterFilter(G.Filter);
         RbfFreeConfig();

@@ -3,7 +3,7 @@
 - 项目：Windows 文件共享回收站 (RecycleBin for SMB)
 - 范围：内核 Mini-Filter 驱动 (`rbminiflt`) + C 核心服务 (`rbservice`) + Go 管理 API (`rbapi`) + 数据模型 + 部署链路
 - 日期：2026-08-31
-- 条目：RB-01 ~ RB-26（含 5 项大目录树删除场景专项问题）
+- 条目：RB-01 ~ RB-28（含 5 项大目录树删除场景专项问题）
 - 评估结论：**核心 P0 阻塞已消除，仍不具备生产部署条件**
 
 > 与 `bugfix-report.md` 的关系
@@ -17,6 +17,7 @@
 > RB-18 ~ RB-22 为 2026-08-31 新增的大目录树删除场景问题（第五章）。
 > RB-23 为通信端口生命周期问题（client port use-after-free，蓝屏风险），见第六章。
 > RB-24 ~ RB-26 为 2026-08-31 蓝屏风险复审新增（RB-24 为 RB-23 的残余竞态补强）。
+> RB-27 ~ RB-28 为 2026-08-31 **实测蓝屏**（0x3B / 0xA）dump 分析新增，详见第六章。
 
 ---
 
@@ -50,6 +51,8 @@
 | RB-24 | **P0** | 驱动 | `RbfQueueNotify` 端口快照与入队之间的 disconnect 竞态，节点持已释放端口入队（RB-23 残余窗口） | **已修复** |
 | RB-25 | **P1** | 驱动 | `RbfAllocNotify` 失败分支未释放预占队列槽位，泄漏至满后所有删除被拒 | **已修复** |
 | RB-26 | **P2** | 驱动 | `RbfLoadConfig` 解析 `REG_MULTI_SZ` 未按 `DataLength` 限界，畸形注册表值可越界读 | **已修复** |
+| RB-27 | **P0** | 驱动 | `RbfPortMessage` 回调 7 参数签名 vs FltMgr 实际 6 参数 → 参数错位，把 `InputBufferLength`(=4) 当指针解引用 → **蓝屏 0x3B** | **已修复** |
+| RB-28 | **P0** | 驱动 | 卸载路径把 `PsCreateSystemThread` 返回的**句柄**当内核对象指针传给 `KeWaitForSingleObject` → 解引用无效地址 → **蓝屏 0xA** | **已修复** |
 
 > RB-18 ~ RB-22 为**大目录树删除场景**专项问题（详见第五章）。
 > 该场景在单文件删除时不暴露，删除含大量子目录/文件的目录树时集中显现。
@@ -690,7 +693,7 @@ rename → 入队），整树删除不再能绕过。
 
 ---
 
-## 六、可靠性补强（RB-23 ~ RB-26）
+## 六、可靠性补强（RB-23 ~ RB-28）
 
 ### RB-23 client port use-after-free（蓝屏风险）
 
@@ -780,6 +783,122 @@ rename 已成功、`RbfAllocNotify` 失败（内存不足/路径超长）时，�
 以 `(PBYTE)kvpi->Data + kvpi->DataLength` 为硬边界，所有读取（含 `sizeof(WCHAR)`
 对齐）均先做边界检查。
 
+### RB-27 `RbfPortMessage` 回调参数错位（实测蓝屏 0x3B）
+
+- **模块**：driver
+- **级别**：P0
+- **位置**：`driver/rbminiflt.c` `RbfPortMessage`；`driver/rbminiflt.h`（回调声明）
+- **状态**：**已修复**
+- **来源**：2026-08-31 实测蓝屏 dump（MEMORY.DMP，15:12）定位
+
+**问题**
+
+`RbfPortMessage` 被声明为**旧 7 参数签名**：
+
+```c
+NTSTATUS RbfPortMessage(PFLT_PORT ClientPort, PVOID ServerPortCookie,
+                        PVOID InputBuffer, ULONG InputBufferLength, ...)
+```
+
+但 FltMgr 消息回调实际只传 **6 个参数**（`ClientPort, InputBuffer, InputBufferLength,
+OutputBuffer, OutputBufferLength, SyncIo`），**不带 `ServerPortCookie`**——
+`ServerPortCookie` 只能通过 `FltGetServerPortCookie()` 单独查询。于是所有参数在
+寄存器层面**左移一位**：
+
+| 寄存器 | FltMgr 实际传入 | 7 参数回调误认为 |
+|---|---|---|
+| rcx | `ClientPort` | `ClientPort` |
+| rdx | `InputBuffer`（服务端 4 字节 `RBF_REPLY`） | `ServerPortCookie` |
+| r8 | `InputBufferLength` = **4** | `InputBuffer` 指针 ← 崩溃点解引用 |
+| r9 | `OutputBuffer` 指针 | `InputBufferLength` |
+
+**崩溃现场**（`rbminiflt+0x2b2b`，Bugcheck `0x3B SYSTEM_SERVICE_EXCEPTION`，
+二次异常 `c0000005` 访问违规）：
+
+```
+cmp dword ptr [r8],1    ; r8 = 0x4 → 访问地址 0x4 → AV
+```
+
+代码把 `InputBufferLength` 的**数值 4** 当指针解引用 → 访问 `0x4` → 蓝屏。
+触发者：服务端每 `RBSVC_STATS_INTERVAL` 秒发送的 4 字节 `RBF_REPLY` 查询——
+**端口连接建立并开始统计轮询后必崩**。
+
+**修复（已实施）**
+
+1. `RbfPortMessage` 改为 FltMgr 标准的 **6 参数签名**（移除 `ServerPortCookie` 形参）
+2. `FltCreateCommunicationPort` 调用处的回调指针不再做参数个数不匹配的强转
+3. 函数体内如需 cookie 用 `FltGetServerPortCookie(ClientPort)` 获取
+4. `rbminiflt.h` 中的回调声明同步修正
+
+### RB-28 卸载路径把线程句柄当对象指针（实测蓝屏 0xA）
+
+- **模块**：driver
+- **级别**：P0
+- **位置**：`driver/rbminiflt.c` `RbfUnload`；`DriverEntry` 的 `FltStartFiltering` 失败路径
+- **状态**：**已修复**
+- **来源**：2026-08-31 实测蓝屏 dump（MEMORY.DMP，16:39）定位
+
+**问题**
+
+`PsCreateSystemThread()` 返回的是**句柄**（句柄表索引），不是内核对象指针：
+
+```c
+PsCreateSystemThread(&G.SendThreadHandle, ...);   // G.SendThreadHandle = HANDLE
+```
+
+而 `RbfUnload` 把句柄值直接传给 `KeWaitForSingleObject()`：
+
+```c
+KeWaitForSingleObject(G.SendThreadHandle, Executive, KernelMode, FALSE, NULL);
+```
+
+`KeWaitForSingleObject` 需要**对象指针**。dump 中 `G.SendThreadHandle` 槽位
+（`G+0x58`）值为 `0xffffffff800098e0`（无效地址），崩溃线程正在等待这个"对象"：
+
+```
+Bugcheck 0xA IRQL_NOT_LESS_OR_EQUAL
+Arg1 = ffffffff800098e0   ← G.SendThreadHandle 的值（无效地址）
+Arg2 = 2                  ← IRQL=DISPATCH_LEVEL
+崩溃指令 nt!KeWaitForSingleObject+0x18e: lock bts [rdi],7  ← 解引用对象头
+调用链 System → IopLoadUnloadDriver → FltpMiniFilterDriverUnload
+       → FltpDoUnloadFilter（持 FilterManagerMutex，IRQL=APC_LEVEL）
+       → RbfUnload → KeWaitForSingleObject(G.SendThreadHandle)
+```
+
+**只要 send thread 创建成功，驱动卸载必崩**（0xA）。同样 bug 存在于
+`DriverEntry` 的 `FltStartFiltering` 失败路径（`KeWaitForSingleObject` +
+`ZwClose` 同一句柄）。
+
+**修复（已实施）**
+
+新增 `RbfStopSendThread()`：通过 `ObReferenceObjectByHandle` 把句柄转换为
+`PETHREAD` 对象指针后再等待：
+
+```c
+static NTSTATUS RbfStopSendThread(VOID)
+{
+    PETHREAD ThreadObj = NULL;
+    NTSTATUS status;
+
+    if (!G.SendThreadHandle)
+        return STATUS_SUCCESS;
+
+    status = ObReferenceObjectByHandle(G.SendThreadHandle, THREAD_TERMINATE,
+                                       NULL, KernelMode, (PVOID*)&ThreadObj, NULL);
+    if (NT_SUCCESS(status)) {
+        KeWaitForSingleObject(ThreadObj, Executive, KernelMode, FALSE, NULL);
+        ObDereferenceObject(ThreadObj);
+    }
+    ZwClose(G.SendThreadHandle);
+    G.SendThreadHandle = NULL;
+    return status;
+}
+```
+
+`RbfUnload` 与 `DriverEntry` 失败路径均改用它。等待线程**对象**（而非句柄）在
+APC_LEVEL + `KernelMode` 下合法（FltMgr 在持有 `FilterManagerMutex` 时于
+APC_LEVEL 调用卸载回调；`KernelMode` 等待允许触碰非页面池）。
+
 ---
 
 ## 七、整改路线建议
@@ -792,6 +911,7 @@ rename 已成功、`RbfAllocNotify` 失败（内存不足/路径超长）时，�
 | 第四阶段 生产化 | 持续 | RB-03 回调重构、RB-12 热更新、HLK 认证、容量模型与压测基线 |
 | **新增 目录树场景** | **1–2 周** | ~~RB-18 递归建父目录~~、~~RB-19 目录缓存~~、~~RB-22 拦截 DispositionEx~~ **已完成**；RB-20 / RB-21 仍待排期 |
 | **可观测性** | 已完成 | ~~RB-13 驱动计数器打通~~ **已完成**（含 `PortLock` 生命周期缺陷修复） |
+| **蓝屏实测** | 已完成 | ~~RB-27 消息回调参数错位~~、~~RB-28 卸载句柄当指针~~ **已修复**（已编译 + 反汇编核对，待部署到目标机实测） |
 
 > 建议：在 RB-01、RB-02、RB-04 完成前，**不要开展任何生产试点**。
 >

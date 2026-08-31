@@ -6,6 +6,7 @@ rem Usage:
 rem   build_all.cmd            Release build (default)
 rem   build_all.cmd Debug      Debug build
 rem   build_all.cmd /?         Show this help
+rem   build_all.cmd Release nosign   build without driver signing
 rem
 rem Builds, in order:
 rem   [1/3]  driver\rbminiflt.sys      kernel mini-filter   (WDK + MSVC)
@@ -41,6 +42,14 @@ if /i "%CFG%"=="--help" goto :usage
 
 if /i not "%CFG%"=="Release" if /i not "%CFG%"=="Debug" (
     echo [ERROR] Unknown configuration "%CFG%" - expected Release or Debug.
+    exit /b 1
+)
+
+set "OPT=%~2"
+set "DO_SIGN=1"
+if /i "%OPT%"=="nosign" set "DO_SIGN=0"
+if defined OPT if /i not "%OPT%"=="nosign" (
+    echo [ERROR] Unknown option "%OPT%" - expected "nosign".
     exit /b 1
 )
 
@@ -94,6 +103,63 @@ if not exist "rbminiflt.sys" (
 popd
 echo   [OK] rbminiflt.sys
 echo.
+
+rem ------------------------------------------------------------
+rem Sign rbminiflt.sys - kernel drivers must be signed to load.
+rem
+rem   * Default cert: the project signing cert (CurrentUser\My, no /sm),
+rem     overridable via RBF_CERT_SHA1 (cert SHA1 thumbprint);
+rem     set RBF_SIGN_STORE=machine to read it from LocalMachine\My.
+rem   * signtool is located from the installed Win10 SDK bin dirs,
+rem     overridable via RBF_SIGNTOOL (full path).
+rem   * Skip entirely with:  build_all.cmd Release nosign
+rem
+rem A missing signtool/certificate only WARNS: the build still
+rem succeeds, but the driver then needs test-signing enabled
+rem (bcdedit /set testsigning on) or a manual sign before deploy.
+rem ------------------------------------------------------------
+if "%DO_SIGN%"=="0" (
+    echo [SKIP] Driver signing disabled ^(nosign^).
+    goto :sign_done
+)
+
+set "RBF_CERT_SHA1=%RBF_CERT_SHA1%"
+if "%RBF_CERT_SHA1%"=="" set "RBF_CERT_SHA1=F57B8149935CD56C5565965AB5DF66E454B903F9"
+
+rem Sign from the CURRENT USER cert store by default (no /sm). Set
+rem RBF_SIGN_STORE=machine to read the certificate from LocalMachine\My.
+set "SM_OPTION="
+if /i "%RBF_SIGN_STORE%"=="machine" set "SM_OPTION=/sm"
+
+set "SIGNTOOL=%RBF_SIGNTOOL%"
+if defined SIGNTOOL if not exist "%SIGNTOOL%" set "SIGNTOOL="
+if not defined SIGNTOOL (
+    for %%V in (10.0.26100.0 10.0.22621.0 10.0.22000.0 10.0.19041.0) do (
+        if not defined SIGNTOOL if exist "C:\Program Files (x86)\Windows Kits\10\bin\%%V\x64\signtool.exe" set "SIGNTOOL=C:\Program Files (x86)\Windows Kits\10\bin\%%V\x64\signtool.exe"
+    )
+)
+if not defined SIGNTOOL (
+    echo [WARN] signtool.exe not found - rbminiflt.sys NOT signed.
+    echo        Deploy only with test-signing enabled, or sign manually:
+    echo        signtool sign /sha1 %RBF_CERT_SHA1% /fd sha256 /tr http://timestamp.digicert.com /td sha256 rbminiflt.sys
+    goto :sign_done
+)
+
+echo   Signing rbminiflt.sys ^(cert sha1 %RBF_CERT_SHA1%^) ...
+pushd "%ROOT%\driver"
+"%SIGNTOOL%" sign %SM_OPTION% /sha1 "%RBF_CERT_SHA1%" /fd sha256 /tr http://timestamp.digicert.com /td sha256 rbminiflt.sys
+if errorlevel 1 (
+    popd
+    echo [WARN] Signing failed - rbminiflt.sys NOT signed.
+    echo        Deploy only with test-signing enabled, or sign manually:
+    echo        signtool sign /sha1 %RBF_CERT_SHA1% /fd sha256 /tr http://timestamp.digicert.com /td sha256 rbminiflt.sys
+    goto :sign_done
+)
+popd
+echo   [OK] rbminiflt.sys signed.
+echo.
+
+:sign_done
 
 rem ============================================================
 echo [2/3] Core service     -^> service_c\rbservice.exe
@@ -326,11 +392,20 @@ echo Usage:
 echo   build_all.cmd            Release build ^(default^)
 echo   build_all.cmd Debug      Debug build
 echo   build_all.cmd /?         Show this help
+echo   build_all.cmd Release nosign   build without driver signing
 echo.
 echo Builds:
 echo   [1/3]  driver\rbminiflt.sys      kernel mini-filter   ^(WDK + MSVC^)
 echo   [2/3]  service_c\rbservice.exe   core service         ^(MSVC^)
 echo   [3/3]  service_go\rbapi.exe      management REST API  ^(Go 1.22+, optional^)
+echo.
+echo After [1/3], rbminiflt.sys is signed with the project cert
+echo ^(CurrentUser\My, SHA1 default F57B8149...; override with
+echo RBF_CERT_SHA1, set RBF_SIGN_STORE=machine for LocalMachine\My,
+echo or pass "nosign" to skip; signtool path override with
+echo RBF_SIGNTOOL^). If signtool/cert is unavailable the build
+echo continues unsigned with a warning - such a driver needs
+echo test-signing enabled or a manual sign before it will load.
 echo.
 echo Then runs db\verify_contract.py and db\verify_c_contract.py when python
 echo is available.
