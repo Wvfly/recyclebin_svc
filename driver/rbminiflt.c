@@ -394,12 +394,124 @@ NTSTATUS RbfCreateDirectory(_In_ PCUNICODE_STRING DirPath)
 }
 
 /* Ensure <VolumeName>\RBStore and <VolumeName>\RBStore\<Sid> exist. */
+/* ============================================================
+ * Staging directory fingerprint cache  (RB-19)
+ *
+ * Deleting a directory tree is a USER-MODE recursion: Explorer and `rd /s`
+ * remove one entry at a time, so a tree of N files produces N separate
+ * interceptions, each running the whole pre-callback. RbfEnsureStoreDir used
+ * to run in full for every one of them -- a pool allocation plus two
+ * ZwCreateFile calls that open an already-existing directory and close it
+ * again -- all on the delete path, blocking the operation that triggered it.
+ * A few thousand files later the accumulated latency shows up as a stalled
+ * progress bar or an Explorer that looks hung.
+ *
+ * The two directories only ever need creating once per (volume, SID) pair.
+ * Remembering the pairs we have already created turns N creations into one,
+ * which is the cheapest available win for bulk deletes.
+ *
+ * Correctness:
+ *   - Slots are read and written with interlocked operations, so the fast
+ *     path needs no lock and never blocks.
+ *   - A stale entry (an administrator removed \RBStore, or the volume was
+ *     dismounted) is not dangerous: the rename then fails, the caller drops
+ *     the fingerprint, and the next delete recreates the directories. With
+ *     fail-closed in effect the file is preserved either way.
+ * ========================================================== */
+#define RBF_STORE_CACHE_SIZE 16
+
+static volatile LONG G_StoreCache[RBF_STORE_CACHE_SIZE];
+
+/* FNV-1a over UTF-16 code units, folded to lower case so that
+   "HarddiskVolume2" and "harddiskvolume2" share a slot. */
+static ULONG RbfHashUnicode(_In_ PCUNICODE_STRING s, _In_ ULONG hash)
+{
+    ULONG i;
+
+    if (!s || !s->Buffer) return hash;
+
+    for (i = 0; i < s->Length / sizeof(WCHAR); i++) {
+        WCHAR c = s->Buffer[i];
+        if (c >= L'A' && c <= L'Z') c = (WCHAR)(c + 32);
+        hash ^= (ULONG)c;
+        hash *= 16777619UL;
+    }
+    return hash;
+}
+
+static ULONG RbfStoreFingerprint(_In_ PCUNICODE_STRING VolumeName,
+                                 _In_ PCUNICODE_STRING SidString)
+{
+    ULONG h = 2166136261UL;   /* FNV-1a offset basis */
+
+    h = RbfHashUnicode(VolumeName, h);
+    h = RbfHashUnicode(SidString, h);
+
+    /* Reserve 0 as the "empty slot" marker. */
+    return (h == 0) ? 1 : h;
+}
+
+static BOOLEAN RbfStoreCacheLookup(_In_ ULONG fp)
+{
+    ULONG i;
+
+    for (i = 0; i < RBF_STORE_CACHE_SIZE; i++) {
+        if (InterlockedCompareExchange(&G_StoreCache[i], 0, 0) == (LONG)fp)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static VOID RbfStoreCacheRemember(_In_ ULONG fp)
+{
+    static volatile LONG sNext = 0;
+    ULONG start;
+    ULONG i;
+
+    start = (ULONG)InterlockedIncrement(&sNext) % RBF_STORE_CACHE_SIZE;
+
+    for (i = 0; i < RBF_STORE_CACHE_SIZE; i++) {
+        ULONG idx = (start + i) % RBF_STORE_CACHE_SIZE;
+
+        /* Already recorded -- nothing to do. */
+        if (InterlockedCompareExchange(&G_StoreCache[idx], (LONG)fp, (LONG)fp)
+                == (LONG)fp) {
+            return;
+        }
+        /* Fill an empty slot. */
+        if (InterlockedCompareExchange(&G_StoreCache[idx], (LONG)fp, 0) == 0) {
+            return;
+        }
+    }
+
+    /* Every slot is taken: evict the round-robin one. Losing an entry only
+       costs one extra directory open, so eviction is always safe. */
+    InterlockedExchange(&G_StoreCache[start], (LONG)fp);
+}
+
+/* Drop a fingerprint so the directories are recreated on the next delete.
+   Called when the staging area turns out to be unusable after all. */
+static VOID RbfStoreCacheForget(_In_ ULONG fp)
+{
+    ULONG i;
+
+    for (i = 0; i < RBF_STORE_CACHE_SIZE; i++) {
+        InterlockedCompareExchange(&G_StoreCache[i], 0, (LONG)fp);
+    }
+}
+
 NTSTATUS RbfEnsureStoreDir(_In_ PCUNICODE_STRING VolumeName,
                            _In_ PCUNICODE_STRING SidString)
 {
     NTSTATUS status;
     UNICODE_STRING dirPath;
     UNICODE_STRING storeDir;
+    ULONG fp;
+
+    fp = RbfStoreFingerprint(VolumeName, SidString);
+
+    /* Fast path: this (volume, SID) staging area was already created. */
+    if (RbfStoreCacheLookup(fp)) return STATUS_SUCCESS;
 
     RtlInitUnicodeString(&storeDir, L"\\RBStore");
 
@@ -421,6 +533,9 @@ NTSTATUS RbfEnsureStoreDir(_In_ PCUNICODE_STRING VolumeName,
     }
 
     ExFreePoolWithTag(dirPath.Buffer, RBF_TAG);
+
+    if (NT_SUCCESS(status)) RbfStoreCacheRemember(fp);
+
     return status;
 }
 
@@ -989,25 +1104,58 @@ RbfPreSetInfo(
     _In_    PCFLT_RELATED_OBJECTS FltObjects,
     _Outptr_result_maybenull_ PVOID* CompletionContext)
 {
-    PFILE_DISPOSITION_INFORMATION dispInfo;
     PFLT_FILE_NAME_INFORMATION    nameInfo = NULL;
     FILE_STANDARD_INFORMATION     stdInfo;
     UNICODE_STRING                storePath = {0};
     PRBF_NOTIFICATION             note = NULL;   /* paged pool, never on stack */
     NTSTATUS                      status;
     ULONG                         sessionId = 0;
+    FILE_INFORMATION_CLASS        fic;
 
     UNREFERENCED_PARAMETER(CompletionContext);
 
-    /* 1. Only care about delete mark */
-    if (Data->Iopb->Parameters.SetFileInformation.FileInformationClass
-            != FileDispositionInformation)
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    /* 1. Only care about a delete mark.
+     *
+     * Two classes can carry one (RB-22):
+     *
+     *   FileDispositionInformation     -- the legacy form, a boolean
+     *                                     DeleteFile flag. Explorer, `del`
+     *                                     and `rd /s` still use this.
+     *   FileDispositionInformationEx   -- Windows 10 1709+. Its
+     *                                     FILE_DISPOSITION_POSIX_SEMANTICS
+     *                                     flag deletes a NON-EMPTY directory
+     *                                     in a single call, which is exactly
+     *                                     the operation this filter exists
+     *                                     to intercept. Watching only the
+     *                                     legacy class leaves a one-call
+     *                                     bypass that destroys an entire
+     *                                     tree with no notification and no
+     *                                     counter -- the only path left that
+     *                                     could lose data silently.
+     */
+    fic = Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
 
-    dispInfo = (PFILE_DISPOSITION_INFORMATION)
-               Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
-    if (!dispInfo->DeleteFile)
+    if (fic == FileDispositionInformation) {
+        PFILE_DISPOSITION_INFORMATION dispInfo =
+            (PFILE_DISPOSITION_INFORMATION)
+            Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
+
+        if (!dispInfo->DeleteFile)
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+    } else if (fic == FileDispositionInformationEx) {
+        PFILE_DISPOSITION_INFORMATION_EX dispInfoEx =
+            (PFILE_DISPOSITION_INFORMATION_EX)
+            Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
+
+        /* FILE_DISPOSITION_DO_NOT_DELETE (0) clears a pending delete rather
+           than requesting one; ignore those. */
+        if (!(dispInfoEx->Flags & FILE_DISPOSITION_DELETE))
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+    } else {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
 
     /* 2. Path-based policy: intercept ANY delete hitting a protected
        prefix (local or remote). SMB2 deletes are executed by srv2.sys in
@@ -1124,6 +1272,13 @@ RbfPreSetInfo(
     /* Staging failed. The file is untouched so far -- decide whether the
        delete may proceed and destroy it, per the fail-closed policy. */
     InterlockedIncrement64((volatile LONG64 *)&G.Stats.RenameFail);
+
+    /* The staging directories are evidently not usable as cached (deleted
+       behind our back, or the volume went away), so forget the fingerprint
+       and re-create them on the next delete instead of failing every
+       subsequent one (RB-19 self-healing). */
+    RbfStoreCacheForget(RbfStoreFingerprint(&nameInfo->Volume, &sidStr));
+
     RbfReleaseQueueSlot();
     ExFreePoolWithTag(storePath.Buffer, RBF_TAG);
     if (sidStr.Buffer) ExFreePoolWithTag(sidStr.Buffer, RBF_TAG);

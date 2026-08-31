@@ -15,6 +15,63 @@
 #include "rbsvc.h"
 
 /* UTF-8 -> UTF-16 helper (local copy; rbdb.c keeps its own static one) */
+
+/* ------------------------------------------------------------------ */
+/* Recursive directory creation (RB-18)                                */
+/* ------------------------------------------------------------------ */
+/*
+ * Windows deletes a directory tree one entry at a time, so restoring
+ * D:\Share\proj\src\main.c also needs proj and proj\src to come back.
+ * CreateDirectoryW creates a SINGLE level and fails when an ancestor is
+ * missing, which made deep restores impossible: the MoveFileEx that
+ * followed simply reported "path not found" and the file -- still sitting
+ * safely in $Recycle.Bin -- could not be given back to the user.
+ *
+ * This walks the separators and creates each level in turn.
+ * ERROR_ALREADY_EXISTS is treated as success, so the call is idempotent.
+ */
+static int EnsureDirectoryChain(const WCHAR *dir)
+{
+    WCHAR  buf[RBSVC_MAX_RECON_PATH];
+    WCHAR *p;
+    size_t len;
+
+    if (!dir || dir[0] == L'\0') return 0;
+
+    /* Drive-absolute only. DestIsAllowed() has already rejected UNC paths,
+       device paths and ".." components before we get here. */
+    if (dir[0] == L'\\' || dir[1] != L':') return 0;
+
+    len = wcslen(dir);
+    if (len < 3 || len >= ARRAYSIZE(buf)) return 0;
+    if (len == 3) return 1;              /* drive root: always exists */
+
+    memcpy(buf, dir, (len + 1) * sizeof(WCHAR));
+
+    /* Drop trailing separators -- creating "D:\" is meaningless. */
+    while (len > 3 && buf[len - 1] == L'\\')
+        buf[--len] = L'\0';
+
+    /* Create every level above the final component. */
+    for (p = buf + 3; *p; p++) {
+        if (*p != L'\\') continue;
+
+        *p = L'\0';
+        if (!CreateDirectoryW(buf, NULL) &&
+            GetLastError() != ERROR_ALREADY_EXISTS) {
+            *p = L'\\';
+            return 0;
+        }
+        *p = L'\\';
+    }
+
+    /* Final component (already existing is fine). */
+    if (!CreateDirectoryW(buf, NULL) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        return 0;
+    }
+    return 1;
+}
 static WCHAR *U8ToWLocal(const char *s)
 {
     int n;
@@ -167,18 +224,25 @@ int RestoreItemById(LONG64 itemId, const WCHAR *argOverride,
         goto cleanup;
     }
 
-    /* Make sure the parent directory exists */
+    /* Make sure the parent directory chain exists (RB-18). See
+       EnsureDirectoryChain() above for why a single CreateDirectoryW is not
+       enough here. Failure is not fatal on its own: the move below reports
+       the real error, so just log it and let that be the user-visible one. */
     {
         WCHAR *slash = wcsrchr(dstDos, L'\\');
         if (slash && slash != dstDos) {
-            WCHAR parent[MAX_PATH];
             size_t len = (size_t)(slash - dstDos);
-            if (len < MAX_PATH) {
+            WCHAR *parent = (WCHAR *)malloc((len + 1) * sizeof(WCHAR));
+
+            if (parent) {
                 memcpy(parent, dstDos, len * sizeof(WCHAR));
                 parent[len] = L'\0';
-                /* CreateDirectoryW is recursive-ish only if parents exist;
-                   use SHCreateDirectoryExW-equivalent via CreateDirectory loop */
-                CreateDirectoryW(parent, NULL);
+
+                if (!EnsureDirectoryChain(parent)) {
+                    LogWarn(L"[restore] cannot create parent dir %s (win32=%lu)",
+                            parent, GetLastError());
+                }
+                free(parent);
             }
         }
     }

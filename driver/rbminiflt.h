@@ -43,6 +43,14 @@
 /* User-mode -> driver commands (RBF_REPLY.Ack) */
 #define RBF_CMD_QUERY_STATS 1
 
+/* FileDispositionInformationEx support (RB-22) needs
+ * FILE_DISPOSITION_INFORMATION_EX and FILE_DISPOSITION_DELETE from the WDK
+ * headers, both introduced with Windows 10 1709. They are used as-is rather
+ * than redeclared here: a defensive typedef collides with the real one,
+ * because the SDK guards it with a macro name that cannot be tested for
+ * reliably across versions. Building this filter therefore requires a
+ * 1709-era (or newer) WDK, which is also what DriverVerifier/HLK expects. */
+
 /* Sanity tag written into every notification so a malformed or stale buffer
    can be rejected instead of parsed. */
 #define RBF_NOTIFY_MAGIC    0x52424654UL   /* 'RBFT' */

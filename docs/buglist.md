@@ -3,7 +3,8 @@
 - 项目：Windows 文件共享回收站 (RecycleBin for SMB)
 - 范围：内核 Mini-Filter 驱动 (`rbminiflt`) + C 核心服务 (`rbservice`) + Go 管理 API (`rbapi`) + 数据模型 + 部署链路
 - 日期：2026-08-31
-- 评估结论：**当前状态为可演示的工程原型，不具备生产部署条件**
+- 条目：RB-01 ~ RB-22（含 5 项大目录树删除场景专项问题）
+- 评估结论：**核心 P0 阻塞已消除，仍不具备生产部署条件**
 
 > 与 `bugfix-report.md` 的关系
 >
@@ -13,6 +14,7 @@
 >
 > 修复进度：RB-01、RB-04 ~ RB-12 已修复，详见 `bugfix-production.md`。
 > RB-02 为外部流程（驱动签名），RB-03 暂缓（需测试机 + Driver Verifier）。
+> RB-18 ~ RB-22 为 2026-08-31 新增的大目录树删除场景问题（第五章）。
 
 ---
 
@@ -37,6 +39,14 @@
 | RB-15 | P2 | 工程 | 测试覆盖为零（无单元测试、压力测试、故障注入测试） | 待修 |
 | RB-16 | P2 | Go API | Token 非恒定时间比较、注册表明文存储、无限流、无操作审计 | 待修 |
 | RB-17 | P2 | 服务 | `$I` 元数据用 v1 格式，可能与 Win10+ 回收站 UI 不兼容 | 待确认 |
+| RB-18 | **P1** | 服务 | 深层目录还原失败：`CreateDirectoryW` 只建一级父目录 | **已修复** |
+| RB-19 | P1 | 驱动 | 删除大目录树极慢：每文件重复调用 `RbfEnsureStoreDir` | **已修复** |
+| RB-20 | P1 | 驱动 | 队列满时部分删除失败，目录删不干净（RB-08 副作用） | 待修 |
+| RB-21 | P1 | 驱动/服务 | staging 扁平结构，单目录文件数膨胀后操作变慢 | 待修 |
+| RB-22 | **P1** | 驱动 | `FileDispositionInformationEx` 未拦截，可绕过整树真删 | **已修复** |
+
+> RB-18 ~ RB-22 为**大目录树删除场景**专项问题（详见第五章）。
+> 该场景在单文件删除时不暴露，删除含大量子目录/文件的目录树时集中显现。
 
 ---
 
@@ -379,7 +389,226 @@ minifilter 卸载常被未决 I/O 阻塞 → 驱动更新需重启服务器；�
 
 ---
 
-## 五、整改路线建议
+## 五、大目录树删除场景（RB-18 ~ RB-22）
+
+> **场景背景**
+>
+> Windows 删除目录是**用户态递归**：Explorer / `rd /s` / `rm -rf` 逐个枚举文件并
+> 对每个条目发起删除 I/O。因此删除含 N 个文件的目录树 = **N 次独立拦截**，
+> 每次都要走一遍 `RbfPreSetInfo` 的完整流程。
+>
+> 单文件时被掩盖的问题（每次调用的小开销、队列容量、父目录创建）在此场景下
+> 被放大 N 倍，并暴露出几个单文件场景根本看不到的问题。
+
+### RB-18 深层目录还原失败
+
+- **模块**：service_c
+- **位置**：`service_c/rbrestore.c`（还原前创建父目录）
+- **级别**：P1（数据不丢，但核心的"可还原"能力失效）
+
+**问题**
+
+还原前用 `CreateDirectoryW` 创建父目录，而该函数**只能创建单级**：
+
+```c
+WCHAR *slash = wcsrchr(dstDos, L'\\');
+if (slash && slash != dstDos) {
+    ...
+    /* CreateDirectoryW is recursive-ish only if parents exist;
+       use SHCreateDirectoryExW-equivalent via CreateDirectory loop */
+    CreateDirectoryW(parent, NULL);      // 只创建一级
+}
+```
+
+代码注释本身已承认该限制（"recursive-ish only if parents exist"）。
+
+**复现路径**
+
+1. 删除目录树 `D:\Share\proj\`（含 `src\main.c`）
+2. 每个文件独立进入回收站，`proj` 目录本身也被删除
+3. 还原 `main.c` → 目标 `D:\Share\proj\src\main.c`
+4. parent = `D:\Share\proj\src`，但 `D:\Share\proj` 不存在
+5. `CreateDirectoryW` 失败 → `MoveFileEx` 到不存在路径 → **还原失败**
+
+**影响**
+
+删除复杂目录树后，深层文件不可还原。文件仍在 `$Recycle.Bin` 中（数据未丢），
+但用户无法通过正常途径取回——**产品核心价值失效**。
+
+**修复方案（已实施）**
+
+在 `rbrestore.c` 中实现 `EnsureDirectoryChain()`，逐级调用 `CreateDirectoryW`
+创建整个父目录链，把 `ERROR_ALREADY_EXISTS` 视为成功（幂等）。
+
+路径为驱动器绝对路径（`DestIsAllowed()` 已在此前拒绝 UNC、设备路径与 `..`
+组件），长度用 `RBSVC_MAX_RECON_PATH`（1024）而非 `MAX_PATH`。
+
+> 未采用 `SHCreateDirectoryExW` 的原因：本项目定义了 `WIN32_LEAN_AND_MEAN`，
+> 引入 `shlwapi.h` 后该函数仍未被声明，产生 `C4013`（编译器假设返回 int，
+> 在 x64 下存在返回值截断风险）。改为自实现可消除额外链接库依赖与 SDK
+> 版本差异，行为完全可控。
+
+---
+
+### RB-19 删除大目录树极慢
+
+- **模块**：driver
+- **位置**：`driver/rbminiflt.c` `RbfPreSetInfo`
+
+**问题**
+
+每个文件删除在 Pre 回调内**同步串行**执行：
+
+| 操作 | 每个文件调用次数 |
+|---|---|
+| `RbfEnsureStoreDir` | 1 次（内部 2 次 `ZwCreateFile`：`<vol>\RBStore` 与 `<vol>\RBStore\<Sid>`） |
+| `RbfMoveToStore` | 1 次 rename |
+| `FltQueryInformationFile` | 1 次 |
+
+`RbfEnsureStoreDir` **对每个文件都重复调用**，即使目录早已存在——仍要执行
+完整的打开 + 关闭内核对象流程。
+
+删除 5000 个文件 = 10000 次目录打开 + 5000 次 rename + 5000 次查询，
+全部**同步阻塞**在删除路径上。
+
+**影响**
+
+按每次增加 1 ms 估算，5000 文件额外耗时约 5 秒；磁盘繁忙时（每次 5 ms）
+可达 25 秒以上。用户表现为进度条停滞、资源管理器假死。
+
+注意：这是**慢**，不是死锁——所有操作最终都会返回。
+
+**修复方案（已实施）**
+
+在 `rbminiflt.c` 中增加 **staging 目录指纹缓存**（RB-19）：
+
+- 对 `(卷名, SID)` 计算 FNV-1a 指纹，16 槽定长数组
+- `RbfEnsureStoreDir` 命中缓存直接返回，**跳过池分配与两次 `ZwCreateFile`**
+- 槽位用 `InterlockedCompareExchange` 读写，**无锁、快路径不阻塞**
+- 槽位用尽时轮转淘汰（丢失条目仅多一次目录打开，无正确性影响）
+
+**陈旧条目自愈**：若管理员删除了 `\RBStore` 或卷被卸载，缓存会误判目录存在，
+此时 rename 失败 → `RbfStoreCacheForget()` 清除指纹 → 下一次删除重建目录。
+配合 fail-closed，数据在任何情况下都不会丢失。
+
+> 更彻底的解法是把这些 I/O 移出 Pre 回调（RB-03），但那属于高风险重构，
+> 需测试机 + Driver Verifier 验证，暂缓。
+
+---
+
+### RB-20 队列满时部分删除失败
+
+- **模块**：driver
+- **位置**：`driver/rbminiflt.c`（`RbfReserveQueueSlot` 失败分支）
+- **关联**：RB-08 修复的副作用
+
+**问题**
+
+RB-08 将入队改为"预留式"（rename 前占位），消除了孤儿文件，但引入了新的
+用户可见行为：队列满（512）时**拒绝删除**。
+
+删除大目录树时：
+
+```
+前 512 个文件 → rename 成功，进入回收站   ✅
+第 513 个    → 队列满 → ACCESS_DENIED    ❌（文件留在原地）
+```
+
+**影响**
+
+**目录删不干净**：部分文件已进回收站，部分仍在原目录。用户需反复重试。
+数据未丢失（fail-closed 生效），但体验很差，且留下"半删除"状态。
+
+**修复建议**
+
+1. 扩大队列容量（当前 512，对大目录树偏小）
+2. 或改为按 SID 分片队列，避免单个用户的大批量删除挤占全部容量
+3. 或在删除失败时向用户态返回可重试提示，由 Explorer 的重试机制消化
+
+---
+
+### RB-21 staging 扁平结构导致目录膨胀
+
+- **模块**：driver + service_c
+- **位置**：`driver/rbminiflt.c` `RbfBuildStorePath`
+
+**问题**
+
+暂存路径为**扁平**结构：
+
+```
+<vol>\RBStore\<Sid>\<seq>_<basename>
+```
+
+不保留原目录层级。删除 5000 文件的目录树 → staging 单目录下塞入 5000 个文件。
+
+**影响**
+
+1. **NTFS 单目录膨胀**：文件数达数万后，目录索引查找变慢，
+   而 `RbfEnsureStoreDir` 每次删除都要打开该目录 → 与 RB-19 叠加恶化
+2. **落地后回收站膨胀**：`$Recycle.Bin\<Sid>\` 变成 N 个 `$R`/`$I` 对，
+   Explorer 打开回收站明显卡顿
+3. **还原粒度问题**：目录树退化为 N 个独立条目，用户无法"整体还原目录"
+
+**修复建议**
+
+1. staging 路径保留部分层级（如按原路径 hash 分桶到子目录），控制单目录文件数
+2. 还原 API 支持"按前缀批量还原"，把目录树还原作为一个操作
+
+---
+
+### RB-22 `FileDispositionInformationEx` 未被拦截（可绕过）
+
+- **模块**：driver
+- **位置**：`driver/rbminiflt.c` `RbfPreSetInfo` 的过滤条件
+
+**问题**
+
+```c
+if (Data->Iopb->Parameters.SetFileInformation.FileInformationClass
+        != FileDispositionInformation)
+    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+```
+
+只拦截 `FileDispositionInformation`，**不拦截** `FileDispositionInformationEx`。
+
+Windows 10 1709+ 引入的 `FileDispositionInformationEx` 支持
+`FILE_DISPOSITION_POSIX_SEMANTICS` 标志，可**一次性删除非空目录**。
+
+**影响**
+
+使用该 API 的应用程序可绕过拦截，**整棵目录树被静默真删**，
+且完全不产生任何通知或计数——这是唯一会导致数据真正丢失的路径。
+
+当前 Explorer 与 `rd /s` 仍使用传统递归删除（会逐个触发本驱动），
+所以实际影响暂未显现，但这是明确的绕过面。
+
+**修复方案（已实施）**
+
+`RbfPreSetInfo` 的过滤条件由"仅接受 `FileDispositionInformation`"改为
+按类别分派：
+
+```c
+if (fic == FileDispositionInformation) {
+    /* 旧式：检查 dispInfo->DeleteFile 布尔标志 */
+} else if (fic == FileDispositionInformationEx) {
+    /* 新式：检查 Flags & FILE_DISPOSITION_DELETE */
+    /* FILE_DISPOSITION_DO_NOT_DELETE (0) 表示"取消删除"，直接放行 */
+} else {
+    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+}
+```
+
+两类删除标记此后走同一条拦截路径（路径匹配 → 取 SID → 预留槽位 →
+rename → 入队），整树删除不再能绕过。
+
+> 注：`FILE_DISPOSITION_INFORMATION_EX` 与 `FILE_DISPOSITION_DELETE` 直接使用
+> WDK 头文件定义，未做兼容性别名——SDK 对该结构体的守卫宏名无法跨版本可靠
+> 检测，自行 typedef 会与真实定义冲突。构建本驱动需 1709 或更新版本的 WDK。
+
+---
+
+## 六、整改路线建议
 
 | 阶段 | 周期 | 任务 |
 |---|---|---|
@@ -387,5 +616,9 @@ minifilter 卸载常被未决 I/O 阻塞 → 驱动更新需重启服务器；�
 | 第二阶段 可观测 | 2 周 | RB-13 驱动计数器、RB-14 日志与告警 |
 | 第三阶段 规模化 | 4 周 | RB-08 目录批处理、RB-09 归档与索引、RB-11 备份、RB-15 测试补齐 |
 | 第四阶段 生产化 | 持续 | RB-03 回调重构、RB-12 热更新、HLK 认证、容量模型与压测基线 |
+| **新增 目录树场景** | **1–2 周** | ~~RB-18 递归建父目录~~、~~RB-19 目录缓存~~、~~RB-22 拦截 DispositionEx~~ **已完成**；RB-20 / RB-21 仍待排期 |
 
 > 建议：在 RB-01、RB-02、RB-04 完成前，**不要开展任何生产试点**。
+>
+> **RB-18 建议优先修复**：仅一行代码改动，却解决了"删除复杂目录树后无法还原"
+> 这一核心功能失效问题，投入产出比最高。

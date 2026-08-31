@@ -28,7 +28,15 @@
 | RB-11 | P1 | 服务 | 数据库无备份与完整性检查 | 已修复 |
 | RB-12 | P1 | 运维 | 配置变更需重启服务 | 部分（用户态配置已热加载） |
 
-**未包含在本轮**：RB-02 驱动签名（外部流程，需采购证书 + 提交 Dev Center，2–6 周）、RB-03 Pre 回调重构（需测试机 + Driver Verifier，风险高，暂缓）。
+### 大目录树场景（第二轮，同日追加）
+
+| 编号 | 级别 | 问题 | 状态 |
+|---|---|---|---|
+| RB-18 | P1 | 深层目录还原失败（`CreateDirectoryW` 只建一级） | 已修复 |
+| RB-19 | P1 | 删除大目录树极慢（每文件重复创建目录） | 已修复 |
+| RB-22 | P1 | `FileDispositionInformationEx` 未拦截，可绕过整树真删 | 已修复 |
+
+**未包含在本轮**：RB-02 驱动签名（外部流程，需采购证书 + 提交 Dev Center，2–6 周）、RB-03 Pre 回调重构（需测试机 + Driver Verifier，风险高，暂缓）、RB-20 / RB-21（属结构性设计优化，收益/风险比低于上述三项，待单独立项）。
 
 ---
 
@@ -143,6 +151,73 @@
 
 ---
 
+## 三之二、大目录树删除场景修复
+
+> **场景背景**
+>
+> Windows 删除目录是**用户态递归**：Explorer / `rd /s` 逐个枚举并删除条目，
+> 所以含 N 个文件的目录树 = **N 次独立拦截**。单文件场景被掩盖的问题
+> （每次调用的小开销、队列容量、父目录创建）在此场景下放大 N 倍并集中暴露。
+
+### RB-18 深层目录还原失败
+
+**问题**：还原前用 `CreateDirectoryW` 创建父目录，而它**只创建单级**。
+删除目录树后 `D:\Share\proj\src\main.c` 的 `proj` 与 `proj\src` 均已消失，
+创建 `D:\Share\proj\src` 失败 → `MoveFileEx` 报路径不存在 → **还原失败**。
+
+文件仍在 `$Recycle.Bin`（数据未丢），但用户取不回 —— 产品核心价值失效。
+
+**修复**：新增 `EnsureDirectoryChain()`，逐级调用 `CreateDirectoryW` 创建完整
+父目录链，将 `ERROR_ALREADY_EXISTS` 视为成功（幂等）。路径缓冲改用
+`RBSVC_MAX_RECON_PATH`（1024）而非 `MAX_PATH`。
+
+> **未采用 `SHCreateDirectoryExW` 的原因**：项目定义了 `WIN32_LEAN_AND_MEAN`，
+> 即便引入 `shlwapi.h` 该函数仍未声明，产生 `C4013` 警告——编译器假设返回
+> `int`，在 x64 下存在返回值截断风险。自实现消除了该警告、额外链接库依赖
+> 与 SDK 版本差异。
+
+### RB-19 删除大目录树极慢
+
+**问题**：`RbfEnsureStoreDir` 对每个文件都完整执行一遍——池分配 + 两次
+`ZwCreateFile`（打开已存在的目录再关闭），全部在 Pre 回调内**同步阻塞**删除路径。
+5000 个文件即 10000 次目录打开，累积延迟表现为进度条停滞。
+
+**修复**：新增 **(卷名, SID) 指纹缓存**：
+
+- FNV-1a 指纹，16 槽定长数组，命中即跳过全部 I/O
+- 槽位用 `InterlockedCompareExchange` 读写，**无锁、快路径不阻塞**
+- 槽位用尽轮转淘汰（丢失条目仅多一次目录打开，无正确性影响）
+
+**陈旧条目自愈**：若 `\RBStore` 被管理员删除或卷被卸载，缓存会误判目录存在；
+此时 rename 失败 → `RbfStoreCacheForget()` 清除指纹 → 下次删除重建目录。
+配合 fail-closed，数据在任何路径下都不会丢失。
+
+### RB-22 `FileDispositionInformationEx` 绕过
+
+**问题**：驱动只拦截 `FileDispositionInformation`。Windows 10 1709+ 的
+`FileDispositionInformationEx` + `FILE_DISPOSITION_POSIX_SEMANTICS` 可
+**一次性删除非空目录**，不被拦截 → 整树静默真删，无通知、无计数。
+这是唯一会导致数据真正丢失的路径。
+
+**修复**：过滤条件改为按类别分派，两类删除标记走同一拦截路径：
+
+```c
+if (fic == FileDispositionInformation) {
+    /* 旧式：dispInfo->DeleteFile */
+} else if (fic == FileDispositionInformationEx) {
+    /* 新式：Flags & FILE_DISPOSITION_DELETE
+       FILE_DISPOSITION_DO_NOT_DELETE (0) 表示取消删除，放行 */
+} else {
+    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+}
+```
+
+> 直接用 WDK 头文件的 `FILE_DISPOSITION_INFORMATION_EX`，未做兼容性别名：
+> SDK 对该结构体的守卫宏名无法跨版本可靠检测（实测自定义守卫宏失效导致
+> `C2011` 重复定义错误）。构建本驱动需 1709 或更新版本 WDK。
+
+---
+
 ## 四、验证
 
 每项修复均执行全量重新编译（`build_all.cmd Release`）并运行两套契约测试：
@@ -151,7 +226,9 @@
 |---|---|
 | `verify_contract.py`（C ↔ Go 共享 schema） | 9/9 PASS |
 | `verify_c_contract.py`（C 版本守卫 + ops 往返） | 7/7 PASS |
-| 驱动 / C 服务 / Go API 编译 | 全部成功 |
+| 驱动 / C 服务 / Go API 编译 | 全部成功，**零警告** |
+
+第二轮（RB-18 / RB-19 / RB-22）完成后同样通过全量编译与契约测试。
 
 ### 契约测试捕获的真实回归
 
@@ -172,4 +249,7 @@
 
 **建议**：RB-02 应尽早启动 —— 它是纯外部依赖，且 HLK 测试套件会反向暴露驱动实现缺陷，可能影响 RB-03 的整改方向。
 
-**风险提示**：本轮修复**仅经过编译与契约验证**。内核路径（RB-01、RB-04、RB-08）的正确性需要在配备 Driver Verifier 的测试机上做真实删除拦截压测后才能确认，当前环境不具备该条件。
+**风险提示**：本轮修复**仅经过编译与契约验证**。内核路径（RB-01、RB-04、RB-08、RB-19、RB-22）的正确性需要在配备 Driver Verifier 的测试机上做真实删除拦截压测后才能确认，当前环境不具备该条件。
+
+RB-19 的指纹缓存是新增的内核状态，压测时应重点验证：
+多用户并发删除、缓存淘汰轮转、以及删除 `\RBStore` 后的自愈路径。
