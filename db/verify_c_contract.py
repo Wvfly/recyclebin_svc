@@ -5,6 +5,8 @@ Checks:
   2. it re-applies the DDL to heal a database missing an index
   3. it REFUSES to run against a database with an incompatible version
   4. ops draining performs the state transition
+  5. restore-tree is dispatched, requires a prefix, and enforces the
+     protected-share allow-list on that prefix
 
 The C service reads StoreRoot from the registry, so we point HKCU-only env is
 not possible; instead we drive it through a temporary registry key value by
@@ -149,6 +151,68 @@ def main():
     after, msg = (row if row else (None, None))
     check("op drained by rbservice (no longer pending)",
           after in ("done", "failed"), f"state={after} msg={msg}")
+
+    # --------------------------------------------------------------
+    print("\n[5] restore-tree dispatch and prefix allow-list")
+    # --------------------------------------------------------------
+    # restore-tree is the batch form: every item whose orig_path begins with
+    # the prefix comes back in one request. Two properties matter and both are
+    # checkable without a real volume:
+    #
+    #   a) the op type is dispatched at all -- if it were treated as unknown
+    #      the message would say "unsupported op type";
+    #   b) the prefix goes through the same protected-share allow-list as a
+    #      single restore (RB-06). This rename runs as SYSTEM and the request
+    #      arrives via the shared ops table, so an unvalidated prefix would be
+    #      an arbitrary write. We deliberately use an UNPROTECTED prefix and
+    #      require a rejection.
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO ops(type, item_id, arg, state, ts)"
+        " VALUES ('restore-tree', 0, ?, 'pending', ?)",
+        (r"C:\Windows\System32", time.time()))
+    tree_op = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.commit()
+    conn.close()
+
+    run([RBSVC, "once", "--db", db])
+
+    conn = sqlite3.connect(db)
+    row = conn.execute(
+        "SELECT state, message FROM ops WHERE id=?", (tree_op,)).fetchone()
+    conn.close()
+    t_state, t_msg = (row if row else (None, None))
+    t_msg = (t_msg or "")
+
+    check("restore-tree dispatched (not 'unsupported op type')",
+          t_state == "failed" and "unsupported op type" not in t_msg.lower(),
+          f"state={t_state} msg={t_msg}")
+    check("restore-tree rejects an unprotected prefix",
+          "rejected" in t_msg.lower() or "outside" in t_msg.lower(),
+          f"msg={t_msg}")
+
+    # A restore-tree with no prefix must fail cleanly rather than being
+    # read as an empty (i.e. match-everything) prefix.
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO ops(type, item_id, arg, state, ts)"
+        " VALUES ('restore-tree', 0, NULL, 'pending', ?)", (time.time(),))
+    empty_op = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.commit()
+    conn.close()
+
+    run([RBSVC, "once", "--db", db])
+
+    conn = sqlite3.connect(db)
+    row = conn.execute(
+        "SELECT state, message FROM ops WHERE id=?", (empty_op,)).fetchone()
+    conn.close()
+    e_state, e_msg = (row if row else (None, None))
+    e_msg = (e_msg or "")
+
+    check("restore-tree requires a prefix in arg",
+          e_state == "failed" and "requires a path prefix" in e_msg.lower(),
+          f"state={e_state} msg={e_msg}")
 
     shutil.rmtree(tmp, ignore_errors=True)
 

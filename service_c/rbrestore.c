@@ -284,10 +284,134 @@ cleanup:
 }
 
 /* ------------------------------------------------------------------ */
+/* Tree restore                                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Restore every live item whose original path starts with prefixDos.
+ *
+ * Why this exists: deleting a directory over SMB removes one entry at a time,
+ * so `Project\src\main.c`, `Project\src` and `Project` each get their own
+ * interception and their own row. The recycle bin then shows a flat pile of
+ * scattered entries rather than the folder the user deleted, and getting the
+ * tree back meant restoring them one by one (see docs/buglist.md RB-21b).
+ *
+ * Design notes:
+ *
+ *  - The prefix is validated against the protected shares with the same
+ *    routine used for single restores (RB-06). This rename runs as SYSTEM, so
+ *    an unvalidated prefix would be an arbitrary-write primitive, and the
+ *    request reaches us through the shared `ops` table -- the queueing side is
+ *    not a trusted caller.
+ *  - Matching is a genuine path-prefix match, not a substring one:
+ *    "D:\Share\Project" must not also pull in "D:\Share\ProjectBackup".
+ *  - Partial success is reported rather than rolled back. Each entry is an
+ *    independent rename; undoing the ones that already succeeded would be
+ *    more surprising than leaving them and reporting what failed.
+ *  - Stop is checked between entries so a long restore cannot delay shutdown.
+ */
+int RestoreTreeByPrefix(const WCHAR *prefixDos, WCHAR *msgBuf, DWORD cchMsg)
+{
+    WCHAR *prefixNt = NULL;
+    RBSVC_ITEM *items = NULL;
+    int n, i;
+    int okCount = 0, failCount = 0;
+    WCHAR firstErr[256];
+    WCHAR detail[512];
+    int rc;
+
+    firstErr[0] = L'\0';
+
+    if (!prefixDos || prefixDos[0] == L'\0') {
+        if (msgBuf) swprintf_s(msgBuf, cchMsg, L"missing path prefix");
+        return 0;
+    }
+
+    /* Same allow-list check as a single restore (RB-06). */
+    if (!DestIsAllowed(prefixDos, detail, ARRAYSIZE(detail))) {
+        LogWarn(L"[restore-tree] rejected prefix %s: %s", prefixDos, detail);
+        if (msgBuf) swprintf_s(msgBuf, cchMsg, L"%s", detail);
+        return 0;
+    }
+
+    /* orig_path is stored in NT form, so compare in that form. */
+    prefixNt = VolDosToNt(prefixDos);
+    if (!prefixNt) {
+        if (msgBuf) swprintf_s(msgBuf, cchMsg,
+                               L"cannot resolve volume for prefix");
+        return 0;
+    }
+
+    n = DbListByOrigPathPrefix(prefixNt, &items, RBSVC_MAX_TREE_RESTORE);
+    free(prefixNt);
+
+    if (n < 0) {
+        if (msgBuf) swprintf_s(msgBuf, cchMsg, L"query failed");
+        return 0;
+    }
+    if (n == 0) {
+        if (msgBuf) swprintf_s(msgBuf, cchMsg,
+                               L"no restorable items under that prefix");
+        return 0;
+    }
+
+    /* Report when the prefix matched more than we handle, so the caller knows
+       the result is partial rather than assuming the whole tree came back. */
+    if (n >= RBSVC_MAX_TREE_RESTORE) {
+        LogWarn(L"[restore-tree] hit the %d item cap for %s; "
+                L"narrow the prefix to restore the rest",
+                RBSVC_MAX_TREE_RESTORE, prefixDos);
+    }
+
+    for (i = 0; i < n; i++) {
+        WCHAR msg[256];
+        int ok;
+
+        if (WaitForSingleObject(g_StopEvent, 0) == WAIT_OBJECT_0) {
+            LogWarn(L"[restore-tree] stopping early at %d/%d for %s",
+                    i, n, prefixDos);
+            break;
+        }
+
+        /* NULL override: every entry goes back to its own original path,
+           which is what makes this reassemble the tree. */
+        ok = RestoreItemById(items[i].Id, NULL, msg, ARRAYSIZE(msg));
+
+        if (ok) {
+            okCount++;
+        } else {
+            failCount++;
+            if (firstErr[0] == L'\0') {
+                swprintf_s(firstErr, ARRAYSIZE(firstErr),
+                           L"id=%lld: %s", items[i].Id, msg);
+            }
+            LogWarn(L"[restore-tree] id=%lld failed: %s", items[i].Id, msg);
+        }
+    }
+
+    DbFreeItemList(items, n);
+
+    if (failCount == 0) {
+        swprintf_s(detail, ARRAYSIZE(detail), L"restored %d/%d", okCount, n);
+    } else {
+        swprintf_s(detail, ARRAYSIZE(detail),
+                   L"restored %d/%d; %d failed (first: %s)",
+                   okCount, n, failCount, firstErr);
+    }
+
+    LogInfo(L"[restore-tree] %s under %s", detail, prefixDos);
+
+    if (msgBuf) swprintf_s(msgBuf, cchMsg, L"%s", detail);
+
+    rc = (failCount == 0 && okCount > 0) ? 1 : 0;
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
 /* ops queue drain -- commands issued by the Go REST service            */
 /* ------------------------------------------------------------------ */
 
-/* Called periodically by the maintenance thread. */
+/* Called periodically by the ops thread. */
 int RestoreDrainOps(void)
 {
     RBSVC_OP *ops = NULL;
@@ -302,28 +426,43 @@ int RestoreDrainOps(void)
 
         if (!ops[i].Type || ops[i].Type[0] == '\0') {
             DbOpFinish(ops[i].Id, "failed",
-                       "missing op type (expected one of: restore)");
+                       "missing op type (expected: restore, restore-tree)");
             continue;
         }
 
-        /* The `ops.type` column carries a CHECK constraint, so anything
-           reaching here should already be valid. We still reject explicitly:
-           a database written by an older/newer rbapi must not be silently
-           ignored -- the caller deserves a reason. */
-        if (_stricmp(ops[i].Type, "restore") != 0) {
+        if (_stricmp(ops[i].Type, "restore") == 0) {
+            if (ops[i].Arg) argW = U8ToWLocal(ops[i].Arg);
+
+            ok = RestoreItemById(ops[i].ItemId, argW, msg, ARRAYSIZE(msg));
+            free(argW);
+
+        } else if (_stricmp(ops[i].Type, "restore-tree") == 0) {
+            /* The prefix lives in `arg`; item_id is unused (stored as 0). */
+            if (!ops[i].Arg || ops[i].Arg[0] == '\0') {
+                DbOpFinish(ops[i].Id, "failed",
+                           "restore-tree requires a path prefix in arg");
+                continue;
+            }
+
+            argW = U8ToWLocal(ops[i].Arg);
+
+            ok = RestoreTreeByPrefix(argW, msg, ARRAYSIZE(msg));
+            free(argW);
+
+        } else {
+            /* The `ops.type` column carries a CHECK constraint, so anything
+               reaching here should already be valid. We still reject
+               explicitly: a database written by an older or newer rbapi must
+               not be silently ignored -- the caller deserves a reason. */
             char reason[256];
             sprintf_s(reason, sizeof(reason),
-                      "unsupported op type '%s'; this build handles: restore",
+                      "unsupported op type '%s'; this build handles: "
+                      "restore, restore-tree",
                       ops[i].Type);
             LogWarn(L"[ops] %S", reason);
             DbOpFinish(ops[i].Id, "failed", reason);
             continue;
         }
-
-        if (ops[i].Arg) argW = U8ToWLocal(ops[i].Arg);
-
-        ok = RestoreItemById(ops[i].ItemId, argW, msg, ARRAYSIZE(msg));
-        free(argW);
 
         if (!WideCharToMultiByte(CP_UTF8, 0, msg, -1,
                                  msgU8, sizeof(msgU8), NULL, NULL)) {

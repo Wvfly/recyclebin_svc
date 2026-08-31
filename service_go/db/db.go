@@ -44,7 +44,7 @@ var expectedItemCols = []string{
 // SupportedOps mirrors the CHECK constraint on ops.type in db/schema.sql.
 // Keep both in sync; the CHECK rejects anything else at the database level,
 // and this list gives the API a clean 400 before hitting the DB.
-var SupportedOps = []string{"restore"}
+var SupportedOps = []string{"restore", "restore-tree"}
 
 // Item mirrors a row of the `items` table.
 type Item struct {

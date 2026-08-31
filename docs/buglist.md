@@ -42,7 +42,7 @@
 | RB-18 | **P1** | 服务 | 深层目录还原失败：`CreateDirectoryW` 只建一级父目录 | **已修复** |
 | RB-19 | P1 | 驱动 | 删除大目录树极慢：每文件重复调用 `RbfEnsureStoreDir` | **已修复** |
 | RB-20 | P1 | 驱动 | 队列满时部分删除失败，目录删不干净（RB-08 副作用） | 待修 |
-| RB-21 | P1 | 驱动/服务 | staging 扁平结构，单目录文件数膨胀后操作变慢 | 待修 |
+| RB-21 | P1 | 驱动/服务 | staging 扁平结构，单目录文件数膨胀后操作变慢 | 待修（还原粒度已改善） |
 | RB-22 | **P1** | 驱动 | `FileDispositionInformationEx` 未拦截，可绕过整树真删 | **已修复** |
 
 > RB-18 ~ RB-22 为**大目录树删除场景**专项问题（详见第五章）。
@@ -549,11 +549,42 @@ RB-08 将入队改为"预留式"（rename 前占位），消除了孤儿文件�
 2. **落地后回收站膨胀**：`$Recycle.Bin\<Sid>\` 变成 N 个 `$R`/`$I` 对，
    Explorer 打开回收站明显卡顿
 3. **还原粒度问题**：目录树退化为 N 个独立条目，用户无法"整体还原目录"
+   —— **已通过新增 `restore-tree` 批量还原缓解**（见下方说明）
 
 **修复建议**
 
 1. staging 路径保留部分层级（如按原路径 hash 分桶到子目录），控制单目录文件数
 2. 还原 API 支持"按前缀批量还原"，把目录树还原作为一个操作
+
+**部分实施（还原粒度已解决）**
+
+新增 `restore-tree` op 类型，一次请求还原整个目录树：
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8800/ops" -Method Post -Headers $h `
+  -Body '{"type":"restore-tree","arg":"D:\\Share\\Project"}' `
+  -ContentType "application/json"
+```
+
+实现要点：
+
+- **安全校验复用**：前缀经 `DestIsAllowed()` 同一 allow-list 校验（RB-06）。
+  该 rename 以 SYSTEM 执行且请求经共享 `ops` 表传入，未校验的前缀等同于
+  任意写入原语——因此校验位于 C 侧执行点，而非 Go 侧调用方
+- **真前缀匹配**：`orig_path LIKE ? ESCAPE '\'` 且要求分隔符边界，
+  `D:\Share\Project` 不会连带匹配 `D:\Share\ProjectBackup`
+- **LIKE 转义**：用户输入的 `%`、`_`、`\` 均转义，避免通配符注入
+- **限量与可中断**：单次上限 `RBSVC_MAX_TREE_RESTORE`（5000），
+  条目间检查 `g_StopEvent` 以便优雅停机
+- **部分失败如实报告**：各条目 rename 相互独立，不回滚已成功项，
+  结果消息形如 `restored 41/42; 1 failed (first: id=123: ...)`
+
+> 未对 `orig_path` 建索引：每次拦截删除都插入行，索引会持续拖累热路径；
+> 而批量还原是低频管理操作，配合 RB-09 的终态归档，全表扫描可接受。
+
+**仍待解决**：staging 扁平结构本身（RB-21a 前半部分）未改动——
+扁平化是 B1 的正确权衡（避免在内核态重建深层目录树导致 rename 失败），
+仅在大目录树场景有性能影响，优先级低。
 
 ---
 

@@ -399,8 +399,14 @@ static void BindItem(sqlite3_stmt *st, RBSVC_ITEM *out)
     out->RecyclePath = U8ToW((const char *)sqlite3_column_text(st, IT_COL_RECYCLE_PATH));
 }
 
-/* Generic list fetch: sql must return ITEM_SELECT_COLS in order. */
-static int DbFetchItems(const char *sql, RBSVC_ITEM **out, int limit)
+/* Generic list fetch: sql must return ITEM_SELECT_COLS in order.
+ *
+ * bindText, when not NULL, is bound to the statement's first parameter. That
+ * exists so caller-supplied text (a LIKE pattern for tree restore) never has
+ * to be spliced into the SQL string, where quoting or length would be a
+ * problem. */
+static int DbFetchItemsEx(const char *sql, const char *bindText,
+                          RBSVC_ITEM **out, int limit)
 {
     sqlite3_stmt *st = NULL;
     RBSVC_ITEM *list = NULL;
@@ -413,6 +419,14 @@ static int DbFetchItems(const char *sql, RBSVC_ITEM **out, int limit)
 
     rc = sqlite3_prepare_v2(g_Db, sql, -1, &st, NULL);
     if (rc != SQLITE_OK) { DbLogError("prepare"); goto done; }
+
+    if (bindText) {
+        if (sqlite3_bind_text(st, 1, bindText, -1, SQLITE_TRANSIENT)
+                != SQLITE_OK) {
+            DbLogError("bind");
+            goto done;
+        }
+    }
 
     cap = (limit > 0 && limit < 4096) ? limit : 256;
     list = (RBSVC_ITEM *)calloc((size_t)cap, sizeof(RBSVC_ITEM));
@@ -440,6 +454,118 @@ done:
 
     if (count == 0) { free(list); list = NULL; }
     *out = list;
+    return count;
+}
+
+static int DbFetchItems(const char *sql, RBSVC_ITEM **out, int limit)
+{
+    return DbFetchItemsEx(sql, NULL, out, limit);
+}
+
+/* Escape the LIKE metacharacters in user-supplied text so it matches
+   literally: without this a prefix of "D:\Share\100%" would silently match
+   anything, and "_" would match any single character.
+   `out` must have room for 2*wcslen(in)+1 WCHARs. */
+static void SqlLikeEscape(const WCHAR *in, WCHAR *out)
+{
+    WCHAR *p = out;
+
+    for (; in && *in; in++) {
+        if (*in == L'%' || *in == L'_' || *in == L'\\') *p++ = L'\\';
+        *p++ = *in;
+    }
+    *p = L'\0';
+}
+
+/* Items whose orig_path starts with `prefixNt` (NT form), oldest first.
+ *
+ * Powers the restore-tree op (see rbrestore.c). Deleting a directory over SMB
+ * removes one entry at a time, so its contents land in the store as separate
+ * rows; this is what reassembles them for a single restore request.
+ *
+ * Only live rows are returned -- 'restored' / 'purged' entries have already
+ * left (or been discarded from) the store, so asking to restore them again
+ * would only produce confusing "not found" failures.
+ *
+ * There is deliberately no index on orig_path. Every intercepted delete
+ * inserts a row, so an index there would tax the hot path continuously to
+ * speed up an operation an administrator runs occasionally; the reaper keeps
+ * the table small enough for the scan.
+ */
+int DbListByOrigPathPrefix(const WCHAR *prefixNt, RBSVC_ITEM **out, int limit)
+{
+    const char *sql =
+        "SELECT " ITEM_SELECT_COLS
+        " FROM items"
+        " WHERE orig_path LIKE ? ESCAPE '\\'"
+        "   AND status IN ('landed','staged')"
+        " ORDER BY orig_path ASC"
+        " LIMIT ?";
+    sqlite3_stmt *st = NULL;
+    char *patU8 = NULL;
+    WCHAR *esc = NULL;
+    size_t len;
+    int count = 0;
+
+    *out = NULL;
+    if (!g_Db || !prefixNt || !prefixNt[0]) return 0;
+
+    len = wcslen(prefixNt);
+    if (len > RBSVC_MAX_TREE_PREFIX) return -1;   /* refuse absurd input */
+
+    esc = (WCHAR *)malloc((2 * len + 2) * sizeof(WCHAR));
+    if (!esc) return -1;
+    SqlLikeEscape(prefixNt, esc);
+
+    /* Trailing wildcard is intentional: everything under the prefix. */
+    wcscat_s(esc, 2 * len + 2, L"%");
+
+    patU8 = WToU8(esc);
+    free(esc);
+    if (!patU8) return -1;
+
+    EnterCriticalSection(&g_DbLock);
+
+    if (sqlite3_prepare_v2(g_Db, sql, -1, &st, NULL) == SQLITE_OK) {
+        RBSVC_ITEM *list = NULL;
+        int cap = (limit > 0 && limit < 4096) ? limit : 256;
+
+        sqlite3_bind_text(st, 1, patU8, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, limit > 0 ? limit : RBSVC_MAX_TREE_RESTORE);
+
+        list = (RBSVC_ITEM *)calloc((size_t)cap, sizeof(RBSVC_ITEM));
+        if (list) {
+            int rc;
+            while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+                if (count >= cap) {
+                    int ncap = cap * 2;
+                    RBSVC_ITEM *nl = (RBSVC_ITEM *)realloc(
+                        list, (size_t)ncap * sizeof(RBSVC_ITEM));
+                    if (!nl) break;
+                    memset(nl + cap, 0,
+                           (size_t)(ncap - cap) * sizeof(RBSVC_ITEM));
+                    list = nl; cap = ncap;
+                }
+                BindItem(st, &list[count]);
+                count++;
+                if (limit > 0 && count >= limit) break;
+            }
+            if (rc != SQLITE_DONE && rc != SQLITE_ROW) DbLogError("step");
+
+            if (count == 0) { free(list); list = NULL; }
+            *out = list;
+        } else {
+            count = -1;
+        }
+    } else {
+        DbLogError("prepare orig_path prefix");
+        count = -1;
+    }
+
+    if (st) sqlite3_finalize(st);
+    LeaveCriticalSection(&g_DbLock);
+
+    free(patU8);
     return count;
 }
 

@@ -77,10 +77,17 @@ CREATE INDEX IF NOT EXISTS idx_items_terminal ON items(status, delete_time);
 CREATE TABLE IF NOT EXISTS ops (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
 
-    type    TEXT NOT NULL CHECK (type IN ('restore')),
+    -- 'restore'      : restore one item.      item_id = that item's id.
+    -- 'restore-tree' : restore every item whose orig_path starts with the
+    --                  prefix in `arg`. item_id is not used and must be 0.
+    type    TEXT NOT NULL CHECK (type IN ('restore', 'restore-tree')),
     item_id INTEGER NOT NULL,
 
-    arg     TEXT,   -- optional restore target override
+    -- 'restore'      : optional restore target override (may be NULL)
+    -- 'restore-tree' : REQUIRED path prefix, e.g. D:\Share\Project.
+    --                  Matched as a prefix, so "D:\Share\Project" does NOT
+    --                  also pull in "D:\Share\ProjectBackup".
+    arg     TEXT,
     state   TEXT NOT NULL DEFAULT 'pending'
                     CHECK (state IN ('pending', 'done', 'failed')),
     message TEXT,   -- human-readable outcome

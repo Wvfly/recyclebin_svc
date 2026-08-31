@@ -220,10 +220,20 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// POST /ops  {"type":"restore","id":123,"arg":"D:\\Share\\a.txt"}
+// POST /ops
+//
+//	{"type":"restore","id":123,"arg":"D:\\Share\\a.txt"}
+//	    Restore one item. `arg` optionally overrides the destination.
+//
+//	{"type":"restore-tree","arg":"D:\\Share\\Project"}
+//	    Restore every item whose original path starts with `arg`. Deleting a
+//	    directory over SMB removes one entry at a time, so a tree arrives in
+//	    the recycle bin as many scattered entries; this restores them in one
+//	    request. `id` is unused.
 //
 // Queues a command for rbservice.exe. This endpoint does NOT perform the
-// restore itself -- poll GET /ops/{id} for the outcome.
+// restore itself -- poll GET /ops/{id} for the outcome. For restore-tree the
+// result message summarises how many entries succeeded and how many failed.
 func (s *Server) handleOps(w http.ResponseWriter, r *http.Request) {
 	if !s.authorized(r) {
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
@@ -253,24 +263,36 @@ func (s *Server) handleOps(w http.ResponseWriter, r *http.Request) {
 					req.Type, db.SupportedOps))
 			return
 		}
-		if req.ID <= 0 {
-			writeErr(w, http.StatusBadRequest, "id required")
-			return
-		}
+		// Each op type carries a different payload:
+		//   restore      -> id  (the item to restore), arg optional
+		//   restore-tree -> arg (path prefix),          id unused (stored as 0)
+		if req.Type == "restore-tree" {
+			if strings.TrimSpace(req.Arg) == "" {
+				writeErr(w, http.StatusBadRequest,
+					"arg required for restore-tree: path prefix, e.g. D:\\Share\\Project")
+				return
+			}
+			req.ID = 0 // not a single-item op; the schema requires a value
+		} else {
+			if req.ID <= 0 {
+				writeErr(w, http.StatusBadRequest, "id required")
+				return
+			}
 
-		// Only existence is checked here. Whether an item is *restorable* is a
-		// business rule owned by rbservice.exe -- duplicating the
-		// landed/staged check here would let the two services disagree.
-		// Queue the request and let the C service decide; it reports back via
-		// the op's state/message.
-		it, err := s.DB.GetItem(req.ID)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		if it == nil {
-			writeErr(w, http.StatusNotFound, "not found")
-			return
+			// Only existence is checked here. Whether an item is *restorable*
+			// is a business rule owned by rbservice.exe -- duplicating the
+			// landed/staged check here would let the two services disagree.
+			// Queue the request and let the C service decide; it reports back
+			// via the op's state/message.
+			it, err := s.DB.GetItem(req.ID)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if it == nil {
+				writeErr(w, http.StatusNotFound, "not found")
+				return
+			}
 		}
 
 		opID, err := s.DB.EnqueueRestore(req.ID, req.Arg)

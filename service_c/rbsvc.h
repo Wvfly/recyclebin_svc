@@ -92,6 +92,11 @@
    <StoreRoot>\<Sid>\<seq>_<name>; entries that would overflow are counted as
    errors and skipped rather than truncated. */
 #define RBSVC_MAX_RECON_PATH  1024
+
+/* Restore-tree (see rbrestore.c): bounds a single request so one bad prefix
+   cannot queue an unbounded amount of work behind the ops thread. */
+#define RBSVC_MAX_TREE_RESTORE 5000
+#define RBSVC_MAX_TREE_PREFIX  512
 #define DEF_PORT_NAME        L"\\RecycleBinPort"
 #define DEF_PROTECTED        L"D:\\Share"
 
@@ -195,6 +200,11 @@ void DbClose(void);
 /* 1 = store_path present in items, 0 = orphan, -1 = error (RB-05) */
 int    DbStorePathExists(const WCHAR *storePathNt);
 
+/* Items whose orig_path (NT form) starts with prefixNt, oldest first, limited
+   to live ('landed','staged') rows. Returns count, or -1 on error.
+   Backs the restore-tree op. */
+int    DbListByOrigPathPrefix(const WCHAR *prefixNt, RBSVC_ITEM **out, int limit);
+
 /* Delete terminal ('restored'/'purged') rows older than keepDays (RB-09).
    Returns rows deleted, or -1 on error. The backing file is already gone by
    then -- this only bounds the table so queries stay fast. */
@@ -290,6 +300,16 @@ int  ReconcileStaging(DWORD graceDays);
 /* Returns 1 ok, 0 fail. Message written into buf. */
 int  RestoreItemById(LONG64 itemId, const WCHAR *argOverride,
                      WCHAR *msgBuf, DWORD cchMsg);
+
+/* Restore every live item whose original path begins with prefixDos, e.g.
+   D:\Share\Project. Returns 1 if all succeeded, 0 otherwise; msgBuf carries a
+   summary ("restored 41/42; 1 failed: ...").
+
+   Deleting a directory over SMB removes one entry at a time, so a tree
+   arrives in the store as many scattered rows (see docs/buglist.md RB-21b).
+   This reassembles them from a single request instead of requiring one
+   restore per entry. */
+int  RestoreTreeByPrefix(const WCHAR *prefixDos, WCHAR *msgBuf, DWORD cchMsg);
 
 /* ------------------------------------------------------------------ */
 /* Kernel port reader                                                  */

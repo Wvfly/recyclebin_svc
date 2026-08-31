@@ -15,7 +15,7 @@
 ![Core](https://img.shields.io/badge/core-C%20%2F%20Go-555555?logo=go)
 ![Driver](https://img.shields.io/badge/driver-Mini--Filter%20(WDK)-orange)
 ![Architecture](https://img.shields.io/badge/architecture-single--writer%20SQLite-blueviolet)
-![Tests](https://img.shields.io/badge/contract%20tests-16%2F16%20pass-brightgreen)
+![Tests](https://img.shields.io/badge/contract%20tests-19%2F19%20pass-brightgreen)
 ![Signing](https://img.shields.io/badge/driver%20signing-required-red)
 
 </div>
@@ -436,7 +436,7 @@ sc.exe control RecycleBinSvc 128
 | GET | `/items` | 分页查询（`limit`、`offset`、`status`、`sid`） |
 | GET | `/items/{id}` | 单条详情 |
 | GET | `/search` | 路径子串搜索（`q`、`limit`） |
-| POST | `/ops` | 提交操作（当前支持 `restore`） |
+| POST | `/ops` | 提交操作（`restore` 单条 / `restore-tree` 目录树） |
 | GET | `/ops/{id}` | 查询操作执行结果 |
 
 ### GET /health
@@ -469,14 +469,41 @@ sc.exe control RecycleBinSvc 128
 
 ### POST /ops
 
+**单条还原**：
+
 ```json
 { "type": "restore", "id": 123 }
 ```
 
+**按前缀批量还原（目录树）**：
+
+```json
+{ "type": "restore-tree", "arg": "D:\\Share\\Project" }
+```
+
 返回操作 ID，实际执行由 C 服务异步完成，用 `GET /ops/{id}` 查询结果。
+批量还原的 message 形如 `restored 41/42; 1 failed (first: id=123: ...)`。
+
+> **删除目录树后如何还原**
+>
+> SMB 删除目录是**逐个条目**进行的（客户端递归删除），所以一个含 N 个文件、
+> M 个子目录的目录树，在回收站里是 **N+M 个分散条目**，而不是一个目录——
+> 这与本地 Explorer 删除（一次 rename 整树，显示为单个目录）不同。
+>
+> 用 `restore-tree` 可一次还原整棵树，无需逐条操作：
+>
+> ```powershell
+> Invoke-RestMethod "http://127.0.0.1:8800/ops" -Method Post -Headers $h `
+>                   -Body '{"type":"restore-tree","arg":"D:\\Share\\Project"}' `
+>                   -ContentType "application/json"
+> ```
+>
+> 前缀匹配是**真前缀**：`D:\Share\Project` 不会连带匹配 `D:\Share\ProjectBackup`。
+> 单次上限 5000 条，超出时收窄前缀分批处理。
 
 > **还原目标安全**：系统只接受还原到**原路径**，或落在受保护共享内的目标；
-> 含 `..` 的路径、UNC 路径、设备路径均被拒绝。该校验在 C 侧执行。
+> 含 `..` 的路径、UNC 路径、设备路径均被拒绝。该校验在 C 侧执行，
+> `restore-tree` 的前缀同样受此约束。
 
 ### 调用示例
 
@@ -484,8 +511,15 @@ sc.exe control RecycleBinSvc 128
 $h = @{"X-Auth-Token"="change-me"}
 Invoke-RestMethod "http://127.0.0.1:8800/items?status=landed&limit=50" -Headers $h
 Invoke-RestMethod "http://127.0.0.1:8800/search?q=report&limit=20" -Headers $h
+
+# 还原单条
 Invoke-RestMethod "http://127.0.0.1:8800/ops" -Method Post -Headers $h `
                   -Body '{"type":"restore","id":123}' -ContentType "application/json"
+
+# 还原整个目录树
+Invoke-RestMethod "http://127.0.0.1:8800/ops" -Method Post -Headers $h `
+                  -Body '{"type":"restore-tree","arg":"D:\\Share\\Project"}' `
+                  -ContentType "application/json"
 ```
 
 ---
