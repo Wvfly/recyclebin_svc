@@ -293,6 +293,74 @@ int DbCheckIntegrity(void)
     return ok ? 1 : 0;
 }
 
+/* RB-13: persist the latest driver counter snapshot.
+ *
+ * These are cumulative counters, so a few seconds of sampling lag is
+ * harmless; the driver keeps its own high-water mark for queue depth, which
+ * covers the peaks between two samples.
+ *
+ * `driverResponded` distinguishes "driver is up and reports zeros" from
+ * "driver did not answer". Both write a row, but only the first advances `ts`
+ * as a healthy sample -- see the driver_stats comment in db\schema.sql for why
+ * that distinction has to survive into the stored row.
+ */
+int DbWriteDriverStats(const RBF_STATS *stats, int driverResponded)
+{
+    const char *sql =
+        "INSERT INTO driver_stats"
+        " (id, ts, intercepts, rename_ok, rename_fail, delete_denied,"
+        "  notify_sent, notify_dropped, notify_queue_full,"
+        "  queue_depth, max_queue_depth)"
+        " VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " ON CONFLICT(id) DO UPDATE SET"
+        "  ts = excluded.ts,"
+        "  intercepts = excluded.intercepts,"
+        "  rename_ok = excluded.rename_ok,"
+        "  rename_fail = excluded.rename_fail,"
+        "  delete_denied = excluded.delete_denied,"
+        "  notify_sent = excluded.notify_sent,"
+        "  notify_dropped = excluded.notify_dropped,"
+        "  notify_queue_full = excluded.notify_queue_full,"
+        "  queue_depth = excluded.queue_depth,"
+        "  max_queue_depth = excluded.max_queue_depth";
+    sqlite3_stmt *st = NULL;
+    int rc;
+
+    if (!g_Db || !stats) return -1;
+
+    EnterCriticalSection(&g_DbLock);
+
+    rc = sqlite3_prepare_v2(g_Db, sql, -1, &st, NULL);
+    if (rc != SQLITE_OK) {
+        DbLogError("prepare driver_stats");
+        LeaveCriticalSection(&g_DbLock);
+        return -1;
+    }
+
+    sqlite3_bind_double(st, 1, (double)time(NULL));
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)stats->Intercepts);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)stats->RenameOk);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)stats->RenameFail);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)stats->DeleteDenied);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)stats->NotifySent);
+    sqlite3_bind_int64(st, 7, (sqlite3_int64)stats->NotifyDropped);
+    sqlite3_bind_int64(st, 8, (sqlite3_int64)stats->NotifyQueueFull);
+    sqlite3_bind_int(st,  9, (int)stats->QueueDepth);
+    sqlite3_bind_int(st, 10, (int)stats->MaxQueueDepth);
+
+    if (sqlite3_step(st) != SQLITE_DONE) {
+        DbLogError("step driver_stats");
+        sqlite3_finalize(st);
+        LeaveCriticalSection(&g_DbLock);
+        return -1;
+    }
+
+    sqlite3_finalize(st);
+    LeaveCriticalSection(&g_DbLock);
+
+    return driverResponded ? 1 : 0;
+}
+
 void DbClose(void)
 {
     if (g_Db) {

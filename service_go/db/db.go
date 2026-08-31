@@ -397,6 +397,98 @@ func (d *DB) Stats() (*Counts, error) {
 	return c, nil
 }
 
+// DriverStats mirrors the driver_stats table (see db/schema.sql), which is
+// the snapshot rbservice.exe takes of the kernel counters (RB-13).
+//
+// The Go service reads it instead of asking the driver directly: the
+// communication port accepts exactly one connection and the C service holds
+// it, so a second FilterSendMessage would simply be refused.
+type DriverStats struct {
+	Ts              float64 `json:"ts"`
+	Intercepts      int64   `json:"intercepts"`
+	RenameOk        int64   `json:"rename_ok"`
+	RenameFail      int64   `json:"rename_fail"`
+	DeleteDenied    int64   `json:"delete_denied"`
+	NotifySent      int64   `json:"notify_sent"`
+	NotifyDropped   int64   `json:"notify_dropped"`
+	NotifyQueueFull int64   `json:"notify_queue_full"`
+	QueueDepth      int     `json:"queue_depth"`
+	MaxQueueDepth   int     `json:"max_queue_depth"`
+
+	// AgeSec is how long ago the sample was taken, and Stale says whether
+	// that is beyond the sampling window. A stale row means the driver
+	// stopped answering -- it must never be rendered as healthy zeros,
+	// because these are cumulative counters and "0 deletes" would otherwise
+	// look identical to "0 recorded, driver gone".
+	AgeSec float64 `json:"age_sec"`
+	Stale  bool    `json:"stale"`
+}
+
+// DriverStats reads the latest counter snapshot.
+//
+// A nil result with no error means there is no snapshot yet (the C service
+// has not sampled, or the driver was never loaded) -- callers should treat
+// that as "unknown", not "zero".
+func (d *DB) DriverStats() (*DriverStats, error) {
+	const q = `SELECT ts, intercepts, rename_ok, rename_fail, delete_denied,
+	                  notify_sent, notify_dropped, notify_queue_full,
+	                  queue_depth, max_queue_depth
+	             FROM driver_stats WHERE id = 1`
+
+	st := &DriverStats{}
+	err := d.ro.QueryRow(q).Scan(
+		&st.Ts, &st.Intercepts, &st.RenameOk, &st.RenameFail,
+		&st.DeleteDenied, &st.NotifySent, &st.NotifyDropped,
+		&st.NotifyQueueFull, &st.QueueDepth, &st.MaxQueueDepth)
+	if err == sql.ErrNoRows {
+		return nil, nil // no snapshot yet
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	st.AgeSec = float64(time.Now().Unix()) - st.Ts
+	if st.AgeSec < 0 {
+		st.AgeSec = 0 // clock skew between sampler and reader
+	}
+	// The C service samples every RBSVC_STATS_INTERVAL seconds; allow a few
+	// missed cycles before calling it dead.
+	st.Stale = st.AgeSec > statsStaleAfterSec
+
+	return st, nil
+}
+
+// statsStaleAfterSec mirrors RBSVC_STATS_STALE_SEC in service_c/rbsvc.h.
+// Keep both in sync: a snapshot older than this means the driver is offline.
+const statsStaleAfterSec = 30
+
+// DriverStatsMap renders the snapshot for the /stats and /health endpoints.
+//
+// A stale (or missing) snapshot reports offline rather than numbers, so an
+// operator never reads "0 deletes denied" from a driver that is not running.
+func (d *DB) DriverStatsMap() map[string]interface{} {
+	st, err := d.DriverStats()
+	if err != nil || st == nil {
+		return nil // unknown
+	}
+	if st.Stale {
+		return nil // driver stopped answering
+	}
+	return map[string]interface{}{
+		"ts":                st.Ts,
+		"age_sec":           st.AgeSec,
+		"intercepts":        st.Intercepts,
+		"rename_ok":         st.RenameOk,
+		"rename_fail":       st.RenameFail,
+		"delete_denied":     st.DeleteDenied,
+		"notify_sent":       st.NotifySent,
+		"notify_dropped":    st.NotifyDropped,
+		"notify_queue_full": st.NotifyQueueFull,
+		"queue_depth":       st.QueueDepth,
+		"max_queue_depth":   st.MaxQueueDepth,
+	}
+}
+
 // EnqueueOp inserts an `ops` row asking rbservice.exe to perform work.
 // It returns the new op id, which clients can poll via OpStatus.
 //

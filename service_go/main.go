@@ -133,10 +133,14 @@ func main() {
 	}
 	defer database.Close()
 
-	// Driver statistics are fetched from the kernel port, which lives in the C
-	// service. Expose them as nil for now: the C side writes counters into the
-	// DB via an optional `stats` table if you want them here.
-	srv := api.New(database, cfg.Token, nil)
+	// Driver statistics (RB-13).
+	//
+	// The kernel port accepts a single connection and rbservice.exe holds it,
+	// so we cannot ask the driver ourselves -- a second FilterSendMessage would
+	// be refused. Instead rbservice.exe samples the counters into the
+	// driver_stats table and we read that. Nil means "unknown", which the API
+	// reports as 503 rather than as a misleading set of zeros.
+	srv := api.New(database, cfg.Token, database.DriverStatsMap)
 
 	mux := http.NewServeMux()
 	srv.Register(mux)

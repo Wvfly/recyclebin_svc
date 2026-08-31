@@ -97,3 +97,38 @@ CREATE TABLE IF NOT EXISTS ops (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ops_state ON ops(state);
+
+
+-- ---------------------------------------------------------------------------
+-- driver_stats: latest snapshot of the kernel counters (RB-13).
+--
+-- Single row (id is pinned to 1). rbservice.exe is the only writer: it polls
+-- the driver over the communication port, which accepts just one connection
+-- (MaxConnections=1 in FltCreateCommunicationPort) and is already held by the
+-- C service. rbapi.exe therefore reads the counters from here instead of
+-- opening a second port, which the driver would refuse.
+--
+-- `ts` is the sample time, not a read time: a row that stops advancing means
+-- the driver is gone (unloaded) or the port dropped. Consumers must treat a
+-- stale ts as "offline" rather than "all zeros", because these are cumulative
+-- counters -- a fresh-looking zero row would otherwise be indistinguishable
+-- from a healthy idle driver.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS driver_stats (
+    id                INTEGER PRIMARY KEY CHECK (id = 1),
+
+    ts                REAL NOT NULL,   -- unix epoch, when the sample was taken
+
+    -- Cumulative counters
+    intercepts        INTEGER NOT NULL DEFAULT 0,
+    rename_ok         INTEGER NOT NULL DEFAULT 0,
+    rename_fail       INTEGER NOT NULL DEFAULT 0,
+    delete_denied     INTEGER NOT NULL DEFAULT 0,  -- fail-closed (RB-04)
+    notify_sent       INTEGER NOT NULL DEFAULT 0,
+    notify_dropped    INTEGER NOT NULL DEFAULT 0,
+    notify_queue_full INTEGER NOT NULL DEFAULT 0,  -- RB-08
+
+    -- Instantaneous / high-water
+    queue_depth       INTEGER NOT NULL DEFAULT 0,
+    max_queue_depth   INTEGER NOT NULL DEFAULT 0
+);

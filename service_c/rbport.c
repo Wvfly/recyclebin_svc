@@ -28,6 +28,26 @@ typedef struct _RB_MSG_BUFFER {
 static HANDLE g_Port = NULL;
 static CRITICAL_SECTION g_PortLock;
 
+/* The lock used to be initialised and torn down inside the port thread. That
+ * made PortQueryStats() unsafe anywhere else: console/once mode never starts
+ * that thread, so the section was still uninitialised and the call crashed
+ * (caught by the contract test, not by the compiler).
+ *
+ * The lock now follows the process lifetime instead, via PortInit/PortFini. */
+static LONG g_PortLockReady = 0;
+
+void PortInit(void)
+{
+    if (InterlockedCompareExchange(&g_PortLockReady, 1, 0) == 0)
+        InitializeCriticalSection(&g_PortLock);
+}
+
+void PortFini(void)
+{
+    if (InterlockedCompareExchange(&g_PortLockReady, 0, 1) == 1)
+        DeleteCriticalSection(&g_PortLock);
+}
+
 static void PortCloseLocked(void)
 {
     if (g_Port) {
@@ -57,7 +77,7 @@ DWORD WINAPI PortThreadProc(LPVOID param)
     const WCHAR *portName = (const WCHAR *)param;
     int connected = 0;
 
-    InitializeCriticalSection(&g_PortLock);
+    PortInit();
 
     while (WaitForSingleObject(g_StopEvent, 0) != WAIT_OBJECT_0) {
         RB_MSG_BUFFER buf;
@@ -130,7 +150,6 @@ DWORD WINAPI PortThreadProc(LPVOID param)
     EnterCriticalSection(&g_PortLock);
     PortCloseLocked();
     LeaveCriticalSection(&g_PortLock);
-    DeleteCriticalSection(&g_PortLock);
 
     LogInfo(L"port thread exiting");
     return 0;
@@ -161,4 +180,35 @@ int PortQueryStats(RBF_STATS *stats)
 
     LeaveCriticalSection(&g_PortLock);
     return rc;
+}
+
+/*
+ * Sample the driver counters into driver_stats (RB-13).
+ *
+ * The kernel port accepts a single connection and this service holds it, so
+ * rbapi.exe cannot ask the driver itself -- it reads the snapshot we leave in
+ * the database instead. That is also why this lives here rather than in the Go
+ * service: opening a second port would simply be refused.
+ *
+ * Returns 1 if the driver answered, 0 if it did not (port down, driver
+ * unloaded). A failed sample is still recorded, because "the driver stopped
+ * answering" is itself the signal an operator needs -- see the stale-ts rule
+ * in RBSVC_STATS_STALE_SEC.
+ */
+int PortSampleStats(void)
+{
+    RBF_STATS stats;
+    int rc;
+
+    ZeroMemory(&stats, sizeof(stats));
+
+    rc = PortQueryStats(&stats);
+    if (rc != 0) {
+        /* Port is not connected: nothing to report, but keep the previous
+           row so a reader can still tell how stale it is. */
+        return 0;
+    }
+
+    DbWriteDriverStats(&stats, 1);
+    return 1;
 }

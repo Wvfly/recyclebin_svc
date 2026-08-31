@@ -34,7 +34,7 @@
 | RB-10 | P1 | 服务 | 还原操作挂在 30 秒维护周期上，最长等待 30 秒 | **已修复** |
 | RB-11 | P1 | 服务 | 数据库无备份、无完整性检查、无损坏恢复预案 | **已修复** |
 | RB-12 | P1 | 运维 | 配置无法热更新，变更需重启服务 | 部分（用户态配置已热加载） |
-| RB-13 | P2 | Go API | 驱动计数器恒为 `nil`，`/stats` 恒 503，`/health` 的 driver 字段恒 null | 待修 |
+| RB-13 | P2 | Go API | 驱动计数器恒为 `nil`，`/stats` 恒 503，`/health` 的 driver 字段恒 null | **已修复** |
 | RB-14 | P2 | 全局 | 无监控指标导出、事件日志无 manifest、无告警规则 | 待修 |
 | RB-15 | P2 | 工程 | 测试覆盖为零（无单元测试、压力测试、故障注入测试） | 待修 |
 | RB-16 | P2 | Go API | Token 非恒定时间比较、注册表明文存储、无限流、无操作审计 | 待修 |
@@ -310,9 +310,53 @@ minifilter 卸载常被未决 I/O 阻塞 → 驱动更新需重启服务器；�
 
 运维完全看不到"文件被静默真删"的次数，使 RB-04 与 RB-05 在生产上不可见。
 
-**修复建议**
+**修复方案（已实施）**
 
-由 Go 通过命名管道或 C 服务代理读取驱动统计，实现 `Stats` 接口并接入 `/stats`。
+**关键约束**：通信端口 `MaxConnections = 1`（`driver/rbminiflt.c` 的
+`FltCreateCommunicationPort` 末位参数），且该连接已被 C 服务占用，
+因此 **Go 侧无法自行连接端口查询**——`FilterSendMessage` 会被拒绝。
+`main.go` 中原注释已预留此方案。
+
+采用 **C 服务采样 → 数据库快照 → Go 只读** 的链路：
+
+```
+rbservice (ops 线程, 每 5s)               rbapi (只读)
+    PortQueryStats()                          │
+         │                                    ▼
+         ▼                            GET /stats, /health
+  driver_stats 单行表  ─────────────────────────┘
+```
+
+- `db/schema.sql` 新增 `driver_stats` 单行表（`CHECK (id = 1)`），
+  含全部累计计数器 + `queue_depth` / `max_queue_depth` + 采样时间 `ts`
+- C 侧 `PortSampleStats()` 采样写入，`RBSVC_STATS_INTERVAL = 5` 秒
+- Go 侧 `DriverStatsMap()` 读取并接入 `api.New(..., database.DriverStatsMap)`
+
+**陈旧判定（关键设计）**
+
+这些是**累计计数器**，"驱动没应答"与"真的 0 次删除"在数值上无法区分。
+若直接返回 0，运维会看到 `delete_denied = 0` 而误判系统健康。
+
+因此引入 `RBSVC_STATS_STALE_SEC = 30`：快照超过 30 秒未更新即判定
+**驱动离线**，返回 503 而非数值。三态语义：
+
+| 状态 | 表现 |
+|---|---|
+| 无快照 | 503（unknown） |
+| 快照新鲜 | 返回真实计数器 |
+| 快照陈旧 | 503（offline） |
+
+**顺带修复的缺陷**：`g_PortLock` 原先在端口线程内 `InitializeCriticalSection`
+/ `DeleteCriticalSection`，导致 `once` / console 模式（不启动端口线程）调用
+`PortQueryStats()` 时访问未初始化的临界区而崩溃——由契约测试捕获。
+已重构为 `PortInit()` / `PortFini()` 跟随进程生命周期（幂等，
+`InterlockedCompareExchange` 保护）。
+
+**验证**：新增 `db/verify_stats_endpoint.ps1`，启动真实 `rbapi.exe` 实测三种
+状态（无快照 / 新鲜 / 陈旧），均通过。
+
+> 该脚本需占用端口且要拉起进程，故未并入 `build_all.cmd` 默认流程，
+> 以免 CI 上的端口冲突让构建变得不稳定；需要时手动运行。
 
 ---
 
@@ -648,6 +692,7 @@ rename → 入队），整树删除不再能绕过。
 | 第三阶段 规模化 | 4 周 | RB-08 目录批处理、RB-09 归档与索引、RB-11 备份、RB-15 测试补齐 |
 | 第四阶段 生产化 | 持续 | RB-03 回调重构、RB-12 热更新、HLK 认证、容量模型与压测基线 |
 | **新增 目录树场景** | **1–2 周** | ~~RB-18 递归建父目录~~、~~RB-19 目录缓存~~、~~RB-22 拦截 DispositionEx~~ **已完成**；RB-20 / RB-21 仍待排期 |
+| **可观测性** | 已完成 | ~~RB-13 驱动计数器打通~~ **已完成**（含 `PortLock` 生命周期缺陷修复） |
 
 > 建议：在 RB-01、RB-02、RB-04 完成前，**不要开展任何生产试点**。
 >

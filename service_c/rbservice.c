@@ -40,6 +40,9 @@ time_t g_LastReconcile = 0;
 /* RB-11: throttles the database backup (see rbsvc.h) */
 time_t g_LastBackup = 0;
 
+/* RB-13: throttles driver counter sampling (see rbsvc.h) */
+time_t g_LastStatsSample = 0;
+
 /* Declared in rbpolicy.c / rbrestore.c */
 int RestoreDrainOps(void);
 
@@ -189,6 +192,14 @@ static DWORD WINAPI OpsThreadProc(LPVOID param)
     while (WaitForSingleObject(g_StopEvent, RBSVC_OPS_POLL_MS) != WAIT_OBJECT_0) {
         __try {
             RestoreDrainOps();
+
+            /* RB-13: publish the driver counters every few seconds so
+               rbapi.exe can show real delete/deny/drop numbers instead of a
+               permanently unavailable /stats endpoint. */
+            if (time(NULL) - g_LastStatsSample >= (time_t)RBSVC_STATS_INTERVAL) {
+                g_LastStatsSample = time(NULL);
+                PortSampleStats();
+            }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             LogError(L"[ops] unhandled exception draining restore commands");
         }
@@ -271,6 +282,7 @@ DWORD WINAPI ServiceCtrlHandlerEx(DWORD ctrl, DWORD eventType,
         }
 
         DbClose();
+        PortFini();
         LogInfo(L"service stopped");
         LogShutdown();
 
@@ -317,6 +329,7 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR *argv)
     /* Load configuration before anything touches disk */
     ConfigLoad(&g_Config);
     VolInit();
+    PortInit();
 
     if (!DbOpen(g_Config.StoreRoot)) {
         LogError(L"cannot open database under %s -- aborting", g_Config.StoreRoot);
@@ -417,6 +430,7 @@ static int RunOnce(void)
     LogSetConsole(1);
     ConfigLoad(&g_Config);
     VolInit();
+    PortInit();
 
     if (!DbOpen(g_Config.StoreRoot)) {
         fwprintf(stderr, L"cannot open database: %s\n",
@@ -432,9 +446,14 @@ static int RunOnce(void)
        pending restore would be left hanging in 'pending' forever (RB-10). */
     MaintenancePass(1);
 
+    /* RB-13: leave a fresh counter snapshot behind as well, so a one-shot
+       maintenance run also refreshes what /stats reports. */
+    PortSampleStats();
+
     CloseHandle(g_StopEvent);
     g_StopEvent = NULL;
     DbClose();
+    PortFini();
     LogShutdown();
     return 0;
 }
@@ -459,6 +478,7 @@ static int RunConsole(void)
     LogSetConsole(1);
     ConfigLoad(&g_Config);
     VolInit();
+    PortInit();
 
     if (!DbOpen(g_Config.StoreRoot)) {
         fwprintf(stderr, L"cannot open database: %s\n",
@@ -495,6 +515,7 @@ static int RunConsole(void)
     g_StopEvent = NULL;
 
     DbClose();
+    PortFini();
     LogShutdown();
     return 0;
 }

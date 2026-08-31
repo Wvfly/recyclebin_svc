@@ -93,6 +93,14 @@
    errors and skipped rather than truncated. */
 #define RBSVC_MAX_RECON_PATH  1024
 
+/* RB-13: how often the driver counters are sampled into driver_stats.
+   These are cumulative counters, so a few seconds of lag costs nothing; the
+   high-water queue depth in the driver covers the in-between peaks. */
+#define RBSVC_STATS_INTERVAL     5
+/* RB-13: a snapshot older than this is treated as "driver offline" rather
+   than "idle", so a dead driver is never reported as healthy zeros. */
+#define RBSVC_STATS_STALE_SEC    30
+
 /* Restore-tree (see rbrestore.c): bounds a single request so one bad prefix
    cannot queue an unbounded amount of work behind the ops thread. */
 #define RBSVC_MAX_TREE_RESTORE 5000
@@ -294,6 +302,9 @@ int  PolicyDiskWatermark(DWORD minFreeMB);
    number of files reclaimed (>=0), or -1 if the sweep could not run. */
 int  ReconcileStaging(DWORD graceDays);
 
+/* RB-13: persist the latest driver counter snapshot into driver_stats. */
+int  DbWriteDriverStats(const RBF_STATS *stats, int driverResponded);
+
 /* ------------------------------------------------------------------ */
 /* Restore (executed here on behalf of Go REST)                        */
 /* ------------------------------------------------------------------ */
@@ -315,8 +326,18 @@ int  RestoreTreeByPrefix(const WCHAR *prefixDos, WCHAR *msgBuf, DWORD cchMsg);
 /* Kernel port reader                                                  */
 /* ------------------------------------------------------------------ */
 DWORD WINAPI PortThreadProc(LPVOID param);
+/* Initialise / tear down the port subsystem. PortInit() must run before any
+   other Port* call -- it is idempotent, and PortQueryStats() is safe in
+   console/once mode once it has run. */
+void PortInit(void);
+void PortFini(void);
+
 /* Query driver stats; returns 0 on success. */
 int  PortQueryStats(RBF_STATS *stats);
+
+/* Sample the driver counters into driver_stats so rbapi.exe can read them
+   (RB-13). Returns 1 if the driver answered, 0 if it did not. */
+int  PortSampleStats(void);
 
 /* ------------------------------------------------------------------ */
 /* Service lifecycle                                                   */

@@ -16,6 +16,7 @@
 ![Driver](https://img.shields.io/badge/driver-Mini--Filter%20(WDK)-orange)
 ![Architecture](https://img.shields.io/badge/architecture-single--writer%20SQLite-blueviolet)
 ![Tests](https://img.shields.io/badge/contract%20tests-19%2F19%20pass-brightgreen)
+![Observability](https://img.shields.io/badge/driver%20stats-live-brightgreen)
 ![Signing](https://img.shields.io/badge/driver%20signing-required-red)
 
 </div>
@@ -456,16 +457,30 @@ sc.exe control RecycleBinSvc 128
 
 | 字段 | 含义 |
 |---|---|
+| `ts` / `age_sec` | 采样时间 / 距今秒数 |
 | `intercepts` | 命中受保护前缀的删除次数 |
 | `rename_ok` | 成功重定向到暂存区 |
 | `rename_fail` | 重定向失败次数 |
 | `delete_denied` | **fail-closed 拒绝删除次数**（数据已保住，非丢失） |
 | `notify_sent` / `notify_dropped` / `notify_queue_full` | 通知投递情况 |
-| `queue_depth` / `max_queue_depth` | 队列当前深度 / 历史峰值 |
+| `queue_depth` / `max_queue_depth` | 队列当前深度 / **历史峰值** |
 
-> ⚠️ **已知问题**：驱动计数器尚未打通到 Go 侧（见 [RB-13](docs/buglist.md)），
-> `/stats` 当前恒返回 `503`，`/health` 的 `driver` 字段恒为 `null`。
-> 这不影响拦截与还原功能，但意味着**真删/拒删次数暂不可观测**。
+**数据源**：驱动统计每 5 秒由 `rbservice` 采样写入 `driver_stats` 表，
+API 从该表读取。
+
+> 通信端口 `MaxConnections = 1` 且已被 C 服务占用，
+> 所以 Go 侧**无法直连驱动**查询，必须经由数据库快照——这是架构约束，非缺陷。
+
+**返回 503 的两种情况**（均表示"不可信"而非"计数为 0"）：
+
+| 情况 | 含义 |
+|---|---|
+| 从未有过快照 | 驱动未加载，或服务刚启动 |
+| 快照超过 30 秒未更新 | **驱动离线**（卸载/崩溃/端口断开） |
+
+> 这些是**累计计数器**，"驱动没应答"与"真的 0 次删除"在数值上无法区分。
+> 因此陈旧快照返回 503 而非 0，避免运维看到 `delete_denied = 0`
+> 而误判系统健康。
 
 ### POST /ops
 
@@ -549,8 +564,11 @@ Get-WinEvent -LogName Application -Source RecycleBin* -MaxEvents 50
 | `notify_dropped` | 长期为 0 | 非 0 说明服务离线或通信异常，可能产生孤儿 |
 | 暂存区滞留量 | 30s 内清空 | 持续积压说明落地阻塞 |
 
-> 上表中驱动计数器当前不可观测（[RB-13](docs/buglist.md)），
-> 建议改用事件日志与暂存区滞留量作为替代监控手段。
+以上四项建议接入告警：`delete_denied` 与 `notify_dropped` 长期为 0 是健康态，
+一旦开始增长即说明暂存区或服务通信出现异常，需要立即排查。
+
+> `/stats` 返回 503 本身也是一条重要信号：它代表**驱动离线**，
+> 而非"计数为 0"。详见 [REST API](#get-stats) 章节。
 
 ### 时间与延迟
 
@@ -600,11 +618,13 @@ Get-WinEvent -LogName Application -Source RecycleBin* -MaxEvents 50
    保护多卷需分别部署或做驱动改造（"拷贝 + 删源"，复杂度与风险显著上升）。
 2. **跨卷还原不支持** — 还原同样依赖同卷 rename。
 3. **驱动需签名** — 生产环境应使用 EV 证书，测试模式仅限验证（2–6 周外部流程）。
-4. **驱动计数器暂不可观测** — `/stats` 恒 503（[RB-13](docs/buglist.md)）。
-5. **驱动参数不支持热加载** — `ProtectedPaths`、`FailClosed` 改动需重启驱动。
-6. **符号链接 / 硬链接 / 重解析点未特殊处理** — 按普通文件重定向。
-7. **本地删除也会被拦** — 判定依据为路径前缀（原 session ID 过滤会漏掉
+4. **驱动参数不支持热加载** — `ProtectedPaths`、`FailClosed` 改动需重启驱动
+   （用户态配置可热加载，见[配置参考](#配置热加载)）。
+5. **符号链接 / 硬链接 / 重解析点未特殊处理** — 按普通文件重定向。
+6. **本地删除也会被拦** — 判定依据为路径前缀（原 session ID 过滤会漏掉
    SMB2 在 session 0 执行的删除）。服务端本机操作受保护目录同样进回收站。
+7. **驱动计数器带 5 秒采样延迟** — 累计值准确，但瞬时 `queue_depth` 仅为
+   采样点的值；队列峰值请看 `max_queue_depth`。
 8. **`$I` 元数据为 v1 格式** — 与 Windows 回收站 UI 的兼容性待实测确认（[RB-17](docs/buglist.md)）。
 
 ---
@@ -725,7 +745,7 @@ db\schema.sql  ──gen_schema.ps1──▶  service_c\schema_sql.h  ──编�
 | RB-02 | **驱动签名** | 外部流程：EV 证书 + Dev Center 认证，2–6 周 |
 | RB-03 | Pre 回调重构 | 需测试机 + Driver Verifier 验证，风险高，暂缓 |
 | RB-12 | 驱动参数热加载 | 需重构驱动配置加载路径 |
-| RB-13 ~ RB-17 | 可观测性、测试、安全细节 | 待排期，详见 [docs/buglist.md](docs/buglist.md) |
+| RB-14 ~ RB-17 | 监控指标导出、测试补齐、Token 与审计、`$I` 格式 | 待排期，详见 [docs/buglist.md](docs/buglist.md) |
 
 > **建议**：RB-02 应尽早启动 —— 它是纯外部依赖，且 HLK 测试套件会反向暴露
 > 驱动实现缺陷。
