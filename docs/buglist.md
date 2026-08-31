@@ -3,7 +3,7 @@
 - 项目：Windows 文件共享回收站 (RecycleBin for SMB)
 - 范围：内核 Mini-Filter 驱动 (`rbminiflt`) + C 核心服务 (`rbservice`) + Go 管理 API (`rbapi`) + 数据模型 + 部署链路
 - 日期：2026-08-31
-- 条目：RB-01 ~ RB-22（含 5 项大目录树删除场景专项问题）
+- 条目：RB-01 ~ RB-23（含 5 项大目录树删除场景专项问题）
 - 评估结论：**核心 P0 阻塞已消除，仍不具备生产部署条件**
 
 > 与 `bugfix-report.md` 的关系
@@ -15,6 +15,7 @@
 > 修复进度：RB-01、RB-04 ~ RB-12 已修复，详见 `bugfix-production.md`。
 > RB-02 为外部流程（驱动签名），RB-03 暂缓（需测试机 + Driver Verifier）。
 > RB-18 ~ RB-22 为 2026-08-31 新增的大目录树删除场景问题（第五章）。
+> RB-23 为通信端口生命周期问题（client port use-after-free，蓝屏风险），见第六章。
 
 ---
 
@@ -44,9 +45,11 @@
 | RB-20 | P1 | 驱动 | 队列满时部分删除失败，目录删不干净（RB-08 副作用） | 待修 |
 | RB-21 | P1 | 驱动/服务 | staging 扁平结构，单目录文件数膨胀后操作变慢 | 待修（还原粒度已改善） |
 | RB-22 | **P1** | 驱动 | `FileDispositionInformationEx` 未拦截，可绕过整树真删 | **已修复** |
+| RB-23 | **P0** | 驱动 | client port 断开后队列残留节点持悬空端口，发送线程 use-after-free 可致蓝屏 | **已修复** |
 
 > RB-18 ~ RB-22 为**大目录树删除场景**专项问题（详见第五章）。
 > 该场景在单文件删除时不暴露，删除含大量子目录/文件的目录树时集中显现。
+> RB-23 为通信端口生命周期问题（详见第六章），服务重启/崩溃时高概率触发。
 
 ---
 
@@ -683,7 +686,43 @@ rename → 入队），整树删除不再能绕过。
 
 ---
 
-## 六、整改路线建议
+## 六、通信端口生命周期（RB-23）
+
+### RB-23 client port use-after-free（蓝屏风险）
+
+- **模块**：driver
+- **级别**：P0
+- **位置**：`driver/rbminiflt.c` `RbfPortDisconnect` / `RbfSendThread`；`driver/rbminiflt.h` `RBF_GLOBAL`
+- **状态**：**已修复**
+
+**问题**
+
+`RbfPortDisconnect()` 旧实现只将 `G.ClientPort` 置为 `NULL`。但队列中每个
+`RBF_NOTIFY_NODE` 在入队时快照了 `PFLT_PORT`（`node->Port`），发送线程后续用
+该指针调用 `FltSendMessage()`。当服务重启或崩溃、连接被内核拆除时，disconnect
+回调返回后内核随即释放 client port 对象，队列中的残留节点成为悬空指针——
+**use-after-free，可致蓝屏**。
+
+典型触发场景：`rbservice.exe` 重启/崩溃时通知队列尚有积压（大目录树删除、
+批量备份轮转等），旧端口已释放而发送线程仍在消费队列。
+
+**修复方案（已实施）**
+
+1. `RBF_GLOBAL` 新增 `Sending` 标志（仅在 `QueueLock` 下读写）：发送线程进入
+   `FltSendMessage` 前置位、返回后清除。
+2. `RbfPortDisconnect()` 在回调返回前完成三件事（回调期间内核持有端口引用，
+   在途发送安全）：
+   - 置 `G.ClientPort = NULL`，拒绝新通知入队；
+   - 轮询等待 `G.Sending == FALSE`（连接断开时 `FltSendMessage` 立即返回
+     `STATUS_PORT_DISCONNECTED`，等待时间很短）；
+   - 在**同一次锁获取**内摘除队列全部节点（与 `!G.Sending` 检查原子），
+     锁外释放，杜绝"检查后、摘除前"发送线程再取到旧节点的窗口。
+3. 丢弃的待发通知由 RB-05 孤儿对账兜底：服务重连后对账会为已 staging 的文件
+   补建数据库行，不产生不可恢复的数据丢失。
+
+---
+
+## 七、整改路线建议
 
 | 阶段 | 周期 | 任务 |
 |---|---|---|

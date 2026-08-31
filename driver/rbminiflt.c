@@ -903,6 +903,9 @@ VOID RbfSendThread(_In_ PVOID Context)
             G.QueueDepth--;
             G.Stats.QueueDepth = G.QueueDepth;
             port = node->Port;
+            /* Publish "inside FltSendMessage" before dropping the lock so
+               RbfPortDisconnect() can wait out this in-flight send (RB-23). */
+            G.Sending = TRUE;
             KeReleaseSpinLock(&G.QueueLock, irql);
 
             {
@@ -921,6 +924,12 @@ VOID RbfSendThread(_In_ PVOID Context)
             } else {
                 InterlockedIncrement64((volatile LONG64 *)&G.Stats.NotifyDropped);
             }
+            /* Send finished.  With the connection gone, FltSendMessage fails
+               fast with STATUS_PORT_DISCONNECTED, so the disconnect callback's
+               wait on G.Sending is short.  Clear the flag under the lock. */
+            KeAcquireSpinLock(&G.QueueLock, &irql);
+            G.Sending = FALSE;
+            KeReleaseSpinLock(&G.QueueLock, irql);
             RbfNotifyFree(node->Notification);
             ExFreePoolWithTag(node, RBF_TAG);
         }
@@ -1019,16 +1028,79 @@ NTSTATUS RbfPortConnect(
     return STATUS_SUCCESS;
 }
 
+/* RB-23: client port use-after-free.
+ *
+ * Old code only cleared G.ClientPort here.  Every RBF_NOTIFY_NODE still in
+ * the queue held a PFLT_PORT snapshot from enqueue time, and the send thread
+ * later called FltSendMessage() with that now-dead pointer after the kernel
+ * released the port -- a use-after-free that can BSOD the box, typically
+ * when the service restarts (or crashes and the connection is torn down)
+ * while notifications are backed up in the queue.
+ *
+ * The kernel keeps the client port referenced for the whole duration of this
+ * disconnect callback, so a FltSendMessage already in flight is safe.  The
+ * danger is what happens after we return.  We therefore, before returning:
+ *
+ *   1. reject new enqueues (G.ClientPort = NULL, under QueueLock);
+ *   2. wait until the send thread is not inside FltSendMessage;
+ *   3. drain every queued node under the same lock acquisition as the
+ *      !G.Sending check, so the send thread cannot pick up another node
+ *      between our check and our drain;
+ *   4. free the drained notifications outside the lock.
+ *
+ * With the connection gone, FltSendMessage fails immediately with
+ * STATUS_PORT_DISCONNECTED, so step 2 is a short wait in practice.
+ * Undelivered notifications are not lost: the orphan reconciliation pass
+ * (RB-05) re-creates their database rows after the service reconnects. */
 VOID RbfPortDisconnect(_In_opt_ PVOID ConnectionCookie)
 {
+    PRBF_NOTIFY_NODE node;
+    LIST_ENTRY dead;
+    KIRQL irql;
+    LARGE_INTEGER delay;
+    ULONG dropped = 0;
+
     UNREFERENCED_PARAMETER(ConnectionCookie);
-    {
-        KIRQL irql;
+    InitializeListHead(&dead);
+
+    delay.QuadPart = -100 * 10 * 1000; /* 100 us poll interval */
+
+    for (;;) {
         KeAcquireSpinLock(&G.QueueLock, &irql);
+
+        if (G.Sending) {
+            /* Send thread is mid-FltSendMessage: let it finish, then re-check.
+               The spinlock is dropped while polling so the send thread can
+               acquire it to clear G.Sending. */
+            KeReleaseSpinLock(&G.QueueLock, irql);
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+            continue;
+        }
+
+        /* Send thread is idle: reject new enqueues and drain the whole queue
+           under the same lock acquisition (see comment above). */
         G.ClientPort = NULL;
+        while (!IsListEmpty(&G.NotifyQueue)) {
+            node = CONTAINING_RECORD(RemoveHeadList(&G.NotifyQueue),
+                                     RBF_NOTIFY_NODE, Entry);
+            G.QueueDepth--;
+            G.Stats.QueueDepth = G.QueueDepth;
+            InsertTailList(&dead, &node->Entry);
+            dropped++;
+        }
         KeReleaseSpinLock(&G.QueueLock, irql);
+        break;
     }
-    DbgPrint("[RBF] User-mode service disconnected\n");
+
+    while (!IsListEmpty(&dead)) {
+        node = CONTAINING_RECORD(RemoveHeadList(&dead),
+                                 RBF_NOTIFY_NODE, Entry);
+        RbfNotifyFree(node->Notification);
+        ExFreePoolWithTag(node, RBF_TAG);
+    }
+
+    DbgPrint("[RBF] User-mode service disconnected; dropped %lu queued "
+             "notification(s)\n", dropped);
 }
 
 /* Handle user-mode -> driver commands (RBF_CMD_QUERY_STATS). */

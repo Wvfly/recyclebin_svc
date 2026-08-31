@@ -154,6 +154,12 @@ typedef struct _RBF_GLOBAL {
     /* Async send thread (single consumer, serialized by design) */
     KEVENT          NotifyEvent;
     HANDLE          SendThreadHandle;
+    /* TRUE while the send thread is inside FltSendMessage on a node it has
+       already dequeued.  RbfPortDisconnect() waits on this before draining
+       the queue, so a disconnected client port can never be touched again
+       after the disconnect callback returns (RB-23).  Updated only under
+       QueueLock. */
+    BOOLEAN         Sending;
 
     /* Statistics (visible to user-mode via RBF_CMD_QUERY_STATS) */
     RBF_STATS       Stats;

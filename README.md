@@ -609,6 +609,7 @@ Get-WinEvent -LogName Application -Source RecycleBin* -MaxEvents 50
 | 还原返回"目标不在受保护共享内" | 目标路径校验拦截 | 还原目标必须落在受保护共享内，或还原到原路径 |
 | 磁盘很快被撑满 | 配额/水位阈值太大 | 调小阈值后 `sc control RecycleBinSvc 128` |
 | REST 401 | token 不匹配 | 确认注册表 `RestApiToken`；改完热加载 |
+| 服务重启/崩溃后偶发蓝屏 | 旧版驱动 client port use-after-free（[RB-23](docs/buglist.md)） | 重新构建并部署当前驱动（已修复：断连时同步排空队列） |
 
 ---
 
