@@ -130,5 +130,11 @@ CREATE TABLE IF NOT EXISTS driver_stats (
 
     -- Instantaneous / high-water
     queue_depth       INTEGER NOT NULL DEFAULT 0,
-    max_queue_depth   INTEGER NOT NULL DEFAULT 0
+    max_queue_depth   INTEGER NOT NULL DEFAULT 0,
+
+    -- RB-29: protected prefixes loaded by the driver. 0 means the filter
+    -- forwards every delete and the share is NOT protected, even though the
+    -- driver is loaded and attached. Reported alongside the counters so a
+    -- misconfigured driver is visible instead of looking idle-but-healthy.
+    protected_count   INTEGER NOT NULL DEFAULT 0
 );

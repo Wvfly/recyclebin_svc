@@ -13,6 +13,7 @@
 #include "rbsvc.h"
 #include "sqlite3.h"
 #include <stdarg.h>
+#include <string.h>
 
 static sqlite3 *g_Db = NULL;
 static CRITICAL_SECTION g_DbLock;
@@ -75,6 +76,56 @@ static int DbWriteVersion(int ver)
 }
 
 /*
+ * Column-level migration helpers (RB-29).
+ *
+ * The embedded schema is all CREATE ... IF NOT EXISTS, which heals a missing
+ * TABLE but never a missing COLUMN. So a database created before a column was
+ * introduced keeps its old shape, and the first statement naming the new
+ * column fails to prepare -- for driver_stats that means every stats sample
+ * errors out and the counters silently stop advancing, which is exactly the
+ * "driver looks offline" symptom we cannot afford to manufacture.
+ *
+ * These are idempotent: they check PRAGMA table_info first, so re-running
+ * them on an up-to-date database is a no-op.
+ */
+static int DbColumnExists(const char *table, const char *column)
+{
+    sqlite3_stmt *st = NULL;
+    char sql[256];
+    int found = 0;
+
+    sprintf_s(sql, sizeof(sql), "PRAGMA table_info(%s)", table);
+    if (sqlite3_prepare_v2(g_Db, sql, -1, &st, NULL) == SQLITE_OK) {
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char *name = sqlite3_column_text(st, 1);
+            if (name && strcmp((const char *)name, column) == 0) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    if (st) sqlite3_finalize(st);
+    return found;
+}
+
+static int DbEnsureColumn(const char *table, const char *column,
+                          const char *decl)
+{
+    char sql[512];
+
+    if (DbColumnExists(table, column)) return 1;
+
+    sprintf_s(sql, sizeof(sql), "ALTER TABLE %s ADD COLUMN %s %s",
+              table, column, decl);
+    if (DbExec(sql) != SQLITE_OK) {
+        LogError(L"schema migration failed: cannot add %S.%S", table, column);
+        return 0;
+    }
+    LogInfo(L"schema migration: added %S.%S", table, column);
+    return 1;
+}
+
+/*
  * Verifies the on-disk schema against RB_SCHEMA_VERSION.
  *
  * Rules:
@@ -100,6 +151,13 @@ static int DbEnsureSchema(void)
 
     if (DbExec(kSchema) != SQLITE_OK) {
         LogError(L"failed to apply embedded schema");
+        return 0;
+    }
+
+    /* RB-29: heal columns that predate this build. Databases stamped with
+       this RB_SCHEMA_VERSION but created earlier never saw the column. */
+    if (!DbEnsureColumn("driver_stats", "protected_count",
+                        "INTEGER NOT NULL DEFAULT 0")) {
         return 0;
     }
 
@@ -310,8 +368,8 @@ int DbWriteDriverStats(const RBF_STATS *stats, int driverResponded)
         "INSERT INTO driver_stats"
         " (id, ts, intercepts, rename_ok, rename_fail, delete_denied,"
         "  notify_sent, notify_dropped, notify_queue_full,"
-        "  queue_depth, max_queue_depth)"
-        " VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "  queue_depth, max_queue_depth, protected_count)"
+        " VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(id) DO UPDATE SET"
         "  ts = excluded.ts,"
         "  intercepts = excluded.intercepts,"
@@ -322,7 +380,8 @@ int DbWriteDriverStats(const RBF_STATS *stats, int driverResponded)
         "  notify_dropped = excluded.notify_dropped,"
         "  notify_queue_full = excluded.notify_queue_full,"
         "  queue_depth = excluded.queue_depth,"
-        "  max_queue_depth = excluded.max_queue_depth";
+        "  max_queue_depth = excluded.max_queue_depth,"
+        "  protected_count = excluded.protected_count";
     sqlite3_stmt *st = NULL;
     int rc;
 
@@ -347,6 +406,7 @@ int DbWriteDriverStats(const RBF_STATS *stats, int driverResponded)
     sqlite3_bind_int64(st, 8, (sqlite3_int64)stats->NotifyQueueFull);
     sqlite3_bind_int(st,  9, (int)stats->QueueDepth);
     sqlite3_bind_int(st, 10, (int)stats->MaxQueueDepth);
+    sqlite3_bind_int(st, 11, (int)stats->ProtectedCount);
 
     if (sqlite3_step(st) != SQLITE_DONE) {
         DbLogError("step driver_stats");

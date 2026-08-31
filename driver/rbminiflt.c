@@ -143,6 +143,10 @@ NTSTATUS RbfLoadConfig(VOID)
     }
     G.ProtectedCount = i;
 
+    /* RB-29: mirror into the published stats so the service can report
+     * "this driver protects nothing" instead of a healthy-looking zero. */
+    G.Stats.ProtectedCount = G.ProtectedCount;
+
     ExFreePoolWithTag(kvpi, RBF_TAG);
     ZwClose(hKey);
     DbgPrint("[RBF] Loaded %lu protected paths\n", G.ProtectedCount);

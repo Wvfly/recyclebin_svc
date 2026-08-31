@@ -403,3 +403,6 @@ analyze_new*.cmd
 check_lock.ps1
 run_analyze.ps1
 service_c/build_err.txt
+
+# One-shot service/driver state dump (sc query output), not source
+svc_state.txt

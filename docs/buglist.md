@@ -3,7 +3,7 @@
 - 项目：Windows 文件共享回收站 (RecycleBin for SMB)
 - 范围：内核 Mini-Filter 驱动 (`rbminiflt`) + C 核心服务 (`rbservice`) + Go 管理 API (`rbapi`) + 数据模型 + 部署链路
 - 日期：2026-08-31
-- 条目：RB-01 ~ RB-28（含 5 项大目录树删除场景专项问题）
+- 条目：RB-01 ~ RB-30（含 5 项大目录树删除场景专项问题）
 - 评估结论：**核心 P0 阻塞已消除，仍不具备生产部署条件**
 
 > 与 `bugfix-report.md` 的关系
@@ -18,6 +18,12 @@
 > RB-23 为通信端口生命周期问题（client port use-after-free，蓝屏风险），见第六章。
 > RB-24 ~ RB-26 为 2026-08-31 蓝屏风险复审新增（RB-24 为 RB-23 的残余竞态补强）。
 > RB-27 ~ RB-28 为 2026-08-31 **实测蓝屏**（0x3B / 0xA）dump 分析新增，详见第六章。
+> RB-29 为 2026-08-31 **实测部署验证**新增：驱动加载后对已挂载卷的过滤生效存在窗口，
+> 期间删除完全无保护（用户文件实测被永久删除）。同日对 RB-17 取证后**判定为误判并撤回**
+> （`$I` 实为 Explorer 原生 v2 格式，桌面回收站实测可见）。RB-29 已于同日修复并实测验证。
+> RB-30 为 2026-08-31 **实测还原验证**新增：restore 用 `MoveFileExW` 从 `$Recycle.Bin` 移回时
+> **保留回收站的 `Hidden+System` 属性**，还原后的目录/文件在 Explorer 与 SMB 客户端不可见
+> （用户误以为还原失败）。同日已修复并实测验证（还原后清除属性位）。详见第六章。
 
 ---
 
@@ -41,7 +47,7 @@
 | RB-14 | P2 | 全局 | 无监控指标导出、事件日志无 manifest、无告警规则 | 待修 |
 | RB-15 | P2 | 工程 | 测试覆盖为零（无单元测试、压力测试、故障注入测试） | 待修 |
 | RB-16 | P2 | Go API | Token 非恒定时间比较、注册表明文存储、无限流、无操作审计 | 待修 |
-| RB-17 | P2 | 服务 | `$I` 元数据用 v1 格式，可能与 Win10+ 回收站 UI 不兼容 | 待确认 |
+| RB-17 | P2 | 服务 | `$I` 元数据格式兼容性 | **误判（已撤回）** |
 | RB-18 | **P1** | 服务 | 深层目录还原失败：`CreateDirectoryW` 只建一级父目录 | **已修复** |
 | RB-19 | P1 | 驱动 | 删除大目录树极慢：每文件重复调用 `RbfEnsureStoreDir` | **已修复** |
 | RB-20 | P1 | 驱动 | 队列满时部分删除失败，目录删不干净（RB-08 副作用） | 待修 |
@@ -53,6 +59,8 @@
 | RB-26 | **P2** | 驱动 | `RbfLoadConfig` 解析 `REG_MULTI_SZ` 未按 `DataLength` 限界，畸形注册表值可越界读 | **已修复** |
 | RB-27 | **P0** | 驱动 | `RbfPortMessage` 回调 7 参数签名 vs FltMgr 实际 6 参数 → 参数错位，把 `InputBufferLength`(=4) 当指针解引用 → **蓝屏 0x3B** | **已修复** |
 | RB-28 | **P0** | 驱动 | 卸载路径把 `PsCreateSystemThread` 返回的**句柄**当内核对象指针传给 `KeWaitForSingleObject` → 解引用无效地址 → **蓝屏 0xA** | **已修复** |
+| RB-29 | **P1** | 驱动/部署 | 驱动加载后对已挂载卷的 attach/过滤生效存在窗口（17:31 加载、17:41 才 attach E:），期间删除无保护、文件被永久删除 | **已修复** |
+| RB-30 | **P1** | 服务 | 还原后目录/文件保留回收站 `Hidden+System` 属性，Explorer/SMB 客户端不可见（实测） | **已修复** |
 
 > RB-18 ~ RB-22 为**大目录树删除场景**专项问题（详见第五章）。
 > 该场景在单文件删除时不暴露，删除含大量子目录/文件的目录树时集中显现。
@@ -424,22 +432,30 @@ rbservice (ops 线程, 每 5s)               rbapi (只读)
 
 ---
 
-### RB-17 `$I` 元数据格式版本兼容性（待确认）
+### RB-17 `$I` 元数据格式兼容性（误判，已撤回）
 
 - **模块**：service_c
-- **位置**：`service_c/rbstore.c`（`$I` 文件写入）
+- **位置**：`service_c/rbstore.c`（`WriteIFile`，`$I` 文件写入）
+- **状态**：**误判（2026-08-31 取证后撤回）**
 
-**问题**
+**撤回经过**
 
-当前写入 v1 格式（WinXP 时代的 20 字节头）。Win10+ 回收站使用 v2 格式（支持长路径与更大时间戳）。
+初判基于一次容错解析脚本（自研解析器用错偏移）得出"服务端 `$I` 是 v1 自定义格式、
+Explorer 无法解析"的结论。2026-08-31 实测取证推翻该结论：
 
-**影响**
+1. **字节级取证**：让 Explorer 通过 VisualBasic 回收站 API 生成原生 `$I` 条目
+   （`$ILBZ7HH`），与服务端 land 生成的 `$IB13UIN.txt` 逐字节比对——布局完全一致：
+   `0x00 FILETIME + 0x08 文件大小 + 0x10 原始大小 + 0x18 文件名长度 + 0x1C UTF-16LE 完整路径`，
+   即 **Explorer 原生 v2 格式**，且原生条目同样存完整路径、同样带扩展名
+2. **UI 实测**：`rbfmt_probe.txt` 的 `$I`/`$R` 落在 `E:\$RECYCLE.BIN` 后，
+   桌面回收站（Explorer COM 枚举）**正常显示**（221 条目之一，中文名渲染正常）
+3. 用户"看不到"被删文件的**真正原因**是 RB-29（文件被永久删除，从未产生 `$I`/`$R`），
+   而非 `$I` 格式问题
 
-可能导致 Windows 回收站 UI 或第三方工具解析异常。
+**结论**
 
-**建议**
-
-在真实 Win10/Win11 环境验证 `$I` 文件可被系统正确解析；若存在兼容问题，升级到 v2 格式并在 schema 中记录格式版本。
+- `$I` 格式与命名均与 Explorer 原生一致，回收站显示正常，**无需修改**
+- 该缺陷描述从 buglist 撤回；相关"桌面回收站不可见"现象由 RB-29 解释并已随 RB-29 修复
 
 ---
 
@@ -899,6 +915,165 @@ static NTSTATUS RbfStopSendThread(VOID)
 APC_LEVEL + `KernelMode` 下合法（FltMgr 在持有 `FilterManagerMutex` 时于
 APC_LEVEL 调用卸载回调；`KernelMode` 等待允许触碰非页面池）。
 
+### RB-29 驱动加载后卷 attach/过滤生效存在窗口，期间删除无保护（实测用户数据丢失）
+
+- **模块**：driver + 部署
+- **级别**：P1
+- **位置**：`driver/rbminiflt.c` / `rbminiflt.h`（`ProtectedCount` 暴露）；
+  `service_c/rbf_protocol.h`（协议字段 + 编译期断言）；`service_c/rbdb.c`（schema 迁移）；
+  `service_go/db/db.go`（stats 暴露）；`deploy.ps1`（[7/6] 冒烟验证）
+- **状态**：**已修复（2026-08-31 部署实测验证通过）**
+- **来源**：2026-08-31 实测部署验证（USN Journal + `fltmc` + 驱动计数器交叉取证）
+
+**问题**
+
+驱动加载（`sc start` 返回 RUNNING）**并不等于**对已挂载卷的删除过滤已生效。
+2026-08-31 实测时间线：
+
+| 时间 | 事件 | 来源 |
+|---|---|---|
+| 17:31:53 | 部署完成，驱动 RUNNING | deploy 日志 |
+| 17:36:14~17:36:32 | 用户创建「测试驱动.txt」→ 改名 → 写入 96B → 右键删除 | USN Journal |
+| 17:36:32 | 删除为 `文件删除 \| 关闭`（DELETE_CLOSE），**无任何 rename 到暂存区的记录** → 未拦截 | USN Journal |
+| 17:41:31 | `fltmc` 才确认 `rbminiflt` attach 到 C/D/E 卷（高度 370030） | fltmc_check.log |
+| 17:42 / 17:47 | 本地 / UNC 测试删除均成功拦截（`intercepts=2`） | 驱动计数器 |
+
+用户删除发生在 **17:36~17:41 的无保护窗口**：驱动虽已 RUNNING，但对 E: 卷的
+过滤尚未生效，删除直落磁盘 → **文件永久删除**（USN 记录 `DELETE_CLOSE`，
+无 `$R`/`$I` 回收站条目、无 DB 记录、无暂存副本）。
+
+**影响**
+
+- 驱动部署/重启后的 **5~10 分钟内删除完全无保护**，用户数据可被永久删除
+- 无任何日志/计数/告警提示"过滤未生效"——`intercepts=0` 与"真的没删除"无法区分，
+  运维误判系统健康（与 RB-13 的陈旧判定同一类可观测性陷阱）
+- 用户从 **UNC/映射盘**（`\\localhost\share`）右键删除时，Windows **本来就是永久删除**
+  （网络位置删除不进回收站），更放大了无保护窗口的危害
+
+**修复内容（2026-08-31 实施）**
+
+1. **可观测性兜底（防"无保护而不自知"）**：驱动 `RBF_STATS` 新增 `ProtectedCount`
+   （实际从注册表加载的受保护路径数，0 = 驱动对一切删除放行）。跨层打通：
+   `rbminiflt.c` 装载配置后镜像到 `G.Stats` → `rbf_protocol.h` 同步字段并加
+   编译期断言（`sizeof(RBF_STATS)==68`，驱动/服务双侧 C_ASSERT，漂移即编译失败）→
+   `rbdb.c` 落库（含幂等列迁移 `DbEnsureColumn`，防旧库 INSERT 失败）→
+   `db.go` 查询/JSON 暴露 → `/health` 的 `driver.protected_count` 字段
+2. **部署时实测拦截生效（消除"RUNNING ≠ 生效"盲区）**：`deploy.ps1` 新增 **[7/6]** 冒烟验证——
+   向受保护共享投放探针文件并删除，要求驱动将其**暂存**到 RBStore：
+   - 探针在 RBStore → 拦截链路 LIVE（绿色 [OK]）
+   - 探针留在原处 → fail-closed（数据安全但功能异常，红色告警）
+   - 探针消失且未暂存 → **真删，共享未受保护**（红色告警 + 提示文件永久丢失风险）
+3. **启动类型恢复**：`rbminiflt` 恢复 `start= system`（deploy.ps1 预期配置，开机自动加载）
+
+**部署实测验证（2026-08-31 18:29~18:31，签名驱动 25,848 B）**
+
+| 验证项 | 结果 |
+|---|---|
+| 驱动启动（[4/6]，此前 nosign 577 失败） | ✅ RUNNING（签名驱动通过内核加载器校验） |
+| [7/6] 冒烟拦截 | ✅ 探针被暂存 `E:\RBStore\...\1_rb_deploy_probe_182932.txt`（14 B） |
+| `fltmc` attach | ✅ 4 实例（C:/D:/E:/无卷名），高度 370030，E: 已过滤 |
+| `/health` `protected_count` | ✅ = 1（与配置的 `\Device\HarddiskVolume4\tmp\share` 一致） |
+| 驱动计数器 | ✅ `intercepts=1, rename_ok=1, notify_sent=1`（冒烟探针） |
+| 服务状态 | ✅ RecycleBinSvc / RecycleBinApi RUNNING（AUTO_START） |
+
+**遗留说明**
+
+- 部署时无保护窗口已实测消除（[4/6] 启动 → [7/6] 立即拦截成功）；
+  重启后自动加载路径（`start= system`）与 attach 行为同本次验证路径一致，待下次重启复核
+- 未做 `FltEnumerateVolumes` 主动 attach 代码改动——实测显示加载时 FltMgr 已为全部
+  已挂载卷建立实例；若未来出现 attach 延迟，应以部署冒烟验证为准拦截上线
+
+**建议（保留给运维/文档）**
+
+1. 文档/UI 明确提示：从网络路径删除不会进 Windows 回收站，本系统是唯一兜底；
+   部署后若 [7/6] 冒烟未通过，禁止开放删除权限
+2. 每次部署/重启后查看 `/health` 的 `driver.protected_count`：非 0 且 `intercepts` 持续增长
+   才代表保护在运转
+
+### RB-30 还原后保留回收站的 `Hidden+System` 属性，还原项在 Explorer/SMB 不可见（实测）
+
+- **模块**：service_c
+- **级别**：P1
+- **位置**：`service_c/rbrestore.c` `RestoreItemById`（`MoveFileExW` 移回后无属性清理）；
+  树还原 `RestoreTreeByPrefix` 复用同一路径
+- **状态**：**已修复（2026-08-31 部署实测验证通过）**
+- **来源**：2026-08-31 实测还原验证（SMB 删除大目录 → API 还原 → 客户端不可见）
+
+**问题**
+
+还原逻辑用 `MoveFileExW` 把条目从 `$Recycle.Bin` 移回原路径（`rbrestore.c` 第 251 行）：
+```c
+if (!MoveFileExW(srcDos, dstDos,
+                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { ... }
+```
+但 `$Recycle.Bin` 中的 `$R` 容器/文件带 `FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM`
+（回收站标准属性），**移动只搬数据、属性随文件保留**。移回后还原项仍带
+`Hidden+System`，而 Explorer 默认**不显示带 `System` 属性的项**（即使勾选"显示隐藏文件"），
+SMB 客户端枚举同样过滤 → **还原成功但用户完全看不到**。
+
+**实测证据（2026-08-31 18:33~18:40）**
+
+1. SMB 删除 `E:\tmp\share\财务wind文档资料1`（目录树，311 子目录 / 12 文件 / 19.5 MB）
+   → 驱动拦截 → land 到 `E:\$Recycle.Bin\S-1-5-21-...-1001\$R4REVELKRI`
+2. `POST /ops {"type":"restore","id":5}` → op 状态 `done/ok`，DB 更新 `restored=1`
+3. 还原后 `attrib`：`E:\tmp\share\财务wind文档资料1` = **`Hidden, System, Directory`**
+4. 对照：同卷可见目录 `test_dir` = `Directory`（无隐藏属性）；两者 ACL 完全一致
+   （`Everyone` 完全控制），共享无 ABE 枚举过滤——**唯一差异就是属性位**
+5. 用 PowerShell 清除 `Hidden+System` 后，UNC `\\<主机名>\share` 立即可见该目录
+   （12 文件 / 19,493,088 B，与删除前逐字节一致）
+
+**影响**
+
+- 还原结果对用户"隐形"：数据已安全还原，但用户以为还原失败 → 重复发起还原、
+  重新删除、或放弃恢复，破坏核心承诺（"删除进回收站、可还原可见"）
+- 目录树还原（`RestoreTreeByPrefix`）逐条目走同一 `RestoreItemById`，**所有还原的目录
+  都会隐形**，影响面是还原功能的 100%
+
+**修复建议**
+
+1. `RestoreItemById` 在 `MoveFileExW` 成功后，对还原目标显式清除
+   `FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM` 两个属性位
+   （`SetFileAttributesW` 或 `CreateFileW` + `SetFileInformationByHandle(FileBasicInfo)`），
+   仅清这两位，保留其他属性（如只读）
+2. 树还原由 1 自动覆盖（逐条目走 `RestoreItemById`）
+3. 属性清除失败仅告警、不判还原失败（数据已归位，属性可后续修）
+4. 回归验证：还原后 Explorer / SMB 客户端立即可见；`$I` 元数据删除路径（现有逻辑）不受影响
+
+**修复内容（2026-08-31 实施）**
+
+`RestoreItemById` 在 `MoveFileExW` 成功、`$I` 元数据删除之后，对还原目标执行
+**读-改-写属性清除**（仅清 `HIDDEN | SYSTEM` 两位，保留只读等其他属性）：
+```c
+DWORD attrs = GetFileAttributesW(dstDos);
+if (attrs != INVALID_FILE_ATTRIBUTES &&
+    (attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))) {
+    if (!SetFileAttributesW(
+            dstDos, attrs & ~(FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))) {
+        LogWarn(L"[restore] cannot clear hidden/system attrs on %s (win32=%lu)",
+                dstDos, GetLastError());
+    }
+}
+```
+- 树还原（`RestoreTreeByPrefix`）逐条目走同一路径，自动覆盖
+- 属性清除失败仅 `LogWarn` 告警，不判还原失败（数据已归位）
+
+**部署实测验证（2026-08-31 18:54~18:57，rbservice.exe 1,267,200 B）**
+
+| 验证项 | 结果 |
+|---|---|
+| 复现（修复前行为） | ✅ land 后 `$R4REVFF2IR` = `Hidden, System, Directory` |
+| 还原后属性 | ✅ `Directory`（无 hidden/system 位） |
+| SMB 可见性 | ✅ UNC `\\<主机名>\share` 立即可见 RB30T |
+| 内容完整性 | ✅ `a.txt` = `hello A`、`sub\b.txt` = `hello B`（9 B × 2，与删除前一致） |
+| DB 状态 | ✅ op `done`，条目转 `restored` |
+| 服务健康 | ✅ RecycleBinSvc / RecycleBinApi RUNNING，驱动 protected=1 |
+
+**遗留说明**
+
+- 实测中发现 restore 逐条提交时若先还原子文件再还原父目录（id 升序），父目录条目
+  restore 会因目标已由 `EnsureDirectoryChain` 重建而返回 failed——最终树仍完整
+  （子文件已归位），不造成数据损失；树还原接口按整棵前缀还原不受影响
+
 ---
 
 ## 七、整改路线建议
@@ -912,6 +1087,8 @@ APC_LEVEL 调用卸载回调；`KernelMode` 等待允许触碰非页面池）。
 | **新增 目录树场景** | **1–2 周** | ~~RB-18 递归建父目录~~、~~RB-19 目录缓存~~、~~RB-22 拦截 DispositionEx~~ **已完成**；RB-20 / RB-21 仍待排期 |
 | **可观测性** | 已完成 | ~~RB-13 驱动计数器打通~~ **已完成**（含 `PortLock` 生命周期缺陷修复） |
 | **蓝屏实测** | 已完成 | ~~RB-27 消息回调参数错位~~、~~RB-28 卸载句柄当指针~~ **已修复**（已编译 + 反汇编核对，待部署到目标机实测） |
+| **部署验证** | 已完成 | ~~RB-29 attach 就绪窗口~~ **已修复**（ProtectedCount 暴露 + [7/6] 冒烟验证 + 签名驱动部署实测通过）；~~RB-17~~ **误判撤回**（`$I` 实为 Explorer 原生格式，回收站实测可见） |
+| **还原可见性** | 已完成 | ~~RB-30 还原后清除 `Hidden/System` 属性~~ **已修复**（`RestoreItemById` 读-改-写清属性位，部署实测：还原后 `Directory`、UNC 可见、内容完整） |
 
 > 建议：在 RB-01、RB-02、RB-04 完成前，**不要开展任何生产试点**。
 >

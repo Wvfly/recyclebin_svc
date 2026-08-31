@@ -90,6 +90,7 @@ typedef struct _RBF_STATS {
     ULONG64 DeleteDenied;     /* fail-closed: delete refused, data preserved */
     ULONG   QueueDepth;       /* current queue depth */
     ULONG   MaxQueueDepth;    /* high-water mark */
+    ULONG   ProtectedCount;   /* RB-29: 0 = driver protects nothing */
 } RBF_STATS, *PRBF_STATS;
 
 #pragma pack(pop)
@@ -125,9 +126,9 @@ typedef char rbf_assert_notification_isdirectory_offset[
 typedef char rbf_assert_max_size_stays_small[
     (RBF_NOTIFY_MAX_SIZE <= 8192) ? 1 : -1];
 
-/* RBF_STATS: 7 * ULONG64 + 2 * ULONG, packed => exactly 64 bytes */
+/* RBF_STATS: 7 * ULONG64 + 3 * ULONG, packed => exactly 68 bytes */
 typedef char rbf_assert_stats_size[
-    (sizeof(RBF_STATS) == 64) ? 1 : -1];
+    (sizeof(RBF_STATS) == 68) ? 1 : -1];
 
 /* RBF_REPLY is a single ULONG */
 typedef char rbf_assert_reply_size[
@@ -140,5 +141,11 @@ typedef char rbf_assert_stats_queuedepth_offset[
     (offsetof(RBF_STATS, QueueDepth) == 56) ? 1 : -1];
 typedef char rbf_assert_stats_deleteddenied_offset[
     (offsetof(RBF_STATS, DeleteDenied) == 48) ? 1 : -1];
+
+/* RB-29: ProtectedCount must sit right after MaxQueueDepth (offset 64).
+   A silent shift here would make the service read the wrong bytes and
+   report a bogus protected-path count. */
+typedef char rbf_assert_stats_protectedcount_offset[
+    (offsetof(RBF_STATS, ProtectedCount) == 64) ? 1 : -1];
 
 #endif /* _RBF_PROTOCOL_H_ */

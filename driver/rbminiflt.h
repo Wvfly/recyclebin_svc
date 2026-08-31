@@ -110,8 +110,25 @@ typedef struct _RBF_STATS {
     ULONG64 DeleteDenied;     /* fail-closed: delete refused, data preserved */
     ULONG   QueueDepth;       /* current queue depth */
     ULONG   MaxQueueDepth;    /* high-water mark */
+    /* RB-29: number of protected prefixes actually loaded from the registry.
+     * 0 means the filter forwards EVERY delete untouched -- the share looks
+     * protected but is not. Published on purpose: without it, "no protected
+     * path configured" and "protected but nobody deleted anything yet" are
+     * indistinguishable from the counters alone (both read all zeros). */
+    ULONG   ProtectedCount;
 } RBF_STATS, *PRBF_STATS;
 #pragma pack(pop)
+
+/* Wire-format guard.
+ *
+ * The statistics query copies sizeof(RBF_STATS) bytes to user mode, and
+ * service_c\rbf_protocol.h mirrors this struct with the SAME assert (68).
+ * If the two ever drift, the service rejects the reply as a short read
+ * (rc = -2) rather than parsing shifted fields -- but the build should fail
+ * first, here and in the user-mode header, before anything ships.
+ *
+ * Layout: 7 * ULONG64 + 3 * ULONG, packed(1) = 56 + 12 = 68 bytes. */
+C_ASSERT(sizeof(RBF_STATS) == 68);
 
 /* Async notification queue node (fire-and-forget).
  *

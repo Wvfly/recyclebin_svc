@@ -271,6 +271,22 @@ int RestoreItemById(LONG64 itemId, const WCHAR *argOverride,
         }
     }
 
+    /* RB-30: the $R container inside $Recycle.Bin carries HIDDEN|SYSTEM
+       (recycle-bin standard bits); MoveFileExW preserves them, so a restored
+       item is invisible to Explorer/SMB. Clear exactly those two bits.
+       Clearing failure is a warning only - data is already back in place. */
+    {
+        DWORD attrs = GetFileAttributesW(dstDos);
+        if (attrs != INVALID_FILE_ATTRIBUTES &&
+            (attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))) {
+            if (!SetFileAttributesW(
+                    dstDos, attrs & ~(FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))) {
+                LogWarn(L"[restore] cannot clear hidden/system attrs on %s (win32=%lu)",
+                        dstDos, GetLastError());
+            }
+        }
+    }
+
     DbSetStatus(itemId, "restored");
     if (msgBuf) swprintf_s(msgBuf, cchMsg, L"ok");
     LogInfo(L"[restore] id=%lld -> %s", itemId, dstDos);

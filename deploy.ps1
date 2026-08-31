@@ -336,7 +336,86 @@ if (-not $apiBin) {
     Write-Host "  REST API 已启动: http://127.0.0.1:$port"
 }
 
+# =====================================================================
+# [7/6] RB-29: prove the interception path is actually LIVE.
+#
+# "Driver RUNNING" is NOT proof that deletes are being intercepted.
+# On 2026-08-31 a deploy finished at 17:31:53 while the filter was not
+# yet filtering the data volume; a real user delete at 17:36:32 went
+# straight to DELETE_CLOSE (USN) and the file was lost forever -- with
+# no log, no counter and no error anywhere.
+#
+# So we now prove it end to end: drop a file into a protected path,
+# delete it, and require the driver to have STAGED it. Three outcomes:
+#   staged            -> protection confirmed
+#   probe still there -> delete was refused (fail-closed; data safe,
+#                        but the feature is not working)
+#   probe gone, not staged -> REAL DELETE. The share is unprotected.
+# =====================================================================
+Write-Host "[7/6] 拦截链路冒烟验证 (RB-29)"
+$smokeOk  = $false
+$smokeMsg = "skipped"
+$probePath = $null
+try {
+    if (-not $ProtectedDos -or $ProtectedDos.Count -eq 0) {
+        $smokeMsg = "未配置受保护路径"
+    } else {
+        $shareRoot = $ProtectedDos[0]
+        if (-not (Test-Path -LiteralPath $shareRoot)) {
+            $smokeMsg = "受保护路径不存在: $shareRoot"
+        } else {
+            $storeRoot = Join-Path ($shareRoot.Substring(0, 2)) 'RBStore'
+            $probeName = 'rb_deploy_probe_{0}.txt' -f (Get-Date -Format 'HHmmss')
+            $probePath = Join-Path $shareRoot $probeName
+
+            Set-Content -LiteralPath $probePath -Value 'deploy probe' -Encoding ASCII
+            if (-not (Test-Path -LiteralPath $probePath)) {
+                $smokeMsg = "无法在 $shareRoot 创建探针文件"
+            } else {
+                Remove-Item -LiteralPath $probePath -Force
+                Start-Sleep -Seconds 3
+
+                $staged = $null
+                if (Test-Path -LiteralPath $storeRoot) {
+                    $staged = Get-ChildItem -LiteralPath $storeRoot -Recurse -Force `
+                                  -Filter ('*' + $probeName) -ErrorAction SilentlyContinue |
+                              Select-Object -First 1
+                }
+
+                if ($staged) {
+                    $smokeOk  = $true
+                    $smokeMsg = "拦截生效 - 探针已暂存至 $($staged.FullName)"
+                } elseif (Test-Path -LiteralPath $probePath) {
+                    $smokeMsg = "删除被拒绝 (fail-closed, 数据未丢, 但功能异常)"
+                } else {
+                    $smokeMsg = "探针被真删且未暂存 - 驱动未在保护 $shareRoot"
+                }
+            }
+        }
+    }
+} catch {
+    $smokeMsg = "异常: " + $_.Exception.Message
+}
+
+if ($smokeOk) {
+    Write-Host "  [OK] $smokeMsg" -ForegroundColor Green
+} else {
+    Write-Host "  ########################################################" -ForegroundColor Red
+    Write-Host "  #  警告: 删除拦截未生效" -ForegroundColor Red
+    Write-Host "  #  此时删除受保护共享中的文件将【永久丢失】" -ForegroundColor Red
+    Write-Host "  #  $smokeMsg" -ForegroundColor Red
+    Write-Host "  ########################################################" -ForegroundColor Red
+}
+
+# never leave the probe behind in the share
+if ($probePath -and (Test-Path -LiteralPath $probePath)) {
+    Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host "部署完成。"
+if (-not $smokeOk) {
+    Write-Host "(但拦截冒烟验证未通过 - 见上方 [7/6])" -ForegroundColor Red
+}
 Write-Host ""
 Write-Host "验证:"
 Write-Host "  sc.exe query RecycleBinSvc"

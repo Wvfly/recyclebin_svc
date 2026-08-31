@@ -415,6 +415,13 @@ type DriverStats struct {
 	QueueDepth      int     `json:"queue_depth"`
 	MaxQueueDepth   int     `json:"max_queue_depth"`
 
+	// ProtectedCount (RB-29) is how many protected prefixes the driver
+	// actually loaded. Zero means the filter is attached but forwards every
+	// delete: the share looks guarded and is not. Unlike the fields above it
+	// is a configuration value, not a counter -- so 0 is ALWAYS wrong in
+	// production and never an idle-but-healthy reading.
+	ProtectedCount int `json:"protected_count"`
+
 	// AgeSec is how long ago the sample was taken, and Stale says whether
 	// that is beyond the sampling window. A stale row means the driver
 	// stopped answering -- it must never be rendered as healthy zeros,
@@ -432,14 +439,15 @@ type DriverStats struct {
 func (d *DB) DriverStats() (*DriverStats, error) {
 	const q = `SELECT ts, intercepts, rename_ok, rename_fail, delete_denied,
 	                  notify_sent, notify_dropped, notify_queue_full,
-	                  queue_depth, max_queue_depth
+	                  queue_depth, max_queue_depth, protected_count
 	             FROM driver_stats WHERE id = 1`
 
 	st := &DriverStats{}
 	err := d.ro.QueryRow(q).Scan(
 		&st.Ts, &st.Intercepts, &st.RenameOk, &st.RenameFail,
 		&st.DeleteDenied, &st.NotifySent, &st.NotifyDropped,
-		&st.NotifyQueueFull, &st.QueueDepth, &st.MaxQueueDepth)
+		&st.NotifyQueueFull, &st.QueueDepth, &st.MaxQueueDepth,
+		&st.ProtectedCount)
 	if err == sql.ErrNoRows {
 		return nil, nil // no snapshot yet
 	}
@@ -486,6 +494,7 @@ func (d *DB) DriverStatsMap() map[string]interface{} {
 		"notify_queue_full": st.NotifyQueueFull,
 		"queue_depth":       st.QueueDepth,
 		"max_queue_depth":   st.MaxQueueDepth,
+		"protected_count":   st.ProtectedCount,
 	}
 }
 
