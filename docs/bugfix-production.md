@@ -5,6 +5,7 @@
 - 日期：2026-08-31
 - 本轮成果：**修复 10 项**（P0 × 4、P1 × 6），另修正原评估中的 2 处判断偏差
 - 追加轮次：**蓝屏实测修复 2 项**（RB-27 / RB-28，2026-08-31 两次 BSOD dump 定位）
+- 追加轮次：**部署/还原实测修复 2 项**（RB-29 / RB-30，2026-08-31 部署与还原实测新增）
 
 > 文档关系
 >
@@ -43,6 +44,13 @@
 |---|---|---|---|
 | RB-27 | P0 | `RbfPortMessage` 回调 7 参数签名 vs FltMgr 实际 6 参数 → 参数错位把 `InputBufferLength`(=4) 当指针解引用 → **0x3B** | 已修复 |
 | RB-28 | P0 | 卸载路径把 `PsCreateSystemThread` 返回的句柄当内核对象指针传给 `KeWaitForSingleObject` → **0xA** | 已修复 |
+
+### 部署/还原实测（第四轮，同日追加）
+
+| 编号 | 级别 | 问题 | 状态 |
+|---|---|---|---|
+| RB-29 | P1 | 驱动加载后对已挂载卷的 attach/过滤生效存在窗口，期间删除无保护、用户文件被永久删除 | 已修复 |
+| RB-30 | P1 | 还原后保留回收站 `Hidden+System` 属性，还原项在 Explorer/SMB 客户端不可见 | 已修复 |
 
 **未包含在本轮**：RB-02 驱动签名（外部流程，需采购证书 + 提交 Dev Center，2–6 周）、RB-03 Pre 回调重构（需测试机 + Driver Verifier，风险高，暂缓）、RB-20 / RB-21（属结构性设计优化，收益/风险比低于上述三项，待单独立项）。
 
@@ -294,6 +302,113 @@ Arg2 = 2 (IRQL=DISPATCH_LEVEL)
 
 ---
 
+## 三之四、部署实测与还原实测修复（RB-29 / RB-30）
+
+> **背景**：2026-08-31 部署与还原两项实测各暴露一个此前被忽略的问题——
+> "驱动 RUNNING ≠ 删除过滤已生效"的无保护窗口，与"还原成功但用户看不到"的
+> 属性残留。两项均在当日修复并部署实测通过。
+
+### RB-29 驱动加载后卷 attach/过滤生效存在窗口，期间删除无保护（实测用户数据丢失）
+
+**问题**：`sc start` 返回 RUNNING 并不等于对已挂载卷的删除过滤已生效。
+实测时间线：
+
+| 时间 | 事件 | 来源 |
+|---|---|---|
+| 17:31:53 | 部署完成，驱动 RUNNING | deploy 日志 |
+| 17:36:14~17:36:32 | 用户创建「测试驱动.txt」→ 写入 96B → 右键删除 | USN Journal |
+| 17:36:32 | 删除为 `文件删除 \| 关闭`（DELETE_CLOSE），**无 rename 到暂存区记录** → 未拦截 | USN Journal |
+| 17:41:31 | `fltmc` 才确认 `rbminiflt` attach 到 C/D/E 卷（高度 370030） | fltmc_check.log |
+| 17:42 / 17:47 | 本地 / UNC 测试删除均成功拦截（`intercepts=2`） | 驱动计数器 |
+
+用户删除落在 **17:36~17:41 无保护窗口**：文件直落磁盘被永久删除，无 `$R`/`$I`、
+无 DB 记录、无暂存副本。且从 UNC/映射盘右键删除 Windows 本来就是永久删除，
+更放大了危害；`intercepts=0` 与"真的没删除"无法区分，运维会误判系统健康。
+
+**修复**（2026-08-31 实施）：
+
+1. **可观测性兜底**：驱动 `RBF_STATS` 新增 `ProtectedCount`（实际从注册表加载的
+   受保护路径数，0 = 驱动对一切删除放行）。跨层打通：`rbminiflt.c` 装载配置后镜像到
+   `G.Stats` → `rbf_protocol.h` 同步字段 + 编译期断言（`sizeof(RBF_STATS)==68`，
+   驱动/服务双侧 C_ASSERT，漂移即编译失败）→ `rbdb.c` 幂等列迁移落库 →
+   `db.go` 查询/JSON 暴露 → `/health` 的 `driver.protected_count`
+2. **部署冒烟验证 [7/6]**：向受保护共享投放探针文件并删除，要求驱动将其**暂存**到
+   RBStore：暂存 → 拦截链路 LIVE；留在原处 → fail-closed（数据安全但功能异常）；
+   消失且未暂存 → **真删、共享未受保护**（红色告警 + 文件永久丢失风险提示）
+3. **启动类型恢复**：`rbminiflt` 恢复 `start= system`（开机自动加载）
+
+**部署实测验证**（2026-08-31 18:29~18:31，签名驱动 25,848 B）：
+
+| 验证项 | 结果 |
+|---|---|
+| 驱动启动（[4/6]） | RUNNING（签名驱动通过内核加载器校验） |
+| [7/6] 冒烟拦截 | 探针被暂存 `E:\RBStore\...\1_rb_deploy_probe_182932.txt`（14 B） |
+| `fltmc` attach | 4 实例（C:/D:/E:/无卷名），高度 370030，E: 已过滤 |
+| `/health` `protected_count` | = 1（与配置的 `\Device\HarddiskVolume4\tmp\share` 一致） |
+| 驱动计数器 | `intercepts=1, rename_ok=1, notify_sent=1` |
+| 服务状态 | RecycleBinSvc / RecycleBinApi RUNNING（AUTO_START） |
+
+**遗留**：重启后自动加载路径（`start= system`）与本次验证路径一致，待下次重启
+复核；未做 `FltEnumerateVolumes` 主动 attach 代码改动（实测加载时 FltMgr 已为
+全部已挂载卷建立实例）。
+
+### RB-30 还原后保留回收站的 `Hidden+System` 属性，还原项在 Explorer/SMB 不可见（实测）
+
+**问题**：`RestoreItemById` 用 `MoveFileExW` 把条目从 `$Recycle.Bin` 移回原路径
+（`rbrestore.c` 第 251 行）——移动只搬数据、属性随文件保留，`$R` 容器/文件自带的
+`FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM`（回收站标准属性）被一并带回。
+Explorer 默认不显示带 `System` 属性的项（即使勾选"显示隐藏文件"），SMB 客户端枚举
+同样过滤 → **还原成功但用户完全看不到**。
+
+**实测证据**（2026-08-31 18:33~18:40，SMB 删除大目录树「财务wind文档资料1」，
+311 子目录 / 12 文件 / 19.5 MB）：
+
+1. 删除 → 拦截 → land `E:\$Recycle.Bin\S-1-5-21-...-1001\$R4REVELKRI`
+2. `POST /ops {"type":"restore","id":5}` → op `done/ok`，DB 更新 `restored=1`
+3. 还原后 `attrib` = **`Hidden, System, Directory`**；对照可见目录 `test_dir` =
+   `Directory`，两者 ACL 完全一致——**唯一差异就是属性位**
+4. PowerShell 清除 `Hidden+System` 后，UNC `\\<主机名>\share` 立即可见
+   （12 文件 / 19,493,088 B，与删除前逐字节一致）
+
+**影响**：还原结果对用户"隐形"（以为还原失败 → 重复还原/重新删除/放弃恢复），
+破坏核心承诺（"删除进回收站、可还原可见"）；目录树还原逐条目走同一
+`RestoreItemById`，影响面是还原功能的 **100%**。
+
+**修复**（2026-08-31 实施）：`MoveFileExW` 成功、`$I` 元数据删除之后，对还原目标
+**读-改-写清除属性位**（仅清 `HIDDEN | SYSTEM` 两位，保留只读等其他属性）：
+
+```c
+DWORD attrs = GetFileAttributesW(dstDos);
+if (attrs != INVALID_FILE_ATTRIBUTES &&
+    (attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))) {
+    if (!SetFileAttributesW(
+            dstDos, attrs & ~(FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))) {
+        LogWarn(L"[restore] cannot clear hidden/system attrs on %s (win32=%lu)",
+                dstDos, GetLastError());
+    }
+}
+```
+
+- 树还原（`RestoreTreeByPrefix`）逐条目复用同一路径，自动覆盖
+- 清除失败仅 `LogWarn` 告警、不判还原失败（数据已归位，属性可后续修）
+
+**部署实测验证**（2026-08-31 18:54~18:57，rbservice.exe 1,267,200 B）：
+
+| 验证项 | 结果 |
+|---|---|
+| 复现（修复前行为） | land 后 `$R4REVFF2IR` = `Hidden, System, Directory` |
+| 还原后属性 | `Directory`（无 hidden/system 位） |
+| SMB 可见性 | UNC `\\<主机名>\share` 立即可见 RB30T |
+| 内容完整性 | `a.txt` = `hello A`、`sub\b.txt` = `hello B`（9 B × 2，与删除前一致） |
+| DB 状态 | op `done`，条目转 `restored` |
+| 服务健康 | RecycleBinSvc / RecycleBinApi RUNNING，驱动 protected=1 |
+
+**遗留**：逐条 restore 按 id 升序提交时，若先还原子文件再还原父目录，父目录条目会
+因目标已由 `EnsureDirectoryChain` 重建而返回 failed——最终树仍完整（子文件已归位），
+不造成数据损失；树还原接口按整棵前缀还原不受影响。
+
+---
+
 ## 四、验证
 
 每项修复均执行全量重新编译（`build_all.cmd Release`）并运行两套契约测试：
@@ -310,6 +425,11 @@ Arg2 = 2 (IRQL=DISPATCH_LEVEL)
 `verify_contract.py` 9/9 + `verify_c_contract.py` 10/10 通过；并用
 `dumpbin /disasm` 与 IAT 核对新驱动已包含两项修复（RB-27：无
 `cmp [r8],1` 特征码；RB-28：IAT 新增 `ObReferenceObjectByHandle`）。
+
+第四轮（RB-29 / RB-30）修复后完成签名驱动部署实测：契约验证通过；部署冒烟
+[7/6] 探针暂存成功、`/health` 的 `protected_count=1`；还原实测属性清除、UNC
+可见、内容完整。部署后服务持续运行未再触发 0x3B（RB-27 对应验证通过）；
+RB-28 的卸载路径待 `sc stop` 实测确认。
 
 ### 契约测试捕获的真实回归
 
@@ -332,14 +452,15 @@ Arg2 = 2 (IRQL=DISPATCH_LEVEL)
 
 **风险提示**：本轮修复**仅经过编译与契约验证**。内核路径（RB-01、RB-04、RB-08、RB-19、RB-22）的正确性需要在配备 Driver Verifier 的测试机上做真实删除拦截压测后才能确认，当前环境不具备该条件。
 
-RB-27 / RB-28 虽已修复并经反汇编核对，但**尚未部署到目标机实测**。
-部署 `target\Release\` 全套后需验证：
+RB-27 / RB-28 已随 2026-08-31 签名驱动部署（18:29，25,848 B）。服务端 stats
+轮询持续运行未再触发 0x3B（RB-27 实测通过）；RB-28 的卸载路径仍需 `sc stop` /
+驱动更新实测确认（本次部署未执行卸载操作）。
+另需核对系统 `System32\drivers\rbminiflt.sys` 的 SHA256 与构建产物一致，
+避免版本漂移（此前系统里部署的是 16:03:58 构建版，未含任何修复）。
 
-1. 服务端 stats 轮询（`RBSVC_STATS_INTERVAL` 心跳）不再触发 0x3B —— 对应 RB-27
-2. `sc stop` / 驱动更新卸载路径不再触发 0xA —— 对应 RB-28
-3. 核对系统 `System32\drivers\rbminiflt.sys` 的 SHA256 与构建产物一致，
-   避免再次出现"源码已修、部署的还是旧版"的版本漂移（此前系统里部署的是
-   16:03:58 构建版，未含任何修复）。
+RB-29 / RB-30 遗留：驱动重启后自动加载（`start= system`）的 attach 行为待下次
+重启复核；逐条 restore 按 id 升序时的"父目录条目返回 failed、树仍完整"属已知
+边界（树还原接口不受影响），如后续开放逐条还原入口需一并处理。
 
 RB-19 的指纹缓存是新增的内核状态，压测时应重点验证：
 多用户并发删除、缓存淘汰轮转、以及删除 `\RBStore` 后的自愈路径。
