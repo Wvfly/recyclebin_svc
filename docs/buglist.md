@@ -3,7 +3,7 @@
 - 项目：Windows 文件共享回收站 (RecycleBin for SMB)
 - 范围：内核 Mini-Filter 驱动 (`rbminiflt`) + C 核心服务 (`rbservice`) + Go 管理 API (`rbapi`) + 数据模型 + 部署链路
 - 日期：2026-08-31
-- 条目：RB-01 ~ RB-23（含 5 项大目录树删除场景专项问题）
+- 条目：RB-01 ~ RB-26（含 5 项大目录树删除场景专项问题）
 - 评估结论：**核心 P0 阻塞已消除，仍不具备生产部署条件**
 
 > 与 `bugfix-report.md` 的关系
@@ -16,6 +16,7 @@
 > RB-02 为外部流程（驱动签名），RB-03 暂缓（需测试机 + Driver Verifier）。
 > RB-18 ~ RB-22 为 2026-08-31 新增的大目录树删除场景问题（第五章）。
 > RB-23 为通信端口生命周期问题（client port use-after-free，蓝屏风险），见第六章。
+> RB-24 ~ RB-26 为 2026-08-31 蓝屏风险复审新增（RB-24 为 RB-23 的残余竞态补强）。
 
 ---
 
@@ -46,6 +47,9 @@
 | RB-21 | P1 | 驱动/服务 | staging 扁平结构，单目录文件数膨胀后操作变慢 | 待修（还原粒度已改善） |
 | RB-22 | **P1** | 驱动 | `FileDispositionInformationEx` 未拦截，可绕过整树真删 | **已修复** |
 | RB-23 | **P0** | 驱动 | client port 断开后队列残留节点持悬空端口，发送线程 use-after-free 可致蓝屏 | **已修复** |
+| RB-24 | **P0** | 驱动 | `RbfQueueNotify` 端口快照与入队之间的 disconnect 竞态，节点持已释放端口入队（RB-23 残余窗口） | **已修复** |
+| RB-25 | **P1** | 驱动 | `RbfAllocNotify` 失败分支未释放预占队列槽位，泄漏至满后所有删除被拒 | **已修复** |
+| RB-26 | **P2** | 驱动 | `RbfLoadConfig` 解析 `REG_MULTI_SZ` 未按 `DataLength` 限界，畸形注册表值可越界读 | **已修复** |
 
 > RB-18 ~ RB-22 为**大目录树删除场景**专项问题（详见第五章）。
 > 该场景在单文件删除时不暴露，删除含大量子目录/文件的目录树时集中显现。
@@ -686,7 +690,7 @@ rename → 入队），整树删除不再能绕过。
 
 ---
 
-## 六、通信端口生命周期（RB-23）
+## 六、可靠性补强（RB-23 ~ RB-26）
 
 ### RB-23 client port use-after-free（蓝屏风险）
 
@@ -719,6 +723,62 @@ rename → 入队），整树删除不再能绕过。
      锁外释放，杜绝"检查后、摘除前"发送线程再取到旧节点的窗口。
 3. 丢弃的待发通知由 RB-05 孤儿对账兜底：服务重连后对账会为已 staging 的文件
    补建数据库行，不产生不可恢复的数据丢失。
+
+### RB-24 端口快照与入队之间的竞态（RB-23 残余窗口，蓝屏风险）
+
+- **模块**：driver
+- **级别**：P0
+- **位置**：`driver/rbminiflt.c` `RbfQueueNotify`
+- **状态**：**已修复**
+
+**问题**
+
+RB-23 修复覆盖了"已在队列中的节点"与"发送线程在途的节点"，但 `RbfQueueNotify`
+的端口快照在**锁外**进行：`port = G.ClientPort` 快照成功后、节点入队前，disconnect
+回调可能已执行完毕并返回（内核随即释放端口），节点随后带着已释放的端口入队，
+发送线程 `FltSendMessage()` 命中悬空指针——与 RB-23 同一类 UAF。
+
+**修复（已实施）**
+
+入队时在**同一次锁获取**内校验 `G.ClientPort == 快照端口`，不等则释放节点与通知、
+归还预占槽位并计 `NotifyDropped`，返回 `STATUS_PORT_DISCONNECTED`。节点一旦在锁内
+插入成功，disconnect 回调的排队清空逻辑必然覆盖它，竞态窗口闭合。
+
+### RB-25 队列预占槽位泄漏
+
+- **模块**：driver
+- **级别**：P1
+- **位置**：`driver/rbminiflt.c` `RbfPreSetInfo`（`RbfAllocNotify` 失败分支）
+- **状态**：**已修复**
+
+**问题**
+
+rename 已成功、`RbfAllocNotify` 失败（内存不足/路径超长）时，步骤 5.2 预占的
+队列槽位未归还。每次失败泄漏一个 Reserved 槽，累积满 `RBF_QUEUE_MAX`（512）后
+所有删除被拒——fail-closed 保数据但**功能永久退化**，需重启服务才能恢复。
+
+**修复（已实施）**
+
+失败分支调用 `RbfReleaseQueueSlot()` 归还槽位。文件已 staging 但无 DB 行，
+由 RB-05 孤儿对账补录。
+
+### RB-26 注册表 MultiSz 解析越界读（防御性）
+
+- **模块**：driver
+- **级别**：P2
+- **位置**：`driver/rbminiflt.c` `RbfLoadConfig`
+- **状态**：**已修复**
+
+**问题**
+
+`ProtectedPaths`（`REG_MULTI_SZ`）解析时以 `while (*p)` 遍历且无 `DataLength`
+边界约束。标准 MultiSz 以双 NUL 结尾，但若注册表值被写为畸形数据（无尾随 NUL），
+遍历可越界读池缓冲，潜在访问无效地址。
+
+**修复（已实施）**
+
+以 `(PBYTE)kvpi->Data + kvpi->DataLength` 为硬边界，所有读取（含 `sizeof(WCHAR)`
+对齐）均先做边界检查。
 
 ---
 

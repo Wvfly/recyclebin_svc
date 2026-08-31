@@ -112,12 +112,20 @@ NTSTATUS RbfLoadConfig(VOID)
     status = ZwQueryValueKey(hKey, &keyName, KeyValuePartialInformation,
                              kvpi, kvpiLen, &resultLen);
     if (NT_SUCCESS(status) && kvpi->Type == REG_MULTI_SZ && kvpi->DataLength > 0) {
+        /* Defensive bound (RB-26): REG_MULTI_SZ is normally double-NUL
+           terminated, but a tampered registry value could lack the trailing
+           NUL.  Clamp every probe to DataLength so the walk can never read
+           past the returned buffer. */
+        PUCHAR multiEnd = (PUCHAR)kvpi->Data + kvpi->DataLength;
         multi = (PWSTR)kvpi->Data;
-        for (p = multi; *p && i < RBF_MAX_PROTECTED; ) {
+        for (p = multi; (PUCHAR)p + sizeof(WCHAR) <= multiEnd && *p &&
+                        i < RBF_MAX_PROTECTED; ) {
             SIZE_T len = 0;
             PWSTR cur = p;
-            while (*p) { p++; len++; }
-            p++; /* skip NULL */
+            while ((PUCHAR)p + sizeof(WCHAR) <= multiEnd && *p) { p++; len++; }
+            if ((PUCHAR)p + sizeof(WCHAR) <= multiEnd) {
+                p++; /* skip NULL */
+            }
             if (len < RBF_MAX_PATH) {
                 RBF_PROTECTED *pe = &G.Protected[i];
                 pe->Prefix.Buffer = pe->Buffer;
@@ -858,9 +866,25 @@ NTSTATUS RbfQueueNotify(_In_ PRBF_NOTIFICATION Note)
     node->Size         = Note->TotalSize;
     node->Port         = port;
 
+    /* RB-23 follow-up: the port was snapshotted ABOVE outside the lock, so
+       RbfPortDisconnect() may have run (and the kernel may already have
+       released the port) in between.  Re-check inside the same lock
+       acquisition that inserts the node: if the client port changed or went
+       away, the snapshot is dead and this notification must be dropped
+       instead of queued for a use-after-free in the send thread.  The
+       disconnect callback drains under the same lock, so a node already
+       inserted here is always covered by its drain. */
+    KeAcquireSpinLock(&G.QueueLock, &irql);
+    if (G.ClientPort != port) {
+        KeReleaseSpinLock(&G.QueueLock, irql);
+        RbfNotifyFree(Note);
+        ExFreePoolWithTag(node, RBF_TAG);
+        RbfReleaseQueueSlot();
+        InterlockedIncrement64((volatile LONG64 *)&G.Stats.NotifyDropped);
+        return STATUS_PORT_DISCONNECTED;
+    }
     /* The slot was reserved before staging, so the queue cannot be over
        capacity here -- this insert is the reservation being honoured. */
-    KeAcquireSpinLock(&G.QueueLock, &irql);
     InsertTailList(&G.NotifyQueue, &node->Entry);
     if (G.Reserved > 0) G.Reserved--;
     G.QueueDepth++;
@@ -1314,7 +1338,11 @@ RbfPreSetInfo(
         if (!NT_SUCCESS(status)) {
             /* The rename already succeeded, so the file sits in staging with
                no database row: an orphan. Count the drop so it shows up in
-               the statistics instead of failing silently. */
+               the statistics instead of failing silently.  The queue slot
+               reserved in step 5.2 is also released: leaking it would
+               permanently consume one of the RBF_QUEUE_MAX slots and
+               eventually deny every delete (RB-25). */
+            RbfReleaseQueueSlot();
             InterlockedIncrement64((volatile LONG64 *)&G.Stats.NotifyDropped);
             DbgPrint("[RBF] alloc notify failed 0x%X, staged file orphaned\n",
                      status);
