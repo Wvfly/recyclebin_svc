@@ -406,3 +406,7 @@ service_c/build_err.txt
 
 # One-shot service/driver state dump (sc query output), not source
 svc_state.txt
+
+# Test run logs (test/run_all.ps1 and per-layer runners write these)
+test/_*.log
+test/**/_*.log

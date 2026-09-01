@@ -45,6 +45,27 @@ func (s *Server) authorized(r *http.Request) bool {
 	return r.Header.Get("X-Auth-Token") == s.Token
 }
 
+// dbUnavailable reports whether the database handle is missing. When it is,
+// a 503 is written and true is returned so the caller can stop.
+//
+// Why this exists: main.go starts the listener while openWithRetry is still
+// waiting for rbservice.exe to create/migrate recycle.db, so every handler can
+// legitimately be called with s.DB == nil. Dereferencing it panics, and a
+// panic in a handler only shows up as a dropped connection -- which is the
+// worst possible signal for /health, the endpoint operations polls to decide
+// whether protection is actually live (RB-29). A 503 with a readable body is
+// actionable; a reset connection is not.
+//
+// This mirrors the existing s.Stats == nil check in handleStats; the two
+// handlers simply had inconsistent guards.
+func (s *Server) dbUnavailable(w http.ResponseWriter) bool {
+	if s.DB == nil {
+		writeErr(w, http.StatusServiceUnavailable, "database unavailable")
+		return true
+	}
+	return false
+}
+
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -84,6 +105,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method != http.MethodGet {
 		writeErr(w, http.StatusMethodNotAllowed, "GET required")
+		return
+	}
+	if s.dbUnavailable(w) {
 		return
 	}
 
@@ -139,6 +163,10 @@ func (s *Server) handleItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.dbUnavailable(w) {
+		return
+	}
+
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	offset, _ := strconv.Atoi(q.Get("offset"))
@@ -165,6 +193,10 @@ func (s *Server) handleItemByID(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method != http.MethodGet {
 		writeErr(w, http.StatusMethodNotAllowed, "GET required")
+		return
+	}
+
+	if s.dbUnavailable(w) {
 		return
 	}
 
@@ -195,6 +227,10 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method != http.MethodGet {
 		writeErr(w, http.StatusMethodNotAllowed, "GET required")
+		return
+	}
+
+	if s.dbUnavailable(w) {
 		return
 	}
 
@@ -237,6 +273,9 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleOps(w http.ResponseWriter, r *http.Request) {
 	if !s.authorized(r) {
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.dbUnavailable(w) {
 		return
 	}
 
@@ -334,6 +373,10 @@ func (s *Server) handleOpByID(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method != http.MethodGet {
 		writeErr(w, http.StatusMethodNotAllowed, "GET required")
+		return
+	}
+
+	if s.dbUnavailable(w) {
 		return
 	}
 
