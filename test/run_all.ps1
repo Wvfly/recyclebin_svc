@@ -123,6 +123,12 @@ if ($All) {
         Name   = "L5 destructive (skeleton)"
         Result = $(if ($d -match "STATUS: RED") { 1 } else { 0 })
     }
+
+    Write-Host ""
+    $layers += [pscustomobject]@{
+        Name   = "L5 user-scenarios (A~F)"
+        Result = (Invoke-Python -Script "test\l5_e2e\test_l5_user_scenarios.py")
+    }
 }
 
 # ---------------------------------------------------------------------

@@ -2,9 +2,9 @@
 
 - 项目：Windows 文件共享回收站 (RecycleBin for SMB)
 - 范围：内核 Mini-Filter 驱动 (`rbminiflt`) + C 核心服务 (`rbservice`) + Go 管理 API (`rbapi`) + 数据模型 + 部署链路
-- 日期：2026-08-31
-- 条目：RB-01 ~ RB-30（含 5 项大目录树删除场景专项问题）
-- 评估结论：**核心 P0 阻塞已消除，仍不具备生产部署条件**
+- 日期：2026-08-31（2026-09-01 增补 RB-31/RB-32 拦截盲区）
+- 条目：RB-01 ~ RB-32（含 5 项大目录树删除场景专项问题、2 项删除拦截盲区）
+- 评估结论：**核心 P0 阻塞已消除，仍不具备生产部署条件**（RB-31/RB-32 删除拦截盲区为真实数据丢失路径，修复前严禁上线）
 
 > 与 `bugfix-report.md` 的关系
 >
@@ -15,6 +15,11 @@
 > 修复进度：RB-01、RB-04 ~ RB-12 已修复，详见 `bugfix-production.md`。
 > RB-02 为外部流程（驱动签名），RB-03 暂缓（需测试机 + Driver Verifier）。
 > RB-18 ~ RB-22 为 2026-08-31 新增的大目录树删除场景问题（第五章）。
+> RB-31、RB-32 为 2026-09-01 **实测拦截盲区**新增（详见第六章"可靠性补强"末尾）：
+> 维度 B 用例 S-B4（`cmd /c del`）与 S-B13（POSIX_SEMANTICS）在真实 SMB 拦截链路下
+> 仍 FAIL，证明文件删除路径存在未覆盖的 IRP 子类，受保护文件可绕过回收站真删。
+> **RB-22 虽标记"已修复"，但 RB-32 实测显示该修复在部署产物中未生效（疑似构建产物
+> 未更新或未覆盖 `cmd` 删除 IRP），两缺陷一并登记、相互印证。**
 > RB-23 为通信端口生命周期问题（client port use-after-free，蓝屏风险），见第六章。
 > RB-24 ~ RB-26 为 2026-08-31 蓝屏风险复审新增（RB-24 为 RB-23 的残余竞态补强）。
 > RB-27 ~ RB-28 为 2026-08-31 **实测蓝屏**（0x3B / 0xA）dump 分析新增，详见第六章。
@@ -61,6 +66,8 @@
 | RB-28 | **P0** | 驱动 | 卸载路径把 `PsCreateSystemThread` 返回的**句柄**当内核对象指针传给 `KeWaitForSingleObject` → 解引用无效地址 → **蓝屏 0xA** | **已修复** |
 | RB-29 | **P1** | 驱动/部署 | 驱动加载后对已挂载卷的 attach/过滤生效存在窗口（17:31 加载、17:41 才 attach E:），期间删除无保护、文件被永久删除 | **已修复** |
 | RB-30 | **P1** | 服务 | 还原后目录/文件保留回收站 `Hidden+System` 属性，Explorer/SMB 客户端不可见（实测） | **已修复** |
+| RB-31 | **P1** | 驱动 | `cmd /c del` 走的删除 IRP 路径未被拦截，受保护文件被静默真删（实测，RB-22 类盲区复现） | **待修** |
+| RB-32 | **P1** | 驱动 | `FileDispositionInformationEx` + `POSIX_SEMANTICS` 仍被绕过，整树/单文件真删（实测，RB-22 修复未生效） | **待修** |
 
 > RB-18 ~ RB-22 为**大目录树删除场景**专项问题（详见第五章）。
 > 该场景在单文件删除时不暴露，删除含大量子目录/文件的目录树时集中显现。
@@ -707,6 +714,12 @@ rename → 入队），整树删除不再能绕过。
 > WDK 头文件定义，未做兼容性别名——SDK 对该结构体的守卫宏名无法跨版本可靠
 > 检测，自行 typedef 会与真实定义冲突。构建本驱动需 1709 或更新版本的 WDK。
 
+> **状态修正（2026-09-01 实测）**：上述修复在源码层面已合入，但维度 B 用例
+> **S-B13（POSIX_SEMANTICS）在真实拦截链路下仍 FAIL**，说明部署的 `.sys` 产物
+> 未包含该修复或拦截路径未实装（典型的"源码已修、产物未更新"——同 RB-27/28 教训）。
+> 同时 S-B4（`cmd /c del`）表明 `cmd` 删除走的另一条 IRP 子类同样未被覆盖。
+> 故将拦截盲区拆分为 **RB-31 / RB-32** 重新登记，本条目保留为"修复已实现、待部署验证"。
+
 ---
 
 ## 六、可靠性补强（RB-23 ~ RB-28）
@@ -1089,8 +1102,104 @@ if (attrs != INVALID_FILE_ATTRIBUTES &&
 | **蓝屏实测** | 已完成 | ~~RB-27 消息回调参数错位~~、~~RB-28 卸载句柄当指针~~ **已修复**（已编译 + 反汇编核对，待部署到目标机实测） |
 | **部署验证** | 已完成 | ~~RB-29 attach 就绪窗口~~ **已修复**（ProtectedCount 暴露 + [7/6] 冒烟验证 + 签名驱动部署实测通过）；~~RB-17~~ **误判撤回**（`$I` 实为 Explorer 原生格式，回收站实测可见） |
 | **还原可见性** | 已完成 | ~~RB-30 还原后清除 `Hidden/System` 属性~~ **已修复**（`RestoreItemById` 读-改-写清属性位，部署实测：还原后 `Directory`、UNC 可见、内容完整） |
+| **拦截盲区** | 待启动 | **RB-31 `cmd /c del` 删除 IRP 未覆盖**、**RB-32 POSIX_SEMANTICS 绕过点（RB-22 修复未生效）**：2026-09-01 实测 S-B4/S-B13 FAIL，受保护文件可真删。需先核对部署 `.sys` SHA256 是否含 RB-22 修复，再补齐所有删除类 IRP 拦截 |
 
 > 建议：在 RB-01、RB-02、RB-04 完成前，**不要开展任何生产试点**。
 >
 > **RB-18 建议优先修复**：仅一行代码改动，却解决了"删除复杂目录树后无法还原"
 > 这一核心功能失效问题，投入产出比最高。
+
+---
+
+## 六之二、删除拦截盲区（RB-31 ~ RB-32，2026-09-01 实测）
+
+> 本组为 `test/l5_e2e/test_l5_user_scenarios.py` 维度 B 用例在 **真实 SMB 拦截链路**
+> 下实测失败暴露的驱动侧拦截盲区。它们不是测试脚本缺陷，而是产品缺陷：受保护共享
+> 内的文件可绕过回收站被**静默真删**，是"唯一兜底"失效的唯一路径。
+> 固化用例 S-B4 / S-B13 当前 FAIL，修复后自动转 PASS。
+
+### RB-31 `cmd /c del` 删除 IRP 未被拦截，受保护文件被静默真删
+
+- **模块**：driver
+- **级别**：P1（实为数据丢失路径，按 P0 对待）
+- **位置**：`driver/rbminiflt.c` `RbfPreSetInfo`（IRP_MJ_SET_INFORMATION 过滤条件）
+- **状态**：**待修**
+- **来源**：2026-09-01 维度 B 用例 `S-B4` 实测 FAIL（`E:\tmp\share\__smoke__\scenarios`）
+
+**问题**
+
+用例以 `cmd /c del /q <UNC 路径>` 删除受保护共享内文件，删除后：
+
+1. `E:\RBStore` 无对应 staging 条目（`/items` 查不到 `b4_cmd.txt`）；
+2. 源文件从共享中消失，**数据不可恢复**。
+
+`cmd.exe` 的 `del` 底层并非走 `DeleteFileW`（该路径已被本驱动拦截），而是走
+`SetFileInformationByHandle(FileDispositionInformation)` 或更底层的 IRP。**当前
+`RbfPreSetInfo` 的 `FileInformationClass` 过滤未覆盖 `cmd` 实际发出的 IRP 子类**
+（疑似 `FileDispositionInformation` 之外、`cmd` 经 `DeleteFile`/`NtSetInformationFile`
+发出的变体，或 `FILE_OPEN_REPARSE_POINT` 等伴随标志），导致该删除直接到达文件系统、
+绕过 rename 进 RBStore。
+
+**影响**
+
+- 攻击者或误用批处理脚本可借 `cmd /c del` 绕过回收站直接销毁受保护文件，
+  使"SMB 唯一兜底防护层"失效（S-A2 UNC 是网络位置唯一防护层，一旦被绕过即无保护）。
+- 与 S-B13 同属"删除 IRP 覆盖不全"，但触发面更广（命令行/脚本是最常见删除方式）。
+
+**修复建议**
+
+1. `RbfPreSetInfo` 的 `IRP_MJ_SET_INFORMATION` 处理中对**所有删除类**
+   `FileInformationClass`（`FileDispositionInformation`、`FileDispositionInformationEx`）
+   做统一拦截，并与 RB-32 共用同一分派逻辑；
+2. 在测试机用 `cmd /c del` 复现，用 **ProcMon** 抓取 `cmd.exe` 实际发出的
+   `SetInformationFile` IRP 的 `FileInformationClass` 与标志，确认过滤条件对齐；
+3. 以 RB-27/28 教训为戒：**修复后必须核对部署 `.sys` 的 SHA256 与构建产物一致**，
+   并以 `S-B4` 转 PASS 作为验收标准。
+
+**验证方法**：`python test\l5_e2e\test_l5_user_scenarios.py` 中 `S-B4` 由 FAIL 转 PASS，
+且 `E:\RBStore` 出现对应 staging 条目、源文件可还原。
+
+---
+
+### RB-32 `FileDispositionInformationEx` + `POSIX_SEMANTICS` 仍被绕过（RB-22 修复未生效）
+
+- **模块**：driver
+- **级别**：P1（实为数据丢失路径，按 P0 对待）
+- **位置**：`driver/rbminiflt.c` `RbfPreSetInfo`（同 RB-22）
+- **状态**：**待修（RB-22 源码修复已合入，但部署产物未生效）**
+- **来源**：2026-09-01 维度 B 用例 `S-B13` 实测 FAIL
+
+**问题**
+
+用例用 `ntdll.NtSetInformationFile(FileDispositionInformationEx, Flags=POSIX_SEMANTICS)`
+（`0x3` 访问、`FILE_DISPOSITION_DELETE` 标志）删除受保护共享内文件，删除后：
+
+1. `E:\RBStore` 无对应 staging 条目；
+2. 源文件消失，数据不可恢复。
+
+RB-22 已在源码层面对 `FileDispositionInformationEx` 增加拦截分支并将其并入
+`FileDispositionInformation` 的同一 rename 路径，但**实测表明该拦截在部署驱动中未生效**。
+可能原因（按 RB-27/28 经验优先级排序）：
+
+1. 部署的 `.sys` 产物未重新编译/未包含 RB-22 修复（源码已修、产物未更新）；
+2. `cmd` / POSIX 工具实际发出的 IRP 子类（如带 `FILE_OPEN_REPARSE_POINT`、
+   `FILE_DISPOSITION_ON_CLOSE` 等附加标志的变体）未被 RB-22 的精确比较覆盖；
+3. 拦截分支的位置在 `FileDispositionInformationEx` 判定前提前 `return`
+   `FLT_PREOP_SUCCESS_NO_CALLBACK`（早退路径覆盖不全）。
+
+**影响**
+
+与 RB-31 同源但触发更隐蔽：任何使用 `NtSetInformationFile` / POSIX 语义删除的应用、
+WSL、Git for Windows、rsync、某些备份工具均可绕过回收站真删整树或单文件，
+且**不产生任何通知或计数**——历史绕过点复现，是明确的数据真正丢失路径。
+
+**修复建议**
+
+1. 首先核对部署 `.sys` SHA256 与含 RB-22 修复的构建产物一致
+   （`test/run_all.ps1 -Deployed` 已具备该核对入口）；若不一致，重新部署正确产物；
+2. 用 ProcMon 抓取 `NtSetInformationFile` 实际 IRP，确认 `FileInformationClass`
+   与标志位，确保 `RbfPreSetInfo` 的分派覆盖所有变体（含附加标志组合）；
+3. 验收标准：`S-B13` 由 FAIL 转 PASS，且 `S-B4`、`S-B13` 在测试机同时绿。
+
+**关联**：与 RB-22 同源；与 RB-31 互补（二者分别覆盖不同删除 IRP 触发面，
+共同构成"删除拦截全覆盖"验收）。
