@@ -1,0 +1,10 @@
+# 1) 生成新自签测试证书（有效期设 10 年，别再一年一签）
+$c = New-SelfSignedCertificate -Type CodeSigning -Subject "CN=RbMiniflt Test" `
+    -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(10)
+# 导出 pfx 交给团队（密码 = RB_CERT_PWD）
+Export-PfxCertificate -Cert $c -FilePath rbminiflt_test.pfx -Password (ConvertTo-SecureString $env:RB_CERT_PWD -AsPlainText -Force)
+
+# 2) 重签
+set RBF_CERT_SHA1=<新证书SHA1>
+set RB_CERT_PWD=<密码>
+build_all.cmd Release

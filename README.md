@@ -311,7 +311,7 @@ target\Release\
 | **[0/6]** | 校验 `StoreRoot` 与受保护共享**同卷**，不匹配直接中止并给出可照抄的修正建议 |
 | **[1/6]** | 用 `QueryDosDevice` 把 `D:\Share` 转成 NT 形式 `\Device\HarddiskVolumeN\Share`，分别写入驱动参数键和用户态配置键 |
 | **[2/6]** | 创建 `StoreRoot`（如 `D:\RBStore`），加 `HIDDEN\|SYSTEM` 属性，共享用户不可见 |
-| **[3/6]** | 拷贝 sys 到 `system32\drivers\`，`pnputil /add-driver ... /install` |
+| **[3/6]** | 拷贝 sys 到 `system32\drivers\`，`pnputil /add-driver ... /install`（**INF 安装需数字签名；未签名则失败并自动回退 legacy 注册，此时须已开 testsigning**，见「驱动签名」B 节） |
 | **[4/6]** | `sc start rbminiflt`；加载失败按退出码区分：**0xC0000428（未签名）**→ 见下文「驱动签名」小节，切换 test-signing 或改用生产证书重签 |
 | **[5/6]** | `sc create RecycleBinSvc ... obj= LocalSystem start= auto` 并启动 |
 | **[6/6]** | 安装管理 API `rbapi.exe`（可选，未编译则跳过） |
@@ -368,6 +368,17 @@ bcdedit /set testsigning on
 bcdedit /set testsigning off
 ```
 
+> ⚠️ **关键坑（实测）：`testsigning` 只豁免「内核加载器」，不豁免「setupapi 的 INF 包签名校验」。**
+> 部署走 `pnputil /add-driver ... /install`（第 [3/6] 步）时，setupapi 仍要求 `.inf/.cat/.sys`
+> 有**有效数字签名**；仅开 `testsigning` + 未签名驱动，`pnputil` 必报 `Access is denied` 而失败，
+> 进而 `[4/6]` `sc start` 报 `1060`（服务未注册）。
+> 因此「只开 testsigning 还不够，必须签名」是真实约束，对应两条可行路径：
+> - **(A) 用项目测试证书签名后再装**：`set RB_CERT_PWD=...; build_all.cmd Release` → `.sys/.cat` 被签，
+>   `pnputil` 在 testsigning 机上可通过（正式 INF 安装路径）；
+> - **(B) 跳过 INF 安装，走 legacy 回退**：`deploy.ps1` 在 `pnputil` 失败后会自动
+>   `sc create` + 拷 `sys` 直接注册，仅依赖内核加载器，此时 testsigning 即可加载未签名驱动。
+>   功能等价，但**不走正规 INF 安装**，仅限测试/排障使用。
+
 > 生产服务器**严禁**长期开启 test-signing（违反基线，且会加载任意测试签名驱动）。
 
 **C. 生产证书（上线必需，当前阻塞项）**
@@ -381,9 +392,9 @@ Windows 默认信任：
 外部流程（购 EV 证书 + Dev Center 认证）约 **2–6 周**，是上线关键路径阻塞项
 （对应 buglist RB-02）。完成前，驱动仅能在 test-signing 测试机加载。
 
-> 部署校验提示：`deploy.ps1` 的 `[4/6]` 在 `sc start` 返回
-> `0xC0000428`（未签名/证书不受信）时会提示本小节，按 A/B/C 选择对应路径重签或
-> 切换加载策略即可。
+> 部署校验提示：`deploy.ps1` 的 `[3/6]` 在 `pnputil` 失败时**会用红色 banner 报警**
+> （setupapi 校验不受 testsigning 豁免），并自动回退到 legacy 注册；`[4/6]` 若
+> `sc start` 仍失败，按本小节 A/B/C 选择对应路径（重签 / 确认 testsigning 已开并重启 / 用 EV 证书）。
 
 ### 验证部署
 
