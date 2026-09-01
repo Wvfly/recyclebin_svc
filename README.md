@@ -17,7 +17,7 @@
 ![Architecture](https://img.shields.io/badge/architecture-single--writer%20SQLite-blueviolet)
 ![Tests](https://img.shields.io/badge/contract%20tests-19%2F19%20pass-brightgreen)
 ![Observability](https://img.shields.io/badge/driver%20stats-live-brightgreen)
-![Signing](https://img.shields.io/badge/driver%20signing-required-red)
+![Signing](https://img.shields.io/badge/driver%20signing-test%20cert%20ready-orange)
 
 </div>
 
@@ -32,7 +32,8 @@
 >
 > | 项 | 状态 | 说明 |
 > |---|---|---|
-> | **驱动签名** | ❌ 阻塞 | 驱动当前**未签名**，需 `testsigning` 才能加载。生产环境须办理 EV 证书 + Dev Center 认证（2–6 周外部流程） |
+> | **驱动签名（开发/测试）** | ✅ 已支持 | 构建脚本 `build_all.cmd` 默认用项目测试证书 `F57B8149…` 自动签名；无 signtool/证书时仅告警并回落到 `testsigning` 模式 |
+> | **驱动签名（生产）** | ❌ 阻塞 | 生产环境须经 **EV 证书 + Dev Center attestation / WHQL** 认证（2–6 周外部流程），项目测试证书不满足等保/基线 |
 > | **内核路径验证** | ⚠️ 未充分 | 驱动侧修复仅经**编译与契约验证**，尚未在配备 Driver Verifier 的测试机上做删除压测 |
 >
 > 详见 [生产就绪度](#生产就绪度) 与 [docs/buglist.md](docs/buglist.md)。
@@ -311,7 +312,7 @@ target\Release\
 | **[1/6]** | 用 `QueryDosDevice` 把 `D:\Share` 转成 NT 形式 `\Device\HarddiskVolumeN\Share`，分别写入驱动参数键和用户态配置键 |
 | **[2/6]** | 创建 `StoreRoot`（如 `D:\RBStore`），加 `HIDDEN\|SYSTEM` 属性，共享用户不可见 |
 | **[3/6]** | 拷贝 sys 到 `system32\drivers\`，`pnputil /add-driver ... /install` |
-| **[4/6]** | `sc start rbminiflt`，检查退出码并在失败时提示签名/测试模式 |
+| **[4/6]** | `sc start rbminiflt`；加载失败按退出码区分：**0xC0000428（未签名）**→ 见下文「驱动签名」小节，切换 test-signing 或改用生产证书重签 |
 | **[5/6]** | `sc create RecycleBinSvc ... obj= LocalSystem start= auto` 并启动 |
 | **[6/6]** | 安装管理 API `rbapi.exe`（可选，未编译则跳过） |
 
@@ -334,6 +335,55 @@ powershell -ExecutionPolicy Bypass -File .\deploy.ps1
 
 在部署包内运行时，`deploy.ps1` 优先使用**自身所在目录**的二进制，
 无需访问源码树。
+
+### 驱动签名
+
+驱动能否加载取决于它是**用哪类证书签的**以及目标机的加载策略。
+
+**A. 项目测试证书（开发/测试环境，默认）**
+
+`build_all.cmd` 在链接驱动后自动调用 signtool，用项目签名证书
+（`F57B8149…`，见 `build_all.cmd` 顶部 `CERT_THUMBPRINT`）进行**嵌入式签名**。
+证书导出密码通过环境变量 `RB_CERT_PWD` 传入：
+
+```cmd
+set RB_CERT_PWD=your-cert-password
+build_all.cmd Release          # 默认签名
+build_all.cmd Release nosign   # 显式跳过签名（仅当需纯 test-signing 调试）
+```
+
+- 该证书为**自签测试证书**，仅受「测试签名模式」信任，不满足生产基线/等保。
+- 若构建机**缺 signtool 或证书不可用**，`build_all.cmd` 不会中断，仅打印
+  `WARNING: signtool missing or cert unavailable, driver left unsigned` 并回落到
+  未签名产物——此时部署机必须开启 test-signing（见 B）才能加载。
+
+**B. 测试签名模式（test-signing，仅测试机）**
+
+无生产证书、且需要加载未签名/测试证书签名的驱动时，目标机开启测试模式：
+
+```cmd
+# 需管理员，重启生效
+bcdedit /set testsigning on
+# 关闭：
+bcdedit /set testsigning off
+```
+
+> 生产服务器**严禁**长期开启 test-signing（违反基线，且会加载任意测试签名驱动）。
+
+**C. 生产证书（上线必需，当前阻塞项）**
+
+生产部署须改用 **EV 代码签名证书**并完成以下任一认证，证书链才会被普通
+Windows 默认信任：
+
+- ** attestation signing**（Dev Center 跨平台驱动 attestation，最快路径，无需 HLK 实验室）；
+- ** WHQL / HLK 认证**（进入 Windows Update 目录，周期更长）。
+
+外部流程（购 EV 证书 + Dev Center 认证）约 **2–6 周**，是上线关键路径阻塞项
+（对应 buglist RB-02）。完成前，驱动仅能在 test-signing 测试机加载。
+
+> 部署校验提示：`deploy.ps1` 的 `[4/6]` 在 `sc start` 返回
+> `0xC0000428`（未签名/证书不受信）时会提示本小节，按 A/B/C 选择对应路径重签或
+> 切换加载策略即可。
 
 ### 验证部署
 
@@ -618,7 +668,9 @@ Get-WinEvent -LogName Application -Source RecycleBin* -MaxEvents 50
 1. **StoreRoot 必须与被保护共享同卷** — 内核 `FileRenameInformation` 不支持跨卷。
    保护多卷需分别部署或做驱动改造（"拷贝 + 删源"，复杂度与风险显著上升）。
 2. **跨卷还原不支持** — 还原同样依赖同卷 rename。
-3. **驱动需签名** — 生产环境应使用 EV 证书，测试模式仅限验证（2–6 周外部流程）。
+3. **驱动需签名** — 构建默认用项目测试证书（`F57B8149…`）自动签名，但仅受
+   **test-signing** 信任；生产环境须改用 **EV 证书 + Dev Center attestation/WHQL** 认证
+   （2–6 周外部流程，对应 [RB-02](docs/buglist.md)）。
 4. **驱动参数不支持热加载** — `ProtectedPaths`、`FailClosed` 改动需重启驱动
    （用户态配置可热加载，见[配置参考](#配置热加载)）。
 5. **符号链接 / 硬链接 / 重解析点未特殊处理** — 按普通文件重定向。
@@ -743,13 +795,15 @@ db\schema.sql  ──gen_schema.ps1──▶  service_c\schema_sql.h  ──编�
 
 | 编号 | 事项 | 阻塞原因 |
 |---|---|---|
-| RB-02 | **驱动签名** | 外部流程：EV 证书 + Dev Center 认证，2–6 周 |
+| RB-02 | **驱动签名（生产）** | 测试证书已可用（`build_all.cmd` 默认签），但上线需 **EV 证书 + Dev Center attestation/WHQL**，外部流程 2–6 周 |
 | RB-03 | Pre 回调重构 | 需测试机 + Driver Verifier 验证，风险高，暂缓 |
 | RB-12 | 驱动参数热加载 | 需重构驱动配置加载路径 |
 | RB-14 ~ RB-17 | 监控指标导出、测试补齐、Token 与审计、`$I` 格式 | 待排期，详见 [docs/buglist.md](docs/buglist.md) |
+| RB-31 / RB-32 | 删除 IRP 拦截盲区（`cmd del` / POSIX_SEMANTICS 绕过） | 真实数据丢失路径，修复验收见 [docs/buglist.md](docs/buglist.md) |
 
-> **建议**：RB-02 应尽早启动 —— 它是纯外部依赖，且 HLK 测试套件会反向暴露
-> 驱动实现缺陷。
+> **建议**：RB-02 应尽早启动 —— 它是纯外部依赖，且 attestation/HLK 测试会反向暴露
+> 驱动实现缺陷（如 RB-31/RB-32 的拦截覆盖不全）。测试阶段可用项目测试证书 +
+> `bcdedit /set testsigning on` 先行验证功能，但不准入生产。
 
 ---
 
@@ -759,7 +813,7 @@ db\schema.sql  ──gen_schema.ps1──▶  service_c\schema_sql.h  ──编�
 |---|---|
 | [docs/design.md](docs/design.md) | 设计说明（范式选型 / 通信模型 / 限制） |
 | [docs/bugfix-report.md](docs/bugfix-report.md) | 初版 Python 实现的历史修复记录（B1–B7） |
-| [docs/buglist.md](docs/buglist.md) | 现存问题清单与整改排期（RB-01 ~ RB-28） |
+| [docs/buglist.md](docs/buglist.md) | 现存问题清单与整改排期（RB-01 ~ RB-32，含删除拦截盲区 RB-31/RB-32） |
 | [docs/bugfix-production.md](docs/bugfix-production.md) | 生产就绪度修复记录（累计 15 项，含蓝屏实测 RB-27 / RB-28） |
 
 ---
