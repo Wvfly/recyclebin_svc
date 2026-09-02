@@ -129,6 +129,24 @@
 /* Reconnect backoff (ms) */
 #define RBSVC_RECONNECT_MS   5000
 
+/* RB-34/RB-34b: how long to wait for an overlapped FilterGetMessage to
+ * complete before concluding the driver is gone (ms).
+ *
+ * The minifilter communication port is strictly ONE-WAY from the driver's
+ * point of view: the driver pushes notifications and the service only reads
+ * them overlapped. The service NEVER calls FilterSendMessage to probe the
+ * driver -- that call is synchronous with no timeout, and if the driver is
+ * unloaded mid-flight it never returns, wedging the calling thread forever
+ * (proven by the 2026-09-02 dump: worker 0x5adc stuck in FilterSendMessage,
+ * c->Done never signalled, port thread 0x4794 then stuck behind it).
+ *
+ * "Driver alive" is therefore derived purely from g_LastMsgTick -- the time of
+ * the most recent notification actually received -- not from any active query.
+ * On read timeout we treat the port as dead and close it outright; we do NOT
+ * call CancelIoEx, because it cannot cancel an IRP whose kernel endpoint (the
+ * driver) has already been unloaded. */
+#define RBSVC_PORT_READ_MS   5000
+
 /* WTS info class not in all SDK headers */
 #ifndef WTSUserSid
 #define WTSUserSid 16

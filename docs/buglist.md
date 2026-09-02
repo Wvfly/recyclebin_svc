@@ -2,9 +2,12 @@
 
 - 项目：Windows 文件共享回收站 (RecycleBin for SMB)
 - 范围：内核 Mini-Filter 驱动 (`rbminiflt`) + C 核心服务 (`rbservice`) + Go 管理 API (`rbapi`) + 数据模型 + 部署链路
-- 日期：2026-08-31（2026-09-01 增补 RB-31/RB-32 拦截盲区）
-- 条目：RB-01 ~ RB-32（含 5 项大目录树删除场景专项问题、2 项删除拦截盲区）
-- 评估结论：**核心 P0 阻塞已消除，仍不具备生产部署条件**（RB-31/RB-32 删除拦截盲区为真实数据丢失路径，修复前严禁上线）
+- 日期：2026-08-31（2026-09-01 增补 RB-31/RB-32 拦截盲区；2026-09-02 增补 RB-33/RB-34 并实测坐实）
+- 条目：RB-01 ~ RB-34（含 5 项大目录树删除场景专项问题、3 项删除拦截盲区、2 项端口线程死锁相关：RB-34 取消等待 + RB-34b 同步采样）
+- 评估结论：**核心 P0 阻塞已消除，仍不具备生产部署条件**
+  （**RB-33 为 Explorer / 资源管理器删除的确定性盲区，2026-09-02 实测坐实**：驱动只挂钩
+  `IRP_MJ_SET_INFORMATION`，`FILE_DELETE_ON_CLOSE` 路径完全无拦截，用户交互式删除 100% 真删。
+  修复并经 Driver Verifier 验证前严禁上线）
 
 > 与 `bugfix-report.md` 的关系
 >
@@ -18,6 +21,9 @@
 > RB-31、RB-32 为 2026-09-01 **实测拦截盲区**新增（详见第六章"可靠性补强"末尾）：
 > 维度 B 用例 S-B4（`cmd /c del`）与 S-B13（POSIX_SEMANTICS）在真实 SMB 拦截链路下
 > 仍 FAIL，证明文件删除路径存在未覆盖的 IRP 子类，受保护文件可绕过回收站真删。
+> **2026-09-02 复核修正**：S-B4 的 FAIL 系当时部署的 `.sys` 为 8/31 旧产物所致；
+> 正确部署 9/01 产物后，`SET_INFORMATION` 类删除（含 `cmd /c del` 同类路径）实测拦截正常，
+> RB-31 降级为"待用正确产物复测验收"（详见 RB-31 条目内的状态修正）。
 > **RB-22 虽标记"已修复"，但 RB-32 实测显示该修复在部署产物中未生效（疑似构建产物
 > 未更新或未覆盖 `cmd` 删除 IRP），两缺陷一并登记、相互印证。**
 > RB-23 为通信端口生命周期问题（client port use-after-free，蓝屏风险），见第六章。
@@ -29,6 +35,13 @@
 > RB-30 为 2026-08-31 **实测还原验证**新增：restore 用 `MoveFileExW` 从 `$Recycle.Bin` 移回时
 > **保留回收站的 `Hidden+System` 属性**，还原后的目录/文件在 Explorer 与 SMB 客户端不可见
 > （用户误以为还原失败）。同日已修复并实测验证（还原后清除属性位）。详见第六章。
+> RB-33、RB-34 为 2026-09-02 **部署与拦截链路实测**新增（详见第六章"六之三"）：
+> **RB-33 是 Explorer / 资源管理器删除（`FILE_DELETE_ON_CLOSE`）的确定性盲区**，已用
+> 同一共享目录的对照实验坐实（SET_INFORMATION 拦得住、DELETE_ON_CLOSE 拦不住）；
+> 这是用户交互式删除的主力路径，意味着**保护对日常操作实际无效**，级别按 P0 对待。
+> **RB-34 是 C 服务端口线程的无限等待死锁**：驱动每次卸载/重载都会把
+> `rbservice.exe` 的端口线程永久挂死，表现为 `/health` 的 `driver` 变 `null`
+> （假性"驱动掉线"），服务日志也一并停止，是本次排查过程中最大的误导源。
 
 ---
 
@@ -66,12 +79,17 @@
 | RB-28 | **P0** | 驱动 | 卸载路径把 `PsCreateSystemThread` 返回的**句柄**当内核对象指针传给 `KeWaitForSingleObject` → 解引用无效地址 → **蓝屏 0xA** | **已修复** |
 | RB-29 | **P1** | 驱动/部署 | 驱动加载后对已挂载卷的 attach/过滤生效存在窗口（17:31 加载、17:41 才 attach E:），期间删除无保护、文件被永久删除 | **已修复** |
 | RB-30 | **P1** | 服务 | 还原后目录/文件保留回收站 `Hidden+System` 属性，Explorer/SMB 客户端不可见（实测） | **已修复** |
-| RB-31 | **P1** | 驱动 | `cmd /c del` 走的删除 IRP 路径未被拦截，受保护文件被静默真删（实测，RB-22 类盲区复现） | **待修** |
-| RB-32 | **P1** | 驱动 | `FileDispositionInformationEx` + `POSIX_SEMANTICS` 仍被绕过，整树/单文件真删（实测，RB-22 修复未生效） | **待修** |
+| RB-31 | **P2** | 驱动 | `cmd /c del` 删除 IRP 未被拦截（2026-09-02 复核：系部署旧 `.sys` 所致，`SET_INFORMATION` 路径实测已拦截） | **待验收**（用正确产物复测 S-B4） |
+| RB-32 | **P1** | 驱动 | `FileDispositionInformationEx` + `POSIX_SEMANTICS` 仍被绕过，整树/单文件真删 | **待修**（RB-22 源码已修、需用正确产物复测） |
+| RB-33 | **P0** | 驱动 | **`FILE_DELETE_ON_CLOSE`（Explorer / 资源管理器删除）完全无拦截**，受保护文件 100% 真删（2026-09-02 对照实验坐实） | **待修** |
+| RB-34 | **P1** | 服务 | 驱动卸载/重载后端口线程双向死锁（端口线程同步等 `FilterSendMessage` 完成事件 + worker 卡在 `FilterSendMessage`，`CancelIoEx` 无效），C 服务静默、计数停采样 → 假性"驱动掉线" | **已修复**（2026-09-02 mini-dump 实证后二次加固：单向 overlapped 只读 + `g_LastMsgTick` 被动存活判定 + 关闭句柄唤醒 pending 发送，编译通过、契约 10/10） |
 
 > RB-18 ~ RB-22 为**大目录树删除场景**专项问题（详见第五章）。
 > 该场景在单文件删除时不暴露，删除含大量子目录/文件的目录树时集中显现。
 > RB-23 为通信端口生命周期问题（详见第六章），服务重启/崩溃时高概率触发。
+>
+> **RB-33 是用户日常删除的主力路径**（资源管理器按 Delete / 右键删除），
+> 拦截盲区直接等价于"保护对交互式操作无效"，故虽为新增条目，优先级等同 P0。
 
 ---
 
@@ -1102,7 +1120,16 @@ if (attrs != INVALID_FILE_ATTRIBUTES &&
 | **蓝屏实测** | 已完成 | ~~RB-27 消息回调参数错位~~、~~RB-28 卸载句柄当指针~~ **已修复**（已编译 + 反汇编核对，待部署到目标机实测） |
 | **部署验证** | 已完成 | ~~RB-29 attach 就绪窗口~~ **已修复**（ProtectedCount 暴露 + [7/6] 冒烟验证 + 签名驱动部署实测通过）；~~RB-17~~ **误判撤回**（`$I` 实为 Explorer 原生格式，回收站实测可见） |
 | **还原可见性** | 已完成 | ~~RB-30 还原后清除 `Hidden/System` 属性~~ **已修复**（`RestoreItemById` 读-改-写清属性位，部署实测：还原后 `Directory`、UNC 可见、内容完整） |
-| **拦截盲区** | 待启动 | **RB-31 `cmd /c del` 删除 IRP 未覆盖**、**RB-32 POSIX_SEMANTICS 绕过点（RB-22 修复未生效）**：2026-09-01 实测 S-B4/S-B13 FAIL，受保护文件可真删。需先核对部署 `.sys` SHA256 是否含 RB-22 修复，再补齐所有删除类 IRP 拦截 |
+| **拦截盲区** | 待启动 | **RB-31 `cmd /c del` 删除 IRP 未覆盖**、**RB-32 POSIX_SEMANTICS 绕过点（RB-22 修复未生效）**：2026-09-01 实测 S-B4/S-B13 FAIL，受保护文件可真删。需先核对部署 `.sys` SHA256 是否含 RB-22 修复，再补齐所有删除类 IRP 拦截。**2026-09-02 复核：系部署旧 `.sys` 所致，需以正确产物复测验收** |
+| **Explorer 删除盲区** | **待启动（最高优先）** | **RB-33 `FILE_DELETE_ON_CLOSE` 完全无拦截**：2026-09-02 对照实验坐实，资源管理器删除 100% 真删，是用户日常删除主力路径。需新增 `IRP_MJ_CLEANUP` 钩子 + `DeletePending` 判定 + rename 后清除 disposition，**必须经 Driver Verifier 测试机验证**方可部署 |
+| **端口线程死锁** | 已完成（部署待实测） | **RB-34 驱动重载后端口线程双向死锁**：dump 实证端口线程同步等 `FilterSendMessage` 完成事件、worker 卡在 `FilterSendMessage` 本身（`CancelIoEx` 对已卸载驱动端口 IRP 无效）。**2026-09-02 11:00 二次加固**：单向 overlapped 只读模型 + `g_LastMsgTick` 被动存活判定 + 关闭句柄唤醒 pending 发送（取代无效的 orphan 移交）。编译通过、契约测试 10/10。待部署后按条目内"验证方法"实测 |
+| **部署一致性校验** | 待启动（建议并入 RB-15） | 2026 年内已发生 **4 次**"源码已修、产物未更新"（RB-22 / RB-27 / RB-28 / RB-31）。`build_all.cmd` 仅产出到源码树，不覆盖 `target\Release\` 与 `System32\drivers\`，且无校验环节。建议：编译后自动比对部署路径 `.sys` 与构建产物 SHA256，不一致即中止告警 |
+
+> **当前最高优先级排序（2026-09-02）**：
+> **RB-34（低风险，先修，恢复可观测性）→ RB-33（高风险，需测试机，是唯一真正的数据丢失路径）**
+> → RB-32（用正确产物复测）→ 部署一致性校验（防止同类问题再次误导排查）。
+>
+> 注意：RB-33 修复**无法找回**此前经资源管理器删除的文件——那些数据已永久丢失。
 
 > 建议：在 RB-01、RB-02、RB-04 完成前，**不要开展任何生产试点**。
 >
@@ -1159,6 +1186,30 @@ if (attrs != INVALID_FILE_ATTRIBUTES &&
 **验证方法**：`python test\l5_e2e\test_l5_user_scenarios.py` 中 `S-B4` 由 FAIL 转 PASS，
 且 `E:\RBStore` 出现对应 staging 条目、源文件可还原。
 
+**状态修正（2026-09-02 实测复核）**
+
+来源：2026-09-02 在正确部署 9/01 构建产物（`rbminiflt.sys`，25,848 B，时间戳
+`2026-09-01 18:20:04`）后，于受保护共享 `E:\tmp\share`（`share => E:\tmp\share`）
+内做的对照实验。
+
+结论：`Remove-Item` / `del` 一类走 `IRP_MJ_SET_INFORMATION` 的删除**实测拦截正常**——
+同一时刻、同一目录下的对照实验中，该类删除使驱动计数器 `intercepts` 由 2 增至 3，
+DB 生成 `id=9797 status=landed` 条目，回收站产生对应 `$I` / `$R` 文件对。
+
+因此 S-B4 在 2026-09-01 的 FAIL **并非驱动拦截逻辑缺失**，而是当时
+`C:\Windows\System32\drivers\rbminiflt.sys` 仍是 2026-08-31 18:25:17 的旧产物
+（`git reset --hard c6e8dff6` 后重新编译，但驱动二进制未覆盖部署）。
+这是第三次"源码已修、产物未更新"类事件（另见 RB-22 / RB-27 / RB-28）。
+
+处置：本条目由"待修"降级为"待验收"——无需改动拦截逻辑，
+须以正确产物重跑 S-B4 验收。**注意 RB-33 表明本条目即便验收通过，
+也不代表删除拦截已全覆盖。**
+
+**流程缺陷（建议一并纳入 RB-15 工程规范）**：`build_all.cmd` 只产出到源码树，
+不会覆盖 SCM 实际加载的 `target\Release\` 与 `System32\drivers\`，
+且**无任何校验环节**比对运行产物与构建产物的一致性。
+建议：编译后自动比对部署路径 `.sys` 与构建产物的 SHA256，不一致即中止并告警。
+
 ---
 
 ### RB-32 `FileDispositionInformationEx` + `POSIX_SEMANTICS` 仍被绕过（RB-22 修复未生效）
@@ -1203,3 +1254,207 @@ WSL、Git for Windows、rsync、某些备份工具均可绕过回收站真删整
 
 **关联**：与 RB-22 同源；与 RB-31 互补（二者分别覆盖不同删除 IRP 触发面，
 共同构成"删除拦截全覆盖"验收）。
+
+**状态补充（2026-09-02）**：RB-31 的复核已证实"S-B4 FAIL"系部署旧 `.sys` 所致，
+本条目（S-B13）高度同源，**须在正确产物下重新复测后再下结论**；
+在未复测前不得假定 RB-22 的源码修复已生效。另注意 RB-33 揭示的盲区
+与 `POSIX_SEMANTICS` 无关，是独立的一条删除路径。
+
+---
+
+## 六之三、2026-09-02 部署与拦截链路实测（RB-33 ~ RB-34）
+
+> 本节为 2026-09-02 在目标机（`DESKTOP-Q1NM7CS`）上做的端到端实测记录。
+> 起因是用户报告"上个版本功能正常、当前变更后失效"，以及"驱动掉线"。
+> 排查过程中先后排除的假设（均未成立，记录以避免重复排查）：
+> 卷号漂移（`E:` 始终为 `HarddiskVolume4`）、实例未 attach（`fltmc` 确认已 attach
+> E: / C: / D:，高度 370030）、受保护前缀形式错误（`HarddiskVolume4` 与
+> `Volume{GUID}` 两种写法均试过）、本地 vs 远程差异（本地与 UNC 行为一致）、
+> 源码回归（`git reset --hard c6e8dff6` 后问题依旧）。
+> **最终定位为两项独立缺陷**：驱动删除路径覆盖不全（RB-33）与端口线程死锁（RB-34），
+> 叠加一次部署遗漏（驱动 `.sys` 未覆盖）。
+
+### RB-33 `FILE_DELETE_ON_CLOSE`（Explorer 删除）完全无拦截，受保护文件 100% 真删
+
+- **模块**：driver
+- **级别**：**P0**（实为数据丢失路径，且是用户日常删除的主力路径）
+- **位置**：`driver/rbminiflt.c` `G_Callbacks` / `RbfPreSetInfo`
+- **状态**：**待修**
+- **来源**：2026-09-02 用户报告（`\\10.88.36.171\share\新建文件夹\get_session.exe`
+  经资源管理器删除后 `/items` 无记录）+ 同一目录下的对照实验
+
+**问题**
+
+驱动的操作回调表**只注册了 `IRP_MJ_SET_INFORMATION`**：
+
+```c
+const FLT_OPERATION_REGISTRATION G_Callbacks[] = {
+    { IRP_MJ_SET_INFORMATION, 0, RbfPreSetInfo, NULL },
+    { IRP_MJ_OPERATION_END }
+};
+```
+
+Windows 有**两条**独立的删除路径：
+
+| 删除方式 | 内核路径 | 本驱动是否覆盖 |
+|---|---|---|
+| `DeleteFileW` / `del` / `[IO.File]::Delete()` / `Remove-Item` | `IRP_MJ_SET_INFORMATION`（`FileDispositionInformation` / `...Ex`） | ✅ 覆盖 |
+| **资源管理器删除 / 右键删除 / Shell `SHFileOperation`** | 打开时带 `FILE_DELETE_ON_CLOSE` → `IRP_MJ_CREATE` + **`IRP_MJ_CLEANUP`** 时按 `DeletePending` 执行 | ❌ **完全未覆盖** |
+
+第二条路径**根本不产生 `IRP_MJ_SET_INFORMATION`**，因此 `RbfPreSetInfo` 永远不会被调用。
+
+**实测证据（2026-09-02 09:53，同一共享目录 `E:\tmp\share\__smoke__\doc`，同一驱动实例）**
+
+| 用例 | 删除方式 | 驱动计数器变化 | 结果 |
+|---|---|---|---|
+| A | `Remove-Item`（UNC 路径） | `intercepts` **2 → 3** | ✅ 拦截，DB `id=9797` `status=landed`，回收站生成 `$I` / `$R` |
+| B | `CreateFile(FILE_DELETE_ON_CLOSE)` + `CloseHandle`（UNC 路径，模拟 Explorer） | `intercepts` **保持 3（无增长）** | ❌ **未拦截**，文件被真删（`Test-Path` = `False`），DB 无记录、回收站无 `$I` |
+
+补充证据：用户报告的 `get_session.exe` 删除后，`/stats` 显示
+`intercepts=2 / notify_sent=2`（仅含我此前的两次测试），
+`E:\tmp\share` 递归搜索 `get_session*` 无结果 → **该文件已被永久删除，不可恢复**。
+
+**影响**
+
+1. **保护对交互式操作实际无效**：资源管理器按 Delete / 右键删除是 Windows 用户
+   最主流的删除方式，该路径 100% 真删，不产生任何记录、计数或告警。
+2. **静默失败**：与 RB-04 的 fail-open 同类，但更彻底——连"曾发生过删除"这件事
+   都不留痕迹，运维从 `/health` 看 `rename_fail=0`、`delete_denied=0` 会误判系统健康。
+3. **历史数据无法找回**：此前经资源管理器删除的所有受保护文件均已永久丢失，
+   不存在任何副本或元数据，本条目修复**无法回溯**。
+4. 与 RB-31 / RB-32 的关系：那两条是 `SET_INFORMATION` 内部的子类覆盖问题
+   （已修复或待复测），**本条目是完全不同的另一条 IRP 路径**，互不覆盖。
+
+**修复方案（建议）**
+
+在驱动增加 `IRP_MJ_CLEANUP` 前置回调，与现有 `SET_INFORMATION` 路径共用同一套
+"路径匹配 → 取 SID → 预留槽位 → rename 到 staging → 入队通知"逻辑：
+
+1. `PostCreate` 中对以 `FILE_DELETE_ON_CLOSE` 打开的受保护文件建立流上下文打标；
+2. `PreCleanup` 中检查 `FltObjects->FileObject->DeletePending`；
+3. 命中受保护前缀时执行 rename 到 staging；
+4. **关键步骤（易漏）**：rename 后必须再以
+   `FltSetInformationFile(FileDispositionInformation, DeleteFile = FALSE)` 清除删除标志。
+   NTFS 的 delete-on-close 是**基于 FCB 而非文件名**的——仅 rename 不改 FCB，
+   cleanup 时文件仍会被删除，表现为"文件进了 staging 却又消失"。
+5. 通知用户态入库（复用 `RbfQueueNotify`）。
+
+**风险与验证要求**
+
+- 这是内核态改动，rename 与清除 disposition 的**时序非常微妙**，
+  Pre 回调内发起 I/O 本身即命中 RB-03 所述的高危模式。
+- 目标机 `C:\WINDOWS\Minidump` 已存在多份 `BlueScreen` dump
+  （`083126-38984-01.dmp`、`083126-40140-01.dmp`、`083126-26703-01.dmp`），
+  说明该机器上跑未验证的 minifilter 改动风险不低。
+- **必须**在开了 **Driver Verifier**（含 Deadlock Detection / Special Pool /
+  I/O Verification）的测试机上验证后再部署到本机，禁止直接上生产。
+
+**验证方法**
+
+1. 对照实验：同一目录下分别用 `Remove-Item` 与 `CreateFile(FILE_DELETE_ON_CLOSE)`
+   删除，两者 `intercepts` 均增长、DB 均生成 `landed` 条目；
+2. 真机交互：资源管理器删除 UNC 共享文件后 `/items` 立即出现该条目、可还原；
+3. `fltmc instances` 无异常、`notify_dropped` 不增长、无蓝屏。
+
+---
+
+### RB-34 驱动卸载/重载后端口线程永久死锁，C 服务静默 → 假性"驱动掉线"
+
+- **模块**：service_c
+- **级别**：P1（不丢数据，但服务静默 + 可观测性完全失效，是本次排查最大误导源）
+- **位置**：`service_c/rbport.c` `PortThreadProc` / `PortQueryStats`；`service_c/rbsvc.h`
+- **状态**：**已修复（2026-09-02 实施，2026-09-02 mini-dump 实证根因后于 11:00 二次加固）**
+- **来源**：2026-09-02 排查"驱动掉线"时定位；**11:00 抓取 `rbservice_9736.dmp` 后彻底坐实根因**
+
+**问题（dump 实证，非推断）**
+
+2026-09-02 11:00 在 C 服务已冻结（pid=9736，驱动已重载但 `/health` 仍 `driver=null`、
+零 RB-34b 日志）状态下抓全量 user-dump，线程栈如下：
+
+| 线程 | 栈顶（已符号化） | 含义 |
+|---|---|---|
+| 0x4794（端口线程 / SCM 派生） | `rbservice+0x1cb9` → `WaitForSingleObject(hMsgEvent, 5000)` | overlapped `FilterGetMessage` 等待驱动回消息 |
+| 0x5adc（采样 worker） | `rbservice+0xb87c` → `WaitForSingleObject(c->Done, 3000)` | 等 `FilterSendMessage` 的完成事件，`Done` **永不被置位** |
+| 0x2dd8 / 0x5970 | `rbservice+0x1582/0x1512` | 普通业务等待，正常 |
+
+**因果链（dump 唯一解释）**：
+
+1. 端口线程每 `RBSVC_STATS_INTERVAL` 在**自身主循环内**调 `PortSampleStats()` →
+   `PortQueryStats()`，后者在 worker 上发 `FilterSendMessage` 并**同步等待 `c->Done`**；
+2. 驱动在采样往返途中被卸载（或取消读之后端口半死）→ `FilterSendMessage` **永不返回**
+   → worker 卡住、`c->Done` 永不 signal；
+3. 端口线程自身也被 `WaitForSingleObject(c->Done, 3000)` 阻塞，于是**端口线程与 worker
+   双向死锁**：端口线程到不了 5s `hMsgEvent` 超时、到不了 `CancelIoEx`、到不了重连；
+4. `CancelIoEx` 对"已发送到内核、驱动侧已卸载"的通讯端口 IRP **根本无效**——这是首版
+   RB-34 修补也是死代码的根本原因；worker 的 `FilterSendMessage` 只有关闭端口句柄才能
+   被内核 cancel 唤醒，而首版 `PortCloseLocked` 因 `g_SendInFlight != 0` 把 `g_Port`
+   移交给 `g_OrphanPort` **不关句柄**，于是 worker 永远回不来。
+
+=> 全程零日志（连 RB-34 的重连告警都到不了）、`driver=null`。
+
+**这是架构级缺陷，不是两处独立超时问题**：服务把"`/health` 的 driver 是否存活"建立在了
+**主动向已死端口发 `FilterSendMessage`**之上，一旦 driver 卸载这个主动探测本身永久卡死，
+整条自恢复链（连重连）随之雪崩。
+
+**修复（2026-09-02 11:00 二次加固，纯用户态）**
+
+核心原则：**minifilter 通讯端口对用户态是严格单向的——驱动主动推通知、服务只 overlapped
+收；服务绝不在端口线程里发 `FilterSendMessage` 探测；driver 存活完全由"最近收到通知的
+时间戳 `g_LastMsgTick`"推导，而非任何主动查询。**
+
+1. `service_c/rbsvc.h`：删除 `RBSVC_CANCEL_WAIT_MS` / `RBSVC_SEND_WAIT_MS`，改为单一
+   `RBSVC_PORT_READ_MS 5000`（overlapped `FilterGetMessage` 等待上限）；保留
+   `RBSVC_STATS_INTERVAL` / `RBSVC_STATS_STALE_SEC` / `RBSVC_RECONNECT_MS`。
+
+2. **端口线程只读不写**：`FilterGetMessage` overlapped 发出后只 `WaitForSingleObject(
+   hMsgEvent, RBSVC_PORT_READ_MS)`。读取 5s 超时**不关端口**（驱动可能只是空闲），
+   仅 fire-and-forget 触发一次采样后 `continue`；`FilterGetMessage` **真正失败**
+   （`GetOverlappedResult` 报非 `OPERATION_ABORTED` 错，或首调非 `IO_PENDING`）才
+   `connected=0` + 关闭端口 + 重连。**彻底移除 `CancelIoEx` 依赖**。
+
+3. **`g_LastMsgTick`**：每次成功收通知或连上端口即 `g_LastMsgTick = time(NULL)`（持锁写）。
+   `/health` 侧按 `now - g_LastMsgTick < RBSVC_STATS_STALE_SEC` 判定 driver 存活，**完全
+   不碰端口**。driver 卸载时通知流停 → `g_LastMsgTick` 变旧 → 自然判定 offline；
+   驱动重载后端口线程 5s 内重连、首条通知即刷新时间戳 → 自动恢复。
+
+4. **采样改为 fire-and-forget、永不在端口线程同步等待**：`PortSampleStats()` 调
+   `PortQueryStats()` 但**不读其结果**（端口线程只负责"触发"）。`PortQueryStats()` 的
+   worker 仍在独立线程发 `FilterSendMessage`，caller `WaitForSingleObject(c->Done,
+   RBSVC_PORT_READ_MS)` 超时即**放弃本次采样、释放 caller 引用即返回**，绝不阻塞端口线程。
+
+5. **句柄安全改为"直接关闭"**：`PortCloseLocked()` **无条件 `CloseHandle(g_Port)`**
+   （移除 `g_OrphanPort` 移交）。这是关键修正——关闭端口句柄会让内核 cancel 掉该句柄上
+   仍 pending 的 `FilterSendMessage` IRP，worker 以 `ERROR_OPERATION_ABORTED` 返回后
+   自然退出、自行关闭其持有的句柄副本，不再有悬空 IRP。worker 持有的句柄副本是其
+   **发起 `FilterSendMessage` 时捕获的 `g_Port` 值**，与端口线程后续重开的新句柄互不干扰。
+
+> 注：stats（`RBF_CMD_QUERY_STATS`）采样作为"尽力而为"的观测保留，driver 卸载时超时丢弃，
+> 不影响 `/health` 的存活判定（后者走 `g_LastMsgTick`）。若需无通知周期也能探测，应在
+> **驱动侧**周期推送 keepalive 通知，而非用户态反向 `FilterSendMessage`。
+
+**构建验证（2026-09-02 11:xx 二次加固后）**
+
+| 验证项 | 结果 |
+|---|---|
+| `service_c\build.cmd Release`（在 `service_c\` 目录内） | ✅ 通过，`rbport.c` 无警告（`cl /W3`） |
+| `python db\verify_c_contract.py` | ✅ **10/10 通过**（契约未因重构变化） |
+
+> 未重编驱动：本修复纯用户态，部署时**只替换 `rbservice.exe`** 即可（build.cmd 须于
+> `service_c\` 目录运行，否则 `..\db\gen_schema.ps1` 相对路径解析错误）。
+
+**验证方法（覆盖二次加固）**
+
+1. 服务运行中执行 `net stop rbminiflt; net start rbminiflt`（**不重启 C 服务**）；
+2. 观察 Application 日志：应出现 `FilterGetMessage failed (hr=...) reconnecting`（或
+   `cannot connect to ... retrying`）后重新 `connected to kernel port \RecycleBinPort`；
+   **不再**依赖 `cancelling parked read` / `QUERY_STATS stalled` 这类日志（已移除该路径）；
+3. `/health` 的 `driver` 字段应在 **30s 内自动恢复**非 `null`，`age_sec` 回落至个位数；
+4. 删除测试文件，`intercepts` 正常增长；
+5. **dump 复核（如仍怀疑）**：驱动重载后若仍卡死，按前文命令抓 dump，`~*kvn` 应见端口线程
+   停在 `WaitForSingleObject(hMsgEvent, 5000)` 且能正常超时循环，worker 不再卡死在 `c->Done`。
+
+**结论**
+
+RB-34 的真正根因是**"用户态主动 `FilterSendMessage` 探测 + 端口线程同步等待其结果"构成的
+双向死锁**，`CancelIoEx` 对此类已卸载驱动的端口 IRP 无效。二次加固把存活判定改为被动时间戳、
+把关闭句柄作为唤醒 pending `FilterSendMessage` 的唯一手段，从架构上消除该死锁。
