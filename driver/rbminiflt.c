@@ -1242,12 +1242,6 @@ RbfPreSetInfo(
     _In_    PCFLT_RELATED_OBJECTS FltObjects,
     _Outptr_result_maybenull_ PVOID* CompletionContext)
 {
-    PFLT_FILE_NAME_INFORMATION    nameInfo = NULL;
-    FILE_STANDARD_INFORMATION     stdInfo;
-    UNICODE_STRING                storePath = {0};
-    PRBF_NOTIFICATION             note = NULL;   /* paged pool, never on stack */
-    NTSTATUS                      status;
-    ULONG                         sessionId = 0;
     FILE_INFORMATION_CLASS        fic;
 
     UNREFERENCED_PARAMETER(CompletionContext);
@@ -1306,15 +1300,50 @@ RbfPreSetInfo(
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    /* 2. Path-based policy: intercept ANY delete hitting a protected
-       prefix (local or remote). SMB2 deletes are executed by srv2.sys in
-       session 0, so RequestorSessionId is 0 even for remote clients and
-       cannot be used as a discriminator; we only record it for audit. */
+    /* A disposition delete mark on a protected path: stage it to RBStore. */
+    return RbfStageDelete(Data, FltObjects);
+}
+
+/* ============================================================
+ * Core: stage a delete into RBStore  (RB-33)
+ * ==========================================================
+ *
+ * Single point where a protected-path delete is intercepted and the file is
+ * renamed into staging. Called from TWO places:
+ *
+ *   - RbfPreSetInfo  -- a FileDispositionInformation(Ex) delete mark.
+ *   - RbfPostCreate  -- a FILE_DELETE_ON_CLOSE (DOC) delete. Windows Shell /
+ *                       SMB clients delete by opening with FILE_DELETE_ON_CLOSE
+ *                       and letting the Close remove the file; NO
+ *                       SetInformation IRP is ever generated, so that path is
+ *                       invisible to RbfPreSetInfo. We strip the DOC flag at
+ *                       PreCreate (so the filesystem does not delete it behind
+ *                       our back) and stage the file here instead.
+ *
+ * On a protected path it renames the file to RBStore and completes the
+ * operation as STATUS_SUCCESS (suppressing the real delete); a non-protected
+ * path is forwarded untouched.
+ */
+FLT_PREOP_CALLBACK_STATUS
+RbfStageDelete(
+    _Inout_ PFLT_CALLBACK_DATA    Data,
+    _In_    PCFLT_RELATED_OBJECTS FltObjects)
+{
+    PFLT_FILE_NAME_INFORMATION    nameInfo = NULL;
+    FILE_STANDARD_INFORMATION     stdInfo;
+    UNICODE_STRING                storePath = {0};
+    PRBF_NOTIFICATION             note = NULL;   /* paged pool, never on stack */
+    NTSTATUS                      status;
+    ULONG                         sessionId = 0;
+
+    /* Path-based policy: intercept ANY delete hitting a protected prefix.
+       SMB2 deletes run in session 0, so RequestorSessionId is 0 even for
+       remote clients and cannot be used as a discriminator; audit only. */
     status = FltGetRequestorSessionId(Data, &sessionId);
     if (!NT_SUCCESS(status))
         sessionId = 0;
 
-    /* 3. Get path */
+    /* Get path */
     status = FltGetFileNameInformation(
         Data,
         FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
@@ -1324,7 +1353,7 @@ RbfPreSetInfo(
 
     FltParseFileNameInformation(nameInfo);
 
-    /* 4. Path matches protected prefix? otherwise allow */
+    /* Path matches protected prefix? otherwise allow */
     if (!RbfIsProtected(&nameInfo->Name)) {
         FltReleaseFileNameInformation(nameInfo);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -1332,7 +1361,7 @@ RbfPreSetInfo(
 
     InterlockedIncrement64((volatile LONG64 *)&G.Stats.Intercepts);
 
-    /* 5. Get requestor SID: real client SID from the requestor token
+    /* Get requestor SID: real client SID from the requestor token
        (SMB impersonates the client user), placeholder fallback. */
     UNICODE_STRING sidStr = {0};
     status = RbfGetRequestorSid(Data, sessionId, &sidStr);
@@ -1440,9 +1469,115 @@ RbfPreSetInfo(
 }
 
 /* ============================================================
+ * RB-33: CREATE pre/post -- intercept FILE_DELETE_ON_CLOSE deletes
+ * ============================================================
+ *
+ * Windows Shell and SMB clients delete a file by opening it with
+ * FILE_DELETE_ON_CLOSE and letting the Close remove it. That sequence never
+ * produces an IRP_MJ_SET_INFORMATION, so RbfPreSetInfo cannot see it -- which
+ * is why remote Explorer deletes were silently lost (RB-33).
+ *
+ * The fix converts that DOC delete back into the path we already handle:
+ *
+ *   PreCreate  -- if the open is on a protected path AND carries
+ *                 FILE_DELETE_ON_CLOSE, strip the flag and ask for a post
+ *                 callback. Stripping FIRST is what makes this fail-safe: even
+ *                 if staging later fails, the filesystem will not delete the
+ *                 file behind our back -- it simply stays in place.
+ *   PostCreate -- for those opens, stage the file to RBStore (rename + notify),
+ *                 which is exactly what RbfPreSetInfo does for a disposition
+ *                 delete. The handle is still valid, so the client sees the
+ *                 file disappear on close while the data is preserved.
+ *
+ * Only DOC opens on a protected path are touched. Directory enumerations,
+ * ordinary opens and non-protected paths are never modified -- an earlier
+ * attempt that staged on every close renamed a protected directory and is the
+ * reason this check is deliberately narrow.
+ *
+ * The "this was a DOC open" flag is passed through CompletionContext as a
+ * literal (1), so no pool allocation is needed and nothing can leak.
+ */
+#define RBF_CTX_WAS_DOC_OPEN ((PVOID)1)
+
+FLT_PREOP_CALLBACK_STATUS
+RbfPreCreate(
+    _Inout_ PFLT_CALLBACK_DATA    Data,
+    _In_    PCFLT_RELATED_OBJECTS FltObjects,
+    _Outptr_result_maybenull_ PVOID* CompletionContext)
+{
+    PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
+    NTSTATUS                  status;
+    ULONG                     options;
+
+    UNREFERENCED_PARAMETER(FltObjects);
+
+    *CompletionContext = NULL;
+
+    /* Only opens that may delete interest us. */
+    options = Data->Iopb->Parameters.Create.Options;
+    if ((options & FILE_DELETE_ON_CLOSE) == 0)
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+    /* Resolve the target path (IRQL-safe in a pre-create). */
+    status = FltGetFileNameInformation(
+        Data,
+        FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+        &nameInfo);
+    if (!NT_SUCCESS(status))
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+    if (!NT_SUCCESS(FltParseFileNameInformation(nameInfo)) ||
+        !RbfIsProtected(&nameInfo->Name)) {
+        FltReleaseFileNameInformation(nameInfo);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+    FltReleaseFileNameInformation(nameInfo);
+
+    /* Strip the DOC flag: the filesystem must not delete the file on close.
+     * We stage it ourselves in the post-create instead. */
+    Data->Iopb->Parameters.Create.Options = options & ~FILE_DELETE_ON_CLOSE;
+    FltSetCallbackDataDirty(Data);
+
+    *CompletionContext = RBF_CTX_WAS_DOC_OPEN;
+    return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+}
+
+FLT_POSTOP_CALLBACK_STATUS
+RbfPostCreate(
+    _Inout_ PFLT_CALLBACK_DATA       Data,
+    _In_    PCFLT_RELATED_OBJECTS    FltObjects,
+    _In_opt_ PVOID                   CompletionContext,
+    _In_    FLT_POST_OPERATION_FLAGS Flags)
+{
+    UNREFERENCED_PARAMETER(Flags);
+
+    /* Only the DOC opens RbfPreCreate flagged. */
+    if (CompletionContext != RBF_CTX_WAS_DOC_OPEN)
+        return FLT_POSTOP_FINISHED_PROCESSING;
+
+    /* The create must have succeeded for the file to be stageable. */
+    if (!NT_SUCCESS(Data->IoStatus.Status))
+        return FLT_POSTOP_FINISHED_PROCESSING;
+
+    if (FltObjects->FileObject == NULL)
+        return FLT_POSTOP_FINISHED_PROCESSING;
+
+    /* Stage it: renames the file into RBStore and notifies user mode. The
+     * DOC flag was already stripped, so a staging failure leaves the file in
+     * place (data preserved) instead of deleting it. The pre-operation status
+     * code is not propagated: a post-create must return a post status. */
+    (VOID)RbfStageDelete(Data, FltObjects);
+
+    return FLT_POSTOP_FINISHED_PROCESSING;
+}
+
+/* ============================================================
  * Registration / callback table
  * ========================================================== */
 const FLT_OPERATION_REGISTRATION G_Callbacks[] = {
+    /* RB-33: DOC deletes (Explorer / SMB) never produce a SET_INFORMATION IRP,
+     * so they are caught here instead. */
+    { IRP_MJ_CREATE, 0, RbfPreCreate, RbfPostCreate },
     { IRP_MJ_SET_INFORMATION, 0, RbfPreSetInfo, NULL },
     { IRP_MJ_OPERATION_END }
 };

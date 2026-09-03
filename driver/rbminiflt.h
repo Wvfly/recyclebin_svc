@@ -207,6 +207,27 @@ FLT_PREOP_CALLBACK_STATUS RbfPreSetInfo(
     _In_    PCFLT_RELATED_OBJECTS,
     _Outptr_result_maybenull_ PVOID*);
 
+/* RB-33: stage a protected-path delete into RBStore (rename + notify).
+ * Shared by RbfPreSetInfo (disposition deletes) and RbfPostCreate (DOC
+ * deletes, which produce no SET_INFORMATION IRP). */
+FLT_PREOP_CALLBACK_STATUS RbfStageDelete(
+    _Inout_ PFLT_CALLBACK_DATA,
+    _In_    PCFLT_RELATED_OBJECTS);
+
+/* RB-33: catch FILE_DELETE_ON_CLOSE deletes at IRP_MJ_CREATE. PreCreate strips
+ * the DOC flag (fail-safe: a staging failure then leaves the file in place)
+ * and PostCreate stages the file to RBStore. */
+FLT_PREOP_CALLBACK_STATUS RbfPreCreate(
+    _Inout_ PFLT_CALLBACK_DATA,
+    _In_    PCFLT_RELATED_OBJECTS,
+    _Outptr_result_maybenull_ PVOID*);
+
+FLT_POSTOP_CALLBACK_STATUS RbfPostCreate(
+    _Inout_ PFLT_CALLBACK_DATA,
+    _In_    PCFLT_RELATED_OBJECTS,
+    _In_opt_ PVOID,
+    _In_    FLT_POST_OPERATION_FLAGS);
+
 NTSTATUS RbfPortConnect(PFLT_PORT, PVOID, PVOID, ULONG, PVOID*);
 VOID     RbfPortDisconnect(PVOID);
 NTSTATUS RbfPortMessage(PVOID, PVOID, ULONG, PVOID, ULONG, PULONG);
