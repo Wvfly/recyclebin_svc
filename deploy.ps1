@@ -206,16 +206,23 @@ $NtPaths | ForEach-Object { Write-Host "    $_" }
 # RB-35: rbservice 以 LocalSystem 运行, 还原时需把文件写回共享目录
 # (需要目标目录 FILE_ADD_FILE)。共享目录 ACL 通常只授予共享所有者,
 # 不含 SYSTEM -> MoveFileExW 全部 ACCESS_DENIED (win32=5)。
-# 这里显式授予 SYSTEM 对共享根的 Modify (OI)(CI), 使 LocalSystem 的还原可用。
-# LocalSystem 本机即最高特权, 此显式 ACE 仅消除"ACL 漏配 SYSTEM"的事实, 非提权;
-# 共享所有者自身权限不受影响。
-Write-Host "  [RB-35] 授予 SYSTEM 对受保护共享的写回权限 (还原用)"
+# 还原能否成功取决于目标共享是否给 SYSTEM 写回权限:
+#   - 代码侧 (rbrestore.c 方案C) 仅对暂存源文件取所有权/补 DELETE ACE, 不碰目标共享目录;
+#   - 目标共享目录的 FILE_ADD_FILE 仍需由运维显式授予 SYSTEM, 否则还原会再次 ACCESS_DENIED。
+# 按"不擅自改权限"原则, 部署脚本【只提示、不自动执行 icacls】, 由运维自行操作。
+# 以下为原自动授权代码, 保留作参考 (已注释, 不执行):
+#   foreach ($p in $ProtectedDos) {
+#       if (Test-Path -LiteralPath $p) {
+#           icacls $p /grant "SYSTEM:(OI)(CI)(M)" | Out-Null
+#       } else {
+#           Write-Warning "  受保护路径不存在, 跳过授权: $p"
+#       }
+#   }
 foreach ($p in $ProtectedDos) {
-    if (Test-Path -LiteralPath $p) {
-        icacls $p /grant "SYSTEM:(OI)(CI)(M)" | Out-Null
-    } else {
-        Write-Warning "  受保护路径不存在, 跳过授权: $p"
-    }
+    Write-Host "  [RB-35] 运维必做: 授予 SYSTEM 对受保护共享的写回权限 (还原用, 否则还原 ACCESS_DENIED)" -ForegroundColor Cyan
+    Write-Host "           $p"
+    Write-Host "           命令:  icacls '$p' /grant 'SYSTEM:(OI)(CI)(M)'"
+    Write-Host "           说明:  LocalSystem 本机即最高特权, 此 ACE 仅消除'ACL 漏配 SYSTEM', 非提权; 共享所有者权限不受影响"
 }
 
 # RB-36: 受保护共享必须加入本机杀软/EDR 实时扫描排除名单, 否则 SMB 删除会被挡在
