@@ -13,6 +13,8 @@
  */
 
 #include "rbsvc.h"
+#include <aclapi.h>   /* SetNamedSecurityInfoW / SetEntriesInAclW (RB-35) */
+#include <sddl.h>     /* ConvertStringSidToSidW (RB-35) */
 
 /* UTF-8 -> UTF-16 helper (local copy; rbdb.c keeps its own static one) */
 
@@ -154,6 +156,115 @@ static int DestIsAllowed(const WCHAR *dstDos, WCHAR *reasonBuf, DWORD cch)
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* RB-35 source-side fix (方案C)                                        */
+/* ------------------------------------------------------------------ */
+/*
+ * The staging file inside RBStore keeps the DELETING USER's DACL: the kernel
+ * driver's FltSetInformationFile rename preserves the source file's ACEs, so
+ * the LocalSystem service has no DELETE on it and MoveFileExW (a same-volume
+ * rename) fails with win32=5. Before the rename we therefore take ownership of
+ * the staging file -- SYSTEM holds SeTakeOwnershipPrivilege -- and grant SYSTEM
+ * full control, so the rename can proceed.
+ *
+ * The file lives in RBStore, an area this service owns, so rewriting its DACL
+ * is contained and safe. The existing (deleting-user) ACEs are preserved and a
+ * SYSTEM grant is appended.
+ */
+static void GrantSelfAccessToStaging(const WCHAR *path)
+{
+    HANDLE hTok = NULL;
+    SID   *systemSid = NULL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    PACL    oldDacl = NULL;
+    PACL    newDacl = NULL;
+
+    if (!path || path[0] == L'\0') return;
+
+    /* Enable the privileges required to take ownership / write the DACL. */
+    if (OpenProcessToken(GetCurrentProcess(),
+                         TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hTok)) {
+        LUID luid;
+        TOKEN_PRIVILEGES tp;
+        DWORD dummy = 0;
+        if (LookupPrivilegeValueW(NULL, SE_TAKE_OWNERSHIP_NAME, &luid)) {
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Luid = luid;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            AdjustTokenPrivileges(hTok, FALSE, &tp, 0, NULL, &dummy);
+        }
+        if (LookupPrivilegeValueW(NULL, SE_RESTORE_NAME, &luid)) {
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Luid = luid;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            AdjustTokenPrivileges(hTok, FALSE, &tp, 0, NULL, &dummy);
+        }
+        CloseHandle(hTok);
+    }
+
+    if (!ConvertStringSidToSidW(L"S-1-5-18", (PSID *)&systemSid)) return;
+
+    /* Take ownership: after this SYSTEM owns the file and may rewrite its DACL. */
+    if (SetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT,
+                              OWNER_SECURITY_INFORMATION,
+                              systemSid, NULL, NULL, NULL) != ERROR_SUCCESS) {
+        LogWarn(L"[restore] RB-35 take-ownership failed for %s (win32=%lu)",
+                path, GetLastError());
+        /* Non-fatal: owner write may already be allowed if the DACL grants it. */
+    }
+
+    /* Read the current DACL and append a SYSTEM (FILE_ALL_ACCESS) grant. */
+    if (GetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT,
+                              DACL_SECURITY_INFORMATION,
+                              NULL, NULL, &oldDacl, NULL, &sd) == ERROR_SUCCESS) {
+        EXPLICIT_ACCESS_W ea;
+        ZeroMemory(&ea, sizeof(ea));
+        ea.grfAccessPermissions = FILE_ALL_ACCESS;
+        ea.grfAccessMode         = GRANT_ACCESS;
+        ea.grfInheritance        = NO_INHERITANCE;
+        ea.Trustee.TrusteeForm   = TRUSTEE_IS_SID;
+        ea.Trustee.TrusteeType   = TRUSTEE_IS_WELL_KNOWN_GROUP;
+        ea.Trustee.ptstrName      = (LPWSTR)systemSid;
+
+        if (SetEntriesInAclW(1, &ea, oldDacl, &newDacl) == ERROR_SUCCESS) {
+            if (SetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT,
+                                      DACL_SECURITY_INFORMATION,
+                                      NULL, NULL, newDacl, NULL) != ERROR_SUCCESS) {
+                LogWarn(L"[restore] RB-35 set-DACL failed for %s (win32=%lu)",
+                        path, GetLastError());
+            }
+            LocalFree(newDacl);
+        }
+        LocalFree(sd);
+    }
+
+    LocalFree(systemSid);
+}
+
+/*
+ * RB-35 (visibility fix): after the rename the restored file carries the RBStore
+ * staging file's DACL (and, after GrantSelfAccessToStaging, SYSTEM as owner).
+ * That stale DACL does not match the destination folder, so the share's users
+ * cannot see the restored file. Reset the DACL so the file INHERITS from its new
+ * parent directory -- exactly like Windows' own recycle-bin restore.
+ */
+static void RestoreInheritParentAcl(const WCHAR *path)
+{
+    SECURITY_DESCRIPTOR sd;
+
+    if (!path || path[0] == L'\0') return;
+    if (!InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION)) return;
+
+    /* fDaclPresent = FALSE, pDacl = NULL, fDaclDefaulted = TRUE
+       => "no explicit DACL, inherit from parent container". */
+    if (!SetSecurityDescriptorDacl(&sd, FALSE, NULL, TRUE)) return;
+
+    if (!SetFileSecurityW(path, DACL_SECURITY_INFORMATION, &sd)) {
+        LogWarn(L"[restore] reset-inherit DACL failed for %s (win32=%lu)",
+                path, GetLastError());
+    }
+}
+
 /*
  * Restores item `itemId` back to its original path (or `argOverride` if given).
  * Returns 1 on success, 0 on failure; `msgBuf` receives a human-readable reason.
@@ -247,6 +358,12 @@ int RestoreItemById(LONG64 itemId, const WCHAR *argOverride,
         }
     }
 
+    /* RB-35 (方案C): the staging file kept the deleting user's DACL, so SYSTEM
+       has no DELETE on it. Take ownership + grant SYSTEM first so the rename
+       below can proceed. Non-fatal if it fails -- the rename will then surface
+       the real error. */
+    GrantSelfAccessToStaging(srcDos);
+
     /* Same-volume rename; no copy allowed */
     if (!MoveFileExW(srcDos, dstDos,
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
@@ -286,6 +403,10 @@ int RestoreItemById(LONG64 itemId, const WCHAR *argOverride,
             }
         }
     }
+
+    /* RB-35 (visibility): the moved file kept the staging file's DACL; reset it to
+       inherit from the destination folder so share users can see it. */
+    RestoreInheritParentAcl(dstDos);
 
     DbSetStatus(itemId, "restored");
     if (msgBuf) swprintf_s(msgBuf, cchMsg, L"ok");

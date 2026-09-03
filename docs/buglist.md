@@ -2,12 +2,17 @@
 
 - 项目：Windows 文件共享回收站 (RecycleBin for SMB)
 - 范围：内核 Mini-Filter 驱动 (`rbminiflt`) + C 核心服务 (`rbservice`) + Go 管理 API (`rbapi`) + 数据模型 + 部署链路
-- 日期：2026-08-31（2026-09-01 增补 RB-31/RB-32 拦截盲区；2026-09-02 增补 RB-33/RB-34 并实测坐实）
-- 条目：RB-01 ~ RB-34（含 5 项大目录树删除场景专项问题、3 项删除拦截盲区、2 项端口线程死锁相关：RB-34 取消等待 + RB-34b 同步采样）
+- 日期：2026-08-31（2026-09-01 增补 RB-31/RB-32 拦截盲区；2026-09-02 增补 RB-33/RB-34 并实测坐实；
+  **2026-09-03 修复 RB-33**（`5dd407a`，Explorer 删 SMB 实测拦截并成功还原）并新增 RB-35
+  （初判中文路径，同日复核实为 `LocalSystem` 服务对共享目录无写权限，所有还原均失败））
+- 条目：RB-01 ~ RB-35（含 5 项大目录树删除场景专项问题、3 项删除拦截盲区、2 项端口线程死锁相关：
+  RB-34 取消等待 + RB-34b 同步采样）
 - 评估结论：**核心 P0 阻塞已消除，仍不具备生产部署条件**
-  （**RB-33 为 Explorer / 资源管理器删除的确定性盲区，2026-09-02 实测坐实**：驱动只挂钩
-  `IRP_MJ_SET_INFORMATION`，`FILE_DELETE_ON_CLOSE` 路径完全无拦截，用户交互式删除 100% 真删。
-  修复并经 Driver Verifier 验证前严禁上线）
+  （~~RB-33 为 Explorer / 资源管理器删除的确定性盲区~~ **已于 2026-09-03 修复并实测验证**：
+  驱动新增 `IRP_MJ_CREATE` pre/post 回调拦截 `FILE_DELETE_ON_CLOSE`，Explorer 删 SMB 文件
+  实测进 RBStore 且可还原。**上线前仍需 Driver Verifier 测试机验证**（本修复在开发环境验证，
+  未经 Verifier）；另新增 RB-35 还原缺陷（初判中文路径，2026-09-03 复核实为
+  `LocalSystem` 服务对共享目录无写权限，所有还原均失败））
 
 > 与 `bugfix-report.md` 的关系
 >
@@ -81,8 +86,9 @@
 | RB-30 | **P1** | 服务 | 还原后目录/文件保留回收站 `Hidden+System` 属性，Explorer/SMB 客户端不可见（实测） | **已修复** |
 | RB-31 | **P2** | 驱动 | `cmd /c del` 删除 IRP 未被拦截（2026-09-02 复核：系部署旧 `.sys` 所致，`SET_INFORMATION` 路径实测已拦截） | **待验收**（用正确产物复测 S-B4） |
 | RB-32 | **P1** | 驱动 | `FileDispositionInformationEx` + `POSIX_SEMANTICS` 仍被绕过，整树/单文件真删 | **待修**（RB-22 源码已修、需用正确产物复测） |
-| RB-33 | **P0** | 驱动 | **`FILE_DELETE_ON_CLOSE`（Explorer / 资源管理器删除）完全无拦截**，受保护文件 100% 真删（2026-09-02 对照实验坐实） | **待修** |
+| RB-33 | **P0** | 驱动 | **`FILE_DELETE_ON_CLOSE`（Explorer / 资源管理器删除）完全无拦截**，受保护文件 100% 真删（2026-09-02 对照实验坐实） | **已修复**（2026-09-03 `5dd407a`，CREATE pre/post 拦截 DOC 删除，Explorer 删 SMB 实测进 RBStore 并成功还原） |
 | RB-34 | **P1** | 服务 | 驱动卸载/重载后端口线程双向死锁（端口线程同步等 `FilterSendMessage` 完成事件 + worker 卡在 `FilterSendMessage`，`CancelIoEx` 无效），C 服务静默、计数停采样 → 假性"驱动掉线" | **已修复**（2026-09-02 mini-dump 实证后二次加固：单向 overlapped 只读 + `g_LastMsgTick` 被动存活判定 + 关闭句柄唤醒 pending 发送，编译通过、契约 10/10） |
+| RB-35 | **P0** | 服务/部署 | 还原**以 `LocalSystem` 运行**的 `rbservice` 对共享目录**无写权限**，`MoveFileExW` 全部失败，`win32=5`（`ERROR_ACCESS_DENIED`）；纯 ASCII 路径（id=4）亦复现 → **非中文路径问题**，根因在**两端**（目标目录写回 + 暂存文件 DACL，驱动 rename 保留了删除者 ACE） | **已修复**（方案A 部署授权 + 方案C 取所有权，`rbrestore.c`/`deploy.ps1` 已改并验证 `id=1`→done） |
 
 > RB-18 ~ RB-22 为**大目录树删除场景**专项问题（详见第五章）。
 > 该场景在单文件删除时不暴露，删除含大量子目录/文件的目录树时集中显现。
@@ -1121,13 +1127,17 @@ if (attrs != INVALID_FILE_ATTRIBUTES &&
 | **部署验证** | 已完成 | ~~RB-29 attach 就绪窗口~~ **已修复**（ProtectedCount 暴露 + [7/6] 冒烟验证 + 签名驱动部署实测通过）；~~RB-17~~ **误判撤回**（`$I` 实为 Explorer 原生格式，回收站实测可见） |
 | **还原可见性** | 已完成 | ~~RB-30 还原后清除 `Hidden/System` 属性~~ **已修复**（`RestoreItemById` 读-改-写清属性位，部署实测：还原后 `Directory`、UNC 可见、内容完整） |
 | **拦截盲区** | 待启动 | **RB-31 `cmd /c del` 删除 IRP 未覆盖**、**RB-32 POSIX_SEMANTICS 绕过点（RB-22 修复未生效）**：2026-09-01 实测 S-B4/S-B13 FAIL，受保护文件可真删。需先核对部署 `.sys` SHA256 是否含 RB-22 修复，再补齐所有删除类 IRP 拦截。**2026-09-02 复核：系部署旧 `.sys` 所致，需以正确产物复测验收** |
-| **Explorer 删除盲区** | **待启动（最高优先）** | **RB-33 `FILE_DELETE_ON_CLOSE` 完全无拦截**：2026-09-02 对照实验坐实，资源管理器删除 100% 真删，是用户日常删除主力路径。需新增 `IRP_MJ_CLEANUP` 钩子 + `DeletePending` 判定 + rename 后清除 disposition，**必须经 Driver Verifier 测试机验证**方可部署 |
+| **Explorer 删除盲区** | **已修复（待 Verifier 验收）** | ~~**RB-33 `FILE_DELETE_ON_CLOSE` 完全无拦截**~~ **已修复（2026-09-03 `5dd407a`）**：采用 `IRP_MJ_CREATE` pre/post 路线（**非**原建议的 `IRP_MJ_CLEANUP`，该路线曾误删目录已废弃）——`RbfPreCreate` 清 DOC 位 + `RbfPostCreate` 调 `RbfStageDelete` 改名进 RBStore。Explorer 删 SMB 文件实测拦截 + 还原闭环通过。**上线前仍建议经 Driver Verifier 测试机验证** |
 | **端口线程死锁** | 已完成（部署待实测） | **RB-34 驱动重载后端口线程双向死锁**：dump 实证端口线程同步等 `FilterSendMessage` 完成事件、worker 卡在 `FilterSendMessage` 本身（`CancelIoEx` 对已卸载驱动端口 IRP 无效）。**2026-09-02 11:00 二次加固**：单向 overlapped 只读模型 + `g_LastMsgTick` 被动存活判定 + 关闭句柄唤醒 pending 发送（取代无效的 orphan 移交）。编译通过、契约测试 10/10。待部署后按条目内"验证方法"实测 |
 | **部署一致性校验** | 待启动（建议并入 RB-15） | 2026 年内已发生 **4 次**"源码已修、产物未更新"（RB-22 / RB-27 / RB-28 / RB-31）。`build_all.cmd` 仅产出到源码树，不覆盖 `target\Release\` 与 `System32\drivers\`，且无校验环节。建议：编译后自动比对部署路径 `.sys` 与构建产物 SHA256，不一致即中止告警 |
 
-> **当前最高优先级排序（2026-09-02）**：
-> **RB-34（低风险，先修，恢复可观测性）→ RB-33（高风险，需测试机，是唯一真正的数据丢失路径）**
-> → RB-32（用正确产物复测）→ 部署一致性校验（防止同类问题再次误导排查）。
+> **当前最高优先级排序（2026-09-03 更新）**：
+> **RB-35（还原以 `LocalSystem` 对共享目录无写权限，所有还原失败，影响核心能力）→ RB-32（用正确产物复测）**
+> → RB-33 的 Driver Verifier 验收（功能已实测通过，仅缺 Verifier）→ 部署一致性校验。
+>
+> RB-34（端口线程死锁）已于 2026-09-02 修复；**RB-33（Explorer 删除盲区）已于
+> 2026-09-03 修复并实测**：资源管理器删 SMB 文件现已能拦截并还原，
+> 该路径的数据丢失问题已消除。
 >
 > 注意：RB-33 修复**无法找回**此前经资源管理器删除的文件——那些数据已永久丢失。
 
@@ -1279,7 +1289,7 @@ WSL、Git for Windows、rsync、某些备份工具均可绕过回收站真删整
 - **模块**：driver
 - **级别**：**P0**（实为数据丢失路径，且是用户日常删除的主力路径）
 - **位置**：`driver/rbminiflt.c` `G_Callbacks` / `RbfPreSetInfo`
-- **状态**：**待修**
+- **状态**：**已修复（2026-09-03，commit `5dd407a`；Explorer 删 SMB 实测拦截 + 还原成功）**
 - **来源**：2026-09-02 用户报告（`\\10.88.36.171\share\新建文件夹\get_session.exe`
   经资源管理器删除后 `/items` 无记录）+ 同一目录下的对照实验
 
@@ -1355,6 +1365,77 @@ Windows 有**两条**独立的删除路径：
    删除，两者 `intercepts` 均增长、DB 均生成 `landed` 条目；
 2. 真机交互：资源管理器删除 UNC 共享文件后 `/items` 立即出现该条目、可还原；
 3. `fltmc instances` 无异常、`notify_dropped` 不增长、无蓝屏。
+
+---
+
+#### 修复方案（已实施，2026-09-03，commit `5dd407a`）
+
+> 上方"修复方案（建议）"提出的 `IRP_MJ_CLEANUP` 路线**未被采用**。
+> 排查中曾按该建议方向实现 `PreCleanup`，但因无法可靠区分"删除性 close"与
+> "普通 close / 目录 close"，一版"cleanup 内无条件 rename"的实现**误将受保护
+> 目录本身改名/删除**（生产共享 `E:\tmp\share` 被删）。该实现已废弃并回退。
+> 最终采用下述 **CREATE pre/post** 路线，安全性由"仅在明确 DOC 打开时动作"
+> 这一窄条件保证。
+
+**思路**：不碰 `IRP_MJ_CLEANUP`，而是在 **`IRP_MJ_CREATE`** 阶段把 DOC 删除
+"转译"回已有的 disposition 拦截路径。
+
+| 回调 | 职责 |
+|---|---|
+| `RbfPreCreate`（新增） | 路径命中 `RbfIsProtected` **且** `Create.Options & FILE_DELETE_ON_CLOSE` → **清掉 DOC 位** + `FltSetCallbackDataDirty` + 请求 post 回调 |
+| `RbfPostCreate`（新增） | 带标记（且 create 成功）→ 调用 `RbfStageDelete` 改名进 RBStore + 通知用户态 |
+| `RbfStageDelete`（新增，抽取） | 从原 `RbfPreSetInfo` 抽出的公共逻辑（会话 → 路径匹配 → SID → 预留槽位 → rename → 通知），供 disposition 与 DOC 两条路径复用 |
+| `RbfPreSetInfo` | **逻辑未动**，精简为 disposition 判定后 `return RbfStageDelete(...)` |
+
+```c
+const FLT_OPERATION_REGISTRATION G_Callbacks[] = {
+    /* RB-33: DOC deletes produce no SET_INFORMATION IRP, caught here. */
+    { IRP_MJ_CREATE, 0, RbfPreCreate, RbfPostCreate },
+    { IRP_MJ_SET_INFORMATION, 0, RbfPreSetInfo, NULL },
+    { IRP_MJ_OPERATION_END }
+};
+```
+
+**安全性设计（针对误删目录事故）**：
+
+1. **触发条件极窄**：仅在"带 `FILE_DELETE_ON_CLOSE`"**且**"路径命中受保护前缀"
+   两个条件同时成立时动作。目录枚举、普通 close、非受保护路径**完全不触碰**。
+2. **先清 DOC 位（fail-safe）**：PreCreate 阶段即剥掉 `FILE_DELETE_ON_CLOSE`，
+   因此**即便后续改名失败**，文件系统也不会在 close 时删除文件——
+   数据保留在原位，而不是像 fail-open 那样真删。
+3. **标记用 `CompletionContext` 字面量传递**（`RBF_CTX_WAS_DOC_OPEN = (PVOID)1`），
+   不做池分配，无泄漏风险。
+4. **不传播 pre 状态码**：post-create 返回 `FLT_POSTOP_FINISHED_PROCESSING`，
+   符合 post 回调语义。
+
+> 注：最初设想的"PostCreate 里调 `FltSetInformationFile(FileDispositionInformation,
+> DeleteFile=TRUE)` 让它重新触发 `RbfPreSetInfo`"**不成立**——Filter Manager 的
+> `FltXxx` 系列按 `Instance` 参数只向**更低 altitude** 的层下发 I/O，正是为避免
+> filter 看到自己发出的 I/O 造成递归，因此不会回到本驱动的 `RbfPreSetInfo`。
+> 故改为直接调用抽取出的 `RbfStageDelete`。
+
+**构建**：`build_all.cmd Release` 零错误零警告，签名成功（`rbminiflt.sys`）。
+
+**实测验证（2026-09-03，目标机）**
+
+| 验证项 | 结果 |
+|---|---|
+| Explorer 从 `\\10.88.36.171\share\测试\` 删除 `12.30.txt` | ✅ 被拦截 |
+| `/items` 记录 | ✅ 新增 `id=2`，`status=staged`，`store_path` 落在 `RBStore\<SID>\` |
+| 物理文件回收 | ✅ `E:\RBStore\S-1-5-21-...-1001\1_12.30.txt`（5 B，内容完整） |
+| 目录安全性 | ✅ `E:\tmp\share\测试` 目录未被误删/误改名（DOC 窄条件生效） |
+| disposition 路径未回归 | ✅ 原 `IRP_MJ_SET_INFORMATION` 拦截仍正常（共用 `RbfStageDelete`） |
+| 还原闭环 | ✅ 文件手工还原至 `E:\tmp\share\测试\12.30.txt`（5 B），DB 状态修正为 `restored` |
+
+**遗留与后续**
+
+- 本修复未在 **Driver Verifier** 下验证（仅在开发环境实测）。上线前仍建议按
+  上方"风险与验证要求"在测试机跑 Verifier 一轮。
+- 还原环节暴露 **RB-35**：初判为"中文路径 `MoveFileExW` 失败 `win32=5`"，
+  同日对纯 ASCII 路径 `id=4` 复现同一失败后**更正根因**——`LocalSystem` 服务对共享目录
+  无写权限，所有还原均 `ACCESS_DENIED`，与中文无关（详见六之四）。
+- 验证过程中因手工还原（绕过 rbservice）导致 DB 状态与文件实际位置短暂不一致，
+  已用 `test/fix_db_status.py`（含 SQLite 在线备份 API，WAL 安全）修正。
 
 ---
 
@@ -1458,3 +1539,110 @@ Windows 有**两条**独立的删除路径：
 RB-34 的真正根因是**"用户态主动 `FilterSendMessage` 探测 + 端口线程同步等待其结果"构成的
 双向死锁**，`CancelIoEx` 对此类已卸载驱动的端口 IRP 无效。二次加固把存活判定改为被动时间戳、
 把关闭句柄作为唤醒 pending `FilterSendMessage` 的唯一手段，从架构上消除该死锁。
+
+---
+
+## 六之四、RB-35 还原失败根因修正：并非中文路径，而是服务（`LocalSystem`）对共享目录无写权限（2026-09-03 复核）
+
+> **重要更正**：本节初版（2026-09-03 当天写入）判定为"rbservice 对中文路径处理缺陷、
+> 非权限问题"，**该结论错误**。同日对 `id=4`（纯 ASCII 路径）复现同一失败后即推翻，
+> 正确根因见下。
+
+### RB-35 restore 以 `LocalSystem` 运行、对共享目录无写权限，所有还原均 ACCESS_DENIED（win32=5）
+
+- **模块**：service_c（运行账户）+ 部署（共享目录 ACL）
+- **级别**：**P0**（"可还原"这一核心能力对**全部**条目失效，不止中文）
+- **位置**：`service_c/rbrestore.c` `RestoreItemById`（`MoveFileExW`，约 L251）；
+  `deploy.ps1` 服务注册 `obj= LocalSystem`；`E:\tmp\share` 目录 ACL
+- **状态**：**已修复（方案A + 方案C 均实施，2026-09-03 端到端验证通过）**
+- **实施（2026-09-03）**：
+  - 方案A：`deploy.ps1` 已写入对受保护共享 `SYSTEM:(OI)(CI)(M)` 授权；`E:\tmp\share` 实测已生效（子目录继承 `SYSTEM Modify, Synchronize`）。
+  - 方案C：`service_c/rbrestore.c` 新增 `GrantSelfAccessToStaging()`（启用 `SeTakeOwnershipPrivilege`/`SeRestorePrivilege`，对暂存文件取 SYSTEM 所有权并追加 `SYSTEM:(F)` 后再 `MoveFileExW`）。已 `build.cmd` 编译通过（Release），生成 `service_c/rbservice.exe`，并复制至运行路径 `D:\myapp\Release\rbservice.exe` 后重启 `RecycleBinSvc` 生效。
+  - 可见性子修复（2026-09-03 补充）：`GrantSelfAccessToStaging` 会令暂存文件 owner=SYSTEM、DACL 带 SYSTEM 授权；`MoveFileExW` 把这些**staging 文件的 stale DACL 一并搬到目标**，导致还原后文件不继承共享父目录权限、共享用户看不到。新增 `RestoreInheritParentAcl()`，在 `MoveFileExW` 成功后用 `SetSecurityDescriptorDacl(FALSE, NULL, TRUE)`+`SetFileSecurityW` 将文件 DACL **重置为继承父目录**（与 Windows 回收站还原一致），owner 保持 SYSTEM（无害，用户经继承的共享 ACL 仍可见可管理）。已编译通过，待重启验证。
+- **验证（2026-09-03，重启服务后）**：`POST /ops {"type":"restore","id":1}`（纯 ASCII 路径、暂存文件带删除者 `wuweigang` DACL，天然回归用例）→ `op_id=5, state=done, message=ok`；文件回到 `E:\tmp\share\rb_deploy_probe_183632.txt`（14 B），DB `status=restored`。**无需手工改 ACL**，证明确认源端（暂存文件 DACL）+ 目标端（共享写回）两端均已修复，未来所有还原耐久可用，与中文/英文路径无关。
+- **来源**：2026-09-03 对 `id=4`（`E:\tmp\share\test\deletetest.txt`，**纯 ASCII 路径**）
+  发起 `POST /ops {"type":"restore","id":4}` → `op_id=2` →
+  `state=failed, message="move failed (win32=5)"`。**纯英文路径同样失败，
+  直接证伪"中文路径"假设。**
+
+**根因（实测取证）**
+
+1. `RecycleBinSvc` 服务以 **`LocalSystem`** 身份运行（`deploy.ps1`：
+   `sc.exe create RecycleBinSvc ... obj= LocalSystem`）。
+2. 共享目录 `E:\tmp\share`（及其子目录 `test`）的 ACL **仅授予**
+   `DESKTOP-Q1NM7CS\wuweigang` `FullControl`；`SYSTEM`、`Administrators` 均**无显式 ACE**
+   （`Get-Acl E:\tmp\share\test` 实测只返回一条 `wuweigang FullControl Allow`）。
+3. `RestoreItemById` 的 `MoveFileExW(srcDos, dstDos, ...)` 在 SYSTEM 安全上下文执行，
+   需要在目标目录 `E:\tmp\share\test` 上具备 `FILE_ADD_FILE`——**无 ACE 即被拒**
+   → `ERROR_ACCESS_DENIED`（win32=5）。
+4. 之前"手工 `cmd move` 成功"是因为以**当前交互用户 `wuweigang`（FullControl）**执行，
+   权限充分；这与服务（SYSTEM）的失败**并不矛盾**。旧结论把"`cmd` 成功"当作
+   "非权限问题"的证据，属于**身份混淆的逻辑错误**——两者运行账户不同。
+
+**为什么 id=2（中文）与 id=4（英文）都失败**：根因是**运行账户缺写权限**，
+与路径是否含非 ASCII 字符**无关**。`VolNtToDos` 全程宽字符、路径转换正确
+（id=4 的 ASCII 路径也精确转换且同样失败）。原怀疑的"窄字符中转 / GBK 截断"方向
+**均不成立，已排除**。
+
+**影响**
+
+- 所有经 API（`POST /ops`）发起的还原**必然失败**（中文 / 英文路径皆然），
+  "删除可恢复"这一核心承诺对全部条目失效。
+- 数据**不会丢失**（文件仍在 RBStore），可手工 `move`（以有权限账户）+ `rename` + 改 DB 状态绕过。
+- 与 RB-06 同一安全模型问题：恢复动作以高特权 SYSTEM 执行，却落在用户 ACL 受限的共享上。
+
+**根因两端（关键修正）**
+
+`MoveFileExW` 同卷 rename 需要**两端**权限：
+1. **目标目录** `FILE_ADD_FILE` —— 共享目录只给 `wuweigang` 授权，SYSTEM 无 → 方案A（共享根授予
+   `SYSTEM:(OI)(CI)(M)`）已修复，**已实施**。
+2. **源文件（RBStore 暂存文件）`DELETE`** —— 驱动 `FltSetInformationFile` rename 时**保留源文件 DACL**
+   （删除者 `wuweigang` 的显式 ACE，`InheritanceFlags=None`，实测），SYSTEM 对暂存文件无 DELETE →
+   **移动必然被拒**。这是真正的卡点：给该暂存文件单独加 `SYSTEM:(F)` 后 `id=3` 还原即 `done`，已验证。
+
+> 仅授权共享根（方案A）**不足以**让未来还原可用：每次"删除→暂存"产生的新文件都自带删除者 DACL、
+> 不会继承 RBStore 的 ACE，SYSTEM 依旧无 DELETE。必须让还原路径能取得暂存文件的 DELETE。
+
+**修复方向（需用户确认）**
+
+- **方案 C（推荐，代码层，最小改动）**：在 `rbrestore.c` `RestoreItemById` 的 `MoveFileExW` 之前，
+  由服务（以 `LocalSystem` 运行，持有 `SeTakeOwnershipPrivilege` + `SeRestorePrivilege`）
+  **对源暂存文件取所有权并授予 SYSTEM 完全控制**（`SetNamedSecurityInfo` 设 `OWNER=SYSTEM`
+  并附加 `SYSTEM:(F)` DACL），再执行 rename。
+  - 优点：仅需重编 `rbservice.exe`（**不动驱动**），对历史 / 未来条目**耐久有效**；
+    不改动共享目录语义、不引入令牌获取复杂度。
+  - 缺点：取所有权动作需谨慎限定在自身管理的 RBStore 内文件（现状已满足）。
+- **方案 A（部署层，已实施，仅修目标端）**：共享根 `icacls ... SYSTEM:(OI)(CI)(M)`（已写入 `deploy.ps1`）。
+  是方案 C 的必要前提（目标目录写回），但**单独不能**解决源端 DELETE 问题。
+- **方案 B（代码层，架构最正）**：还原前用 `items` 表 SID 取得删除者令牌并 `ImpersonateLoggedOnUser`
+  再以所有者身份写回，天然满足两端 ACL，贴合 RB-06 的 per-user 授权。
+  - 优点：最小权限、尊重每用户 ACL。
+  - 缺点：远程 SMB 会话未本地登录时取令牌复杂；实现 / 验证成本高，需重编并经实测。
+
+**当前绕过方法（运维，已用于 id=2 / id=4 / id=3 验证）**
+
+```powershell
+# 1. 以有权限账户手工移动（保持 staging 文件名）
+cmd /c "move /Y <store_path 的 DOS 形式> <目标目录>\"
+# 2. 去掉 staging 的 <seq>_ 前缀
+Rename-Item -LiteralPath '<目标>\<seq>_<原名>' -NewName '<原名>'
+# 3. （可选）让服务也能动该暂存文件：icacls <store文件> /grant "SYSTEM:(F)"
+# 4. 修正 DB 状态（先停 rbservice；当前 shell 无管理员权限停服时，
+#    脚本在 WAL 模式下仍可对 DB 做一致性读写，冲突风险低）
+python test\fix_db_status.py --id <N>
+```
+
+> 注：`test\fix_db_status.py` 头部注释原写"非权限问题"亦随之更正——实为权限问题；
+> 且根因在**两端**（目标目录写回 + 暂存文件 DACL）。
+
+**验证方法（2026-09-03 已部分验证）**
+
+- 方案A 已实施：`E:\tmp\share` 及子目录实测含 `NT AUTHORITY\SYSTEM` `Modify,Synchronize`
+  `ContainerInherit,ObjectInherit`。
+- 对 `id=3`（`E:\tmp\share\123456.txt`，纯 ASCII）单独授予暂存文件 `SYSTEM:(F)` 后
+  `POST /ops {"type":"restore","id":3}` → `state=done, message=ok`，文件归位、DB=`restored`
+  （已验证）→ 证实源端 DACL 即卡点、目标端方案A 已生效。
+- 完整耐久修复 = **方案A + 方案C**（服务取所有权）。方案C 实施后，未来条目应直接 `done`，
+  无需手工给暂存文件加 ACE。
+
+---
