@@ -218,6 +218,22 @@ foreach ($p in $ProtectedDos) {
     }
 }
 
+# RB-36: 受保护共享必须加入本机杀软/EDR 实时扫描排除名单, 否则 SMB 删除会被挡在
+# 驱动拦截之前。杀软/Defender 实时扫描常以"非 DELETE 共享"句柄常驻占住共享文件/目录,
+# 导致 srv2 的 DELETE 打开撞 SHARING_VIOLATION -> SMB 端删除"失效"(被拒、非真删)。
+# 这是 Windows 共享语义 + 扫描器行为, 非驱动缺陷(驱动计数 delete_denied/rename_fail 均为 0)。
+# 实测 (2026-09-03): 将 E:\tmp\share\test 加入 Defender 排除名单后 SMB 删除即恢复拦截/回收。
+#
+# 【仅提示, 绝不自动改动杀软/EDR/索引器配置】——由运维按下方命令自行操作。
+foreach ($p in $ProtectedDos) {
+    Write-Host "  [RB-36] 运维必做: 将以下共享加入杀软/EDR 实时扫描排除名单 (否则 SMB 删除会被挡)" -ForegroundColor Cyan
+    Write-Host "           $p"
+    Write-Host "           Defender:  Add-MpPreference -ExclusionPath '$p'"
+    Write-Host "           索引器:    从 Windows Search 索引选项排除该路径"
+    Write-Host "           其他 EDR/备份 agent: 在各自控制台加为扫描排除"
+    Write-Host "           规范:     SMB 用户删除期间, 勿在本机用编辑器独占打开共享文件"
+}
+
 # RB-04: 无法暂存时拒绝删除, 而不是静默真删
 Set-ItemProperty $drvReg "FailClosed" $FailClosed -Type DWord
 if ($FailClosed -eq 1) {

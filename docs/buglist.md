@@ -4,8 +4,10 @@
 - 范围：内核 Mini-Filter 驱动 (`rbminiflt`) + C 核心服务 (`rbservice`) + Go 管理 API (`rbapi`) + 数据模型 + 部署链路
 - 日期：2026-08-31（2026-09-01 增补 RB-31/RB-32 拦截盲区；2026-09-02 增补 RB-33/RB-34 并实测坐实；
   **2026-09-03 修复 RB-33**（`5dd407a`，Explorer 删 SMB 实测拦截并成功还原）并新增 RB-35
-  （初判中文路径，同日复核实为 `LocalSystem` 服务对共享目录无写权限，所有还原均失败））
-- 条目：RB-01 ~ RB-35（含 5 项大目录树删除场景专项问题、3 项删除拦截盲区、2 项端口线程死锁相关：
+  （初判中文路径，同日复核实为 `LocalSystem` 服务对共享目录无写权限，所有还原均失败）；
+  **2026-09-03 新增 RB-36**（本地杀软/EDR 实时扫描以非 `DELETE` 共享持锁，阻断 SMB 删除，
+  环境性非驱动缺陷，将共享加入杀软排除名单即恢复））
+- 条目：RB-01 ~ RB-36（含 5 项大目录树删除场景专项问题、3 项删除拦截盲区、2 项端口线程死锁相关：
   RB-34 取消等待 + RB-34b 同步采样）
 - 评估结论：**核心 P0 阻塞已消除，仍不具备生产部署条件**
   （~~RB-33 为 Explorer / 资源管理器删除的确定性盲区~~ **已于 2026-09-03 修复并实测验证**：
@@ -89,6 +91,7 @@
 | RB-33 | **P0** | 驱动 | **`FILE_DELETE_ON_CLOSE`（Explorer / 资源管理器删除）完全无拦截**，受保护文件 100% 真删（2026-09-02 对照实验坐实） | **已修复**（2026-09-03 `5dd407a`，CREATE pre/post 拦截 DOC 删除，Explorer 删 SMB 实测进 RBStore 并成功还原） |
 | RB-34 | **P1** | 服务 | 驱动卸载/重载后端口线程双向死锁（端口线程同步等 `FilterSendMessage` 完成事件 + worker 卡在 `FilterSendMessage`，`CancelIoEx` 无效），C 服务静默、计数停采样 → 假性"驱动掉线" | **已修复**（2026-09-02 mini-dump 实证后二次加固：单向 overlapped 只读 + `g_LastMsgTick` 被动存活判定 + 关闭句柄唤醒 pending 发送，编译通过、契约 10/10） |
 | RB-35 | **P0** | 服务/部署 | 还原**以 `LocalSystem` 运行**的 `rbservice` 对共享目录**无写权限**，`MoveFileExW` 全部失败，`win32=5`（`ERROR_ACCESS_DENIED`）；纯 ASCII 路径（id=4）亦复现 → **非中文路径问题**，根因在**两端**（目标目录写回 + 暂存文件 DACL，驱动 rename 保留了删除者 ACE） | **已修复**（方案A 部署授权 + 方案C 取所有权，`rbrestore.c`/`deploy.ps1` 已改并验证 `id=1`→done） |
+| RB-36 | **P1** | 部署/运维 | 本地杀软/EDR/索引器/备份 agent 以**非 `DELETE` 共享**的句柄常驻占住共享目录/文件，SMB 删除（`srv2` 以 `DELETE` 打开）被 Windows `SHARING_VIOLATION` 挡在驱动拦截**之前**，表现为"SMB 端删除回收失效" | **环境性（将共享加入杀软/索引器排除名单即恢复，非驱动缺陷）** |
 
 > RB-18 ~ RB-22 为**大目录树删除场景**专项问题（详见第五章）。
 > 该场景在单文件删除时不暴露，删除含大量子目录/文件的目录树时集中显现。
@@ -1644,5 +1647,59 @@ python test\fix_db_status.py --id <N>
   （已验证）→ 证实源端 DACL 即卡点、目标端方案A 已生效。
 - 完整耐久修复 = **方案A + 方案C**（服务取所有权）。方案C 实施后，未来条目应直接 `done`，
   无需手工给暂存文件加 ACE。
+
+---
+
+## 六之五、RB-36 本地杀软/EDR 实时扫描以非 `DELETE` 共享持锁，阻断 SMB 删除（2026-09-03 实测坐实）
+
+- **模块**：部署 / 运维（**环境性，非驱动代码缺陷**）
+- **级别**：**P1**（SMB 端删除功能失效；但删除被**拒绝**而非真删，数据不丢，属 fail-closed 再外层的共享冲突）
+- **位置**：不发生在驱动逻辑内，而是 Windows 文件共享语义 + 本机常驻进程（杀软/EDR、Windows Search 索引器、本地备份 agent）的实时扫描行为
+- **状态**：**已定位、环境性**（将共享加入杀软/索引器排除名单后用户实测恢复）
+
+### 1. 现象（用户报告 + 复现）
+用户报告："本地以非 SMB 渠道操作了共享目录和文件后，后续用户在 SMB 端的删除回收都会失效"。
+实测路径 `\\10.88.36.171\share\test`（本地 `E:\tmp\share\test`）。
+
+### 2. 根因
+驱动在**卷层**拦截删除、不区分来源（注释明确 "intentionally do NOT filter by RequestorSessionId"）。
+本地（非 SMB）进程只要以 `FileShare` **不含 `DELETE`** 的句柄占住共享文件/目录，SMB 客户端删除
+（由 `srv2.sys` 以"请求 `DELETE` 的打开"实现）就会在**打开阶段**撞上 `STATUS_SHARING_VIOLATION`，
+删除请求**根本到不了驱动的改名/拒绝逻辑**——即被挡在驱动拦截之前。
+
+- 为什么只在 **SMB 端**暴露：本地删除走已持有句柄的一侧；SMB 删除是新开 `DELETE` 打开，最易受本地持锁影响。
+- 为什么是**持续性**失效：持锁者多为常驻进程（杀软/EDR、Windows Search 索引器、备份 agent），句柄一直挂着。
+
+### 3. 实测证据（机制 A 隔离复现，仅 `E:\tmp\share\test`）
+- 本地以 `FileShare=Read|Write`（**无 `Delete`**）句柄占住探针 `rb_probe_lock_*.txt`：
+  - SMB 删除 → **FAILED**：`The process cannot access the file ... because it is being used by another process`
+  - 源文件仍在（`srcExists=True`）→ 未回收、被拒
+- 关闭本地句柄后，SMB 删除 → **成功**（`srcExists=False`）
+- 驱动计数佐证：`delete_denied=0 / rename_fail=0`（删除在驱动前即失败，驱动从未介入）
+- **用户最终确认**：将 `E:\tmp\share\test` 加入杀软实时扫描**排除名单**后，SMB 删除恢复拦截/回收。
+
+### 4. 与"本地批量删"类（机制 B / RB-20）的区分
+- 本类（RB-36）：**持久型**，根因是常驻进程的 share-mode 冲突，加排除名单即恢复。
+- 机制 B（RB-20）：**瞬时型**，本地批量删打满 512 通知队列 → 同期 SMB 删除被 `ACCESS_DENIED`，队列排空后自愈。
+  二者表现都是"SMB 删除失效"，但根因不同、修复不同，勿混淆。
+
+### 5. 修复 / 缓解（按优先级）
+1. **（治本）将受保护共享加入杀软/EDR 实时扫描排除名单**：
+   - Defender：`Add-MpPreference -ExclusionPath "E:\tmp\share"`（或排除到具体子目录）
+   - 其他 EDR / 备份 agent：在各自控制台将共享路径加为扫描排除
+2. **将共享从 Windows Search 索引选项排除**（索引器常驻持锁）
+3. 运维规范：SMB 用户需删除期间，勿在本机用编辑器独占打开共享文件
+4. **关共享 oplock（`Set-SmbShare -Name share -EnableOplocks $false`）仅对"持不可中断 oplock"类有效，
+   对本类（share-mode 冲突）无效**——降级为辅助保险，不可作为主修复（生产大文件服务器有性能代价）
+
+### 6. 部署侧固化（见 `deploy.ps1`）
+在 `deploy.ps1` 的部署提示中新增"**必须将受保护共享加入杀软/索引器排除名单**"要求，
+避免部署后踩同一坑（`deploy.ps1` 已补注释与命令示例，非自动改 AV 配置）。
+
+### 7. 验证方法
+- 本地持 `Read|Write`（无 `Delete`）句柄占住共享内一文件 → SMB 删除应 `FAILED`（源仍在）
+- 加杀软排除名单后复测 → SMB 删除应成功（源消失、进 RBStore）
+- 对照：`Invoke-RestMethod http://127.0.0.1:8800/stats` 看 `rename_ok` 是否 +1；
+  若 `delete_denied=0` 且删不动，说明仍有别的本地锁未释放
 
 ---
