@@ -64,7 +64,7 @@ func TestSearchEscapesWildcards(t *testing.T) {
 		}
 	}
 
-	items, err := d.SearchItems("50%", 100)
+	items, err := d.SearchItems("50%", 100, 0)
 	if err != nil {
 		t.Fatalf("SearchItems: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestSearchEscapesWildcards(t *testing.T) {
 	}
 
 	// 下划线同样不得当作单字符通配符
-	items, err = d.SearchItems("_", 100)
+	items, err = d.SearchItems("_", 100, 0)
 	if err != nil {
 		t.Fatalf("SearchItems: %v", err)
 	}

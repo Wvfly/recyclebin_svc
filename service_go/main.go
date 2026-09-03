@@ -151,6 +151,23 @@ func main() {
 	runForeground(cfg)
 }
 
+// withCORS lets browser-based front-ends (e.g. web/index.html served from any
+// origin, including file://) call the management API. The listener is bound to
+// loopback only, so exposing CORS here stays local. It also answers the
+// preflight OPTIONS that browsers send before a POST (the restore op endpoint).
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Auth-Token")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Foreground mode (console, debugging, manual --db/--addr/--token usage)
 // ---------------------------------------------------------------------------
@@ -262,7 +279,7 @@ func serve(cfg config, stop <-chan struct{}) error {
 
 	httpSrv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           api.LoggingMiddleware(mux),
+		Handler:           api.LoggingMiddleware(withCORS(mux)),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,

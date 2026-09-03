@@ -56,6 +56,10 @@ type Item struct {
 	// once the C service has landed the item, otherwise the raw kernel path.
 	DisplayPath string  `json:"display_path"`
 	Sid         string  `json:"sid"`
+	// Username is the account name resolved from Sid at query time (best
+	// effort). Empty when unresolvable (e.g. S-SESSION-<id> placeholder or an
+	// account the server cannot translate); the UI falls back to Sid.
+	Username    string  `json:"username"`
 	SessionID   int     `json:"session_id"`
 	ClientIP    string  `json:"client_ip"`
 	DeleteTime  float64 `json:"delete_time"`
@@ -323,25 +327,67 @@ func likeEscape(s string) string {
 }
 
 // SearchItems performs a substring match on the original path.
-func (d *DB) SearchItems(pattern string, limit int) ([]Item, error) {
+// SearchItems returns items whose original path matches the pattern (case-
+// insensitive substring, RB-09). Results are paginated for the front-end.
+func (d *DB) SearchItems(pattern string, limit, offset int) ([]Item, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 	if limit > 1000 {
 		limit = 1000
 	}
+	if offset < 0 {
+		offset = 0
+	}
 
 	// The surrounding % are intentional wildcards; anything inside the user's
 	// pattern is escaped so it is matched literally (RB-09).
 	q := "SELECT " + itemCols +
 		" FROM items WHERE orig_path LIKE ? ESCAPE '\\'" +
-		" ORDER BY id DESC LIMIT ?"
-	rows, err := d.ro.Query(q, "%"+likeEscape(pattern)+"%", limit)
+		" ORDER BY id DESC LIMIT ? OFFSET ?"
+	rows, err := d.ro.Query(q, "%"+likeEscape(pattern)+"%", limit, offset)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return scanItems(rows)
+}
+
+// CountItems returns the number of rows matching the same filters as ListItems.
+// The front-end uses it to render an accurate pager (total / last page).
+func (d *DB) CountItems(status, sid string) (int64, error) {
+	q := "SELECT COUNT(*) FROM items"
+	var args []interface{}
+	var conds []string
+	if status != "" {
+		conds = append(conds, "status = ?")
+		args = append(args, status)
+	}
+	if sid != "" {
+		conds = append(conds, "sid = ?")
+		args = append(args, sid)
+	}
+	if len(conds) > 0 {
+		q += " WHERE " + conds[0]
+		for i := 1; i < len(conds); i++ {
+			q += " AND " + conds[i]
+		}
+	}
+	var n int64
+	if err := d.ro.QueryRow(q, args...).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// CountSearch returns the number of rows matching the search pattern.
+func (d *DB) CountSearch(pattern string) (int64, error) {
+	q := "SELECT COUNT(*) FROM items WHERE orig_path LIKE ? ESCAPE '\\'"
+	var n int64
+	if err := d.ro.QueryRow(q, "%"+likeEscape(pattern)+"%").Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // GetItem returns a single item by id.

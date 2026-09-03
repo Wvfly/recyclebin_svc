@@ -179,8 +179,16 @@ func (s *Server) handleItems(w http.ResponseWriter, r *http.Request) {
 	if items == nil {
 		items = []db.Item{}
 	}
+	fillUsernames(items)
+	// total drives front-end pagination; a count failure must not break the
+	// page itself, so fall back to -1 (unknown) and let the UI cope.
+	total, err := s.DB.CountItems(q.Get("status"), q.Get("sid"))
+	if err != nil {
+		total = -1
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"count": len(items),
+		"total": total,
 		"items": items,
 	})
 }
@@ -216,6 +224,7 @@ func (s *Server) handleItemByID(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "not found")
 		return
 	}
+	it.Username = lookupSidName(it.Sid)
 	writeJSON(w, http.StatusOK, it)
 }
 
@@ -241,8 +250,9 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit, _ := strconv.Atoi(q.Get("limit"))
+	offset, _ := strconv.Atoi(q.Get("offset"))
 
-	items, err := s.DB.SearchItems(pattern, limit)
+	items, err := s.DB.SearchItems(pattern, limit, offset)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -250,8 +260,14 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if items == nil {
 		items = []db.Item{}
 	}
+	fillUsernames(items)
+	total, err := s.DB.CountSearch(pattern)
+	if err != nil {
+		total = -1
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"count": len(items),
+		"total": total,
 		"items": items,
 	})
 }

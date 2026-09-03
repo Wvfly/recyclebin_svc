@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RecycleBin for SMB · 回收站看板</title>
+<style>
+  :root{
+    --bg:#0f1722; --panel:#16212e; --panel2:#1d2a3a; --line:#26384c;
+    --fg:#e6edf3; --muted:#8aa0b6; --accent:#3da5ff; --accent2:#34d399;
+    --warn:#f6c343; --bad:#ff6b6b; --ok:#34d399;
+    --staged:#7aa2ff; --landed:#34d399; --purged:#8aa0b6; --restored:#f6c343;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.5 system-ui,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif;
+    background:var(--bg);color:var(--fg)}
+  header{display:flex;align-items:center;gap:12px;padding:14px 20px;background:var(--panel);
+    border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  header .sp{flex:1}
+  header input,header button{font:inherit}
+  .conn{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .conn input{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+    padding:6px 9px;border-radius:7px;width:230px}
+  .conn input.tok{width:150px}
+  button{cursor:pointer;background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+    padding:6px 12px;border-radius:7px;transition:.15s}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#04121f;font-weight:600}
+  button.primary:hover{filter:brightness(1.08)}
+  .wrap{padding:18px 20px;max-width:1200px;margin:0 auto}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .card .k{color:var(--muted);font-size:12px}
+  .card .v{font-size:24px;font-weight:700;margin-top:4px}
+  .card .v small{font-size:13px;font-weight:400;color:var(--muted)}
+  .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600}
+  .pill.ok{background:rgba(52,211,153,.15);color:var(--ok)}
+  .pill.bad{background:rgba(255,107,107,.15);color:var(--bad)}
+  .pill.warn{background:rgba(246,195,67,.15);color:var(--warn)}
+  .banner{padding:10px 14px;border-radius:9px;margin-bottom:14px;border:1px solid var(--line)}
+  .banner.bad{background:rgba(255,107,107,.1);border-color:rgba(255,107,107,.4);color:#ffb4b4}
+  .banner.warn{background:rgba(246,195,67,.1);border-color:rgba(246,195,67,.4);color:#ffe2a0}
+  .banner.ok{background:rgba(52,211,153,.1);border-color:rgba(52,211,153,.4);color:#aef0d2}
+  .tabs{display:flex;gap:6px;margin:6px 0 14px}
+  .tabs button.active{background:var(--accent);border-color:var(--accent);color:#04121f;font-weight:600}
+  .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+  .toolbar input,.toolbar select{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+    padding:6px 9px;border-radius:7px;font:inherit}
+  .toolbar input.search{flex:1;min-width:220px}
+  table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);
+    border-radius:10px;overflow:hidden}
+  th,td{text-align:left;padding:9px 11px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:var(--panel2);color:var(--muted);font-weight:600;font-size:12px;position:sticky}
+  tbody tr:hover{background:var(--panel2)}
+  td.path{font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px;word-break:break-all}
+  .row-actions{display:flex;gap:6px;flex-wrap:wrap}
+  .row-actions button{padding:4px 9px;font-size:12px}
+  .pager{display:flex;gap:8px;align-items:center;margin-top:12px}
+  .muted{color:var(--muted)}
+  .empty{padding:30px;text-align:center;color:var(--muted)}
+  .toast{position:fixed;right:18px;bottom:18px;background:var(--panel2);border:1px solid var(--line);
+    padding:11px 15px;border-radius:9px;max-width:360px;box-shadow:0 6px 24px rgba(0,0,0,.4);
+    opacity:0;transform:translateY(8px);transition:.2s;pointer-events:none;z-index:50}
+  .toast.show{opacity:1;transform:none}
+  .toast.bad{border-color:var(--bad)} .toast.ok{border-color:var(--ok)}
+  .state-pending{color:var(--warn)} .state-done{color:var(--ok)} .state-failed{color:var(--bad)}
+  .kv{font-family:ui-monospace,Consolas,monospace;font-size:13px}
+  details{margin-top:6px} summary{cursor:pointer;color:var(--muted)}
+  .sec-title{font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin:18px 0 8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>RecycleBin for SMB</h1>
+  <span class="sp"></span>
+  <div class="conn">
+    <input id="baseUrl" value="http://127.0.0.1:8800" title="API 地址">
+    <input id="token" class="tok" placeholder="Token(可选)" title="X-Auth-Token，未设则留空">
+    <button id="connect">连接</button>
+    <label class="muted" title="自动刷新"><input type="checkbox" id="auto"> 自动</label>
+  </div>
+</header>
+
+<div class="wrap">
+  <div id="banner" class="banner" style="display:none"></div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="tabs">
+    <button data-tab="items" class="active">回收项</button>
+    <button data-tab="ops">操作记录</button>
+  </div>
+
+  <!-- 回收项 -->
+  <section id="tab-items">
+    <div class="toolbar">
+      <select id="fStatus">
+        <option value="">状态：全部</option>
+        <option value="staged">staged</option>
+        <option value="landed">landed</option>
+        <option value="purged">purged</option>
+        <option value="restored">restored</option>
+      </select>
+      <input id="fSid" placeholder="SID 过滤" style="width:200px">
+      <input id="fSearch" class="search" placeholder="按路径搜索（子串，回车）">
+      <button id="refreshItems" class="primary">刷新</button>
+    </div>
+    <div id="itemsArea"></div>
+  </section>
+
+  <!-- 操作记录 -->
+  <section id="tab-ops" style="display:none">
+    <div class="toolbar">
+      <button id="refreshOps" class="primary">刷新</button>
+    </div>
+    <div id="opsArea"></div>
+  </section>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const api = {
+  base: () => ($('#baseUrl').value.trim() || 'http://127.0.0.1:8800').replace(/\/+$/, ''),
+  token: () => $('#token').value.trim(),
+  headers(){ const h = {'Accept':'application/json'}; const t=this.token(); if(t) h['X-Auth-Token']=t; return h; },
+  async get(path){
+    const r = await fetch(this.base()+path, {headers:this.headers()});
+    if(!r.ok){ let m=''; try{ m=(await r.json()).error }catch{} throw new Error(m||('HTTP '+r.status)); }
+    return r.json();
+  },
+  async post(path, body){
+    const h = {...this.headers(), 'Content-Type':'application/json'};
+    const r = await fetch(this.base()+path, {method:'POST', headers:h, body:JSON.stringify(body)});
+    if(!r.ok){ let m=''; try{ m=(await r.json()).error }catch{} throw new Error(m||('HTTP '+r.status)); }
+    return r.json();
+  }
+};
+
+const state = { items: [], offset:0, limit:50, total:-1, ops:[] };
+
+function fmtSize(n){
+  if(n==null) return '-';
+  const u=['B','KB','MB','GB','TB']; let i=0; let x=n;
+  while(x>=1024 && i<u.length-1){ x/=1024; i++; }
+  return (i===0?x:x.toFixed(1))+' '+u[i];
+}
+function fmtTime(s){
+  if(!s) return '-';
+  const d = new Date(s*1000);
+  if(isNaN(d)) return '-';
+  const p=n=>String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function statusPill(st){
+  const map={staged:'warn',landed:'ok',purged:'',restored:'warn'};
+  const cls = map[st]||'';
+  return `<span class="pill ${cls}">${st||'-'}</span>`;
+}
+function toast(msg, kind){
+  const t=$('#toast'); t.textContent=msg; t.className='toast show'+(kind?' '+kind:'');
+  clearTimeout(t._t); t._t=setTimeout(()=>t.className='toast',3200);
+}
+function banner(html, kind){
+  const b=$('#banner'); if(!html){ b.style.display='none'; return; }
+  b.style.display='block'; b.className='banner '+(kind||''); b.innerHTML=html;
+}
+
+async function loadHealth(){
+  try{
+    const h = await api.get('/health');
+    const c = h.counts||{};
+    const total = c.total||0;
+    const cards = [
+      ['回收项总数', total],
+      ['已暂存 staged', c.staged||0, 'var(--staged)'],
+      ['已落地 landed', c.landed||0, 'var(--landed)'],
+      ['已清除 purged', c.purged||0, 'var(--purged)'],
+      ['已还原 restored', c.restored||0, 'var(--restored)'],
+    ];
+    $('#cards').innerHTML = cards.map(([k,v,col])=>
+      `<div class="card"><div class="k">${k}</div><div class="v" style="${col?`color:${col}`:''}">${v}</div></div>`
+    ).join('');
+
+    // 驱动状态
+    const d = h.driver;
+    const clearDriver = ()=>{ const e=document.getElementById('driverDetail'); if(e) e.remove(); };
+    if(d==null){
+      clearDriver();
+      banner('驱动统计不可用（rbservice 未采样 / 驱动离线）。SMB 删除拦截可能无法确认。', 'warn');
+    } else if(d.stale){
+      clearDriver();
+      banner(`驱动快照已过期（${Math.round(d.age_sec)}s 无更新），驱动可能已停止响应。`, 'bad');
+    } else {
+      const pc = d.protected_count||0;
+      if(pc===0){
+        banner('⚠ 警告：protected_count = 0，过滤器已挂载但<strong>未加载任何受保护前缀</strong>，共享形同未受保护（RB-29）。', 'bad');
+      } else {
+        banner(`驱动在线：受保护前缀 ${pc} 个，累计拦截 ${d.intercepts||0}，改名成功 ${d.rename_ok||0} / 失败 ${d.rename_fail||0}，拒绝删除 ${d.delete_denied||0}，通知丢弃 ${d.notify_dropped||0}。`, 'ok');
+      }
+      // 追加驱动明细
+      const t = d.ts? fmtTime(d.ts):'-';
+      const extra = `<div class="sec-title">驱动计数器（${t}）</div>
+        <table><tbody>
+        <tr><td class="kv">intercepts</td><td>${d.intercepts||0}</td><td class="kv">rename_ok / rename_fail</td><td>${d.rename_ok||0} / ${d.rename_fail||0}</td></tr>
+        <tr><td class="kv">delete_denied</td><td>${d.delete_denied||0}</td><td class="kv">notify_sent / dropped</td><td>${d.notify_sent||0} / ${d.notify_dropped||0}</td></tr>
+        <tr><td class="kv">notify_queue_full</td><td>${d.notify_queue_full||0}</td><td class="kv">queue_depth / max</td><td>${d.queue_depth||0} / ${d.max_queue_depth||0}</td></tr>
+        </tbody></table>`;
+      let el = document.getElementById('driverDetail');
+      if(!el){ el = document.createElement('div'); el.id='driverDetail'; $('#cards').after(el); }
+      el.innerHTML = extra;
+    }
+    return true;
+  }catch(e){
+    banner('无法连接 API：'+(e.message||e)+'<br>请检查 baseUrl / Token 以及 rbapi 服务是否运行。', 'bad');
+    return false;
+  }
+}
+
+async function loadItems(){
+  const area = $('#itemsArea');
+  const status = $('#fStatus').value, sid = $('#fSid').value.trim();
+  const q = $('#fSearch').value.trim();
+  area.innerHTML = '<div class="empty">加载中…</div>';
+  try{
+    let data;
+    if(q){
+      const p = new URLSearchParams({q, limit:state.limit, offset:state.offset});
+      data = await api.get('/search?'+p.toString());
+    } else {
+      const p = new URLSearchParams({limit:state.limit, offset:state.offset});
+      if(status) p.set('status', status);
+      if(sid) p.set('sid', sid);
+      data = await api.get('/items?'+p.toString());
+    }
+    state.items = data.items||[];
+    state.total = (typeof data.total === 'number') ? data.total : -1;
+    // 数据在分页期间收缩（被还原/清除），可能停在空页；回退一页重试一次
+    if(state.items.length === 0 && state.offset > 0){
+      state.offset = Math.max(0, state.offset - state.limit);
+      return loadItems();
+    }
+    renderItems();
+  }catch(e){ area.innerHTML = `<div class="empty">加载失败：${e.message}</div>`; }
+}
+
+function renderItems(){
+  const area = $('#itemsArea');
+  const rows = state.items;
+  if(!rows.length){ area.innerHTML = '<div class="empty">无记录</div>'; return; }
+  const head = `<tr><th>#</th><th>路径</th><th>类型</th><th>大小</th><th>SID</th><th>来源IP</th><th>删除时间</th><th>状态</th><th>操作</th></tr>`;
+  const body = rows.map(it=>{
+    const isDir = it.is_dir===1 || it.is_dir===true;
+    const path = it.display_path || it.orig_path_dos || it.orig_path || '-';
+    const canRestore = (it.status==='staged'||it.status==='landed');
+    const extras = [];
+    if (it.orig_path && it.orig_path !== it.display_path) {
+      extras.push(`<div>NT: ${escapeHtml(it.orig_path)}</div>`);
+    }
+    if (it.store_path) {
+      extras.push(`<div>staging: ${escapeHtml(it.store_path)}</div>`);
+    }
+    if (it.recycle_path) {
+      extras.push(`<div>回收站: ${escapeHtml(it.recycle_path)}</div>`);
+    }
+    const extraHtml = extras.length
+      ? `<details style="margin-top:4px"><summary class="muted">内部路径 (${extras.length})</summary><div style="margin-top:4px">${extras.join('')}</div></details>`
+      : '';
+    return `<tr>
+      <td class="kv">${it.id}</td>
+      <td class="path">${escapeHtml(path)}${extraHtml}</td>
+      <td>${isDir?'目录':'文件'}</td>
+      <td>${fmtSize(it.file_size)}</td>
+      <td class="kv">${it.username?escapeHtml(it.username):(it.sid||'-')}<div class="muted" style="font-size:11px">${it.sid||''}</div></td>
+      <td class="kv">${it.client_ip||'-'}</td>
+      <td class="kv">${fmtTime(it.delete_time)}</td>
+      <td>${statusPill(it.status)}</td>
+      <td><div class="row-actions">
+        ${canRestore?`<button class="primary" data-act="restore" data-id="${it.id}">还原</button>`:''}
+        ${canRestore&&isDir?`<button data-act="tree" data-path="${escapeAttr(path)}">还原整棵</button>`:''}
+      </div></td>
+    </tr>`;
+  }).join('');
+  // 分页器：基于 total（后端返回）计算页码；total 未知时退化为"行数 < 页大小即末页"
+  const pageSize = state.limit;
+  const total = state.total;
+  const page = Math.floor(state.offset / pageSize) + 1;
+  const totalPages = total >= 0 ? Math.max(1, Math.ceil(total / pageSize)) : (rows.length < pageSize ? page : page + 1);
+  const atStart = state.offset <= 0;
+  const atEnd = (total >= 0 && state.offset + pageSize >= total) || (total < 0 && rows.length < pageSize);
+  area.innerHTML = `<table><thead>${head}</thead><tbody>${body}</tbody></table>
+    <div class="pager">
+      <button id="prev" ${atStart?'disabled':''}>上一页</button>
+      <span class="muted">第 ${page} 页${total>=0?` / 共 ${totalPages} 页（${total} 条）`:` · 本页 ${rows.length} 条`}</span>
+      <button id="next" ${atEnd?'disabled':''}>下一页</button>
+      <label class="muted">每页
+        <select id="pageSize">
+          ${[20,50,100,200].map(n=>`<option value="${n}" ${n===pageSize?'selected':''}>${n}</option>`).join('')}
+        </select>
+      </label>
+    </div>`;
+  area.querySelector('#prev').onclick = ()=>{ if(state.offset>0){ state.offset=Math.max(0,state.offset-pageSize); loadItems(); } };
+  area.querySelector('#next').onclick = ()=>{ if(!atEnd){ state.offset+=pageSize; loadItems(); } };
+  area.querySelector('#pageSize').onchange = e=>{ state.limit=Number(e.target.value); state.offset=0; loadItems(); };
+  area.querySelectorAll('button[data-act]').forEach(b=>{
+    b.onclick = ()=>{
+      const act=b.dataset.act, id=b.dataset.id, p=b.dataset.path;
+      if(act==='restore') doRestore(id);
+      else if(act==='tree') doRestoreTree(p);
+    };
+  });
+}
+
+async function doRestore(id){
+  try{
+    const r = await api.post('/ops', {type:'restore', id:Number(id)});
+    toast(`已提交还原 #${id}，任务 ${r.op_id}`, 'ok');
+    pollOp(r.op_id);
+  }catch(e){ toast('还原失败：'+e.message, 'bad'); }
+}
+async function doRestoreTree(path){
+  if(!confirm(`确认还原整棵目录？\n目标前缀：${path}`)) return;
+  try{
+    const r = await api.post('/ops', {type:'restore-tree', arg:path});
+    toast(`已提交整棵还原，任务 ${r.op_id}`, 'ok');
+    pollOp(r.op_id);
+  }catch(e){ toast('整棵还原失败：'+e.message, 'bad'); }
+}
+async function pollOp(opId){
+  for(let i=0;i<30;i++){
+    await new Promise(r=>setTimeout(r,1000));
+    try{
+      const o = await api.get('/ops/'+opId);
+      if(o.state==='done'){ toast(`任务 ${opId} 完成：${o.message||''}`, 'ok'); loadItems(); loadHealth(); return; }
+      if(o.state==='failed'){ toast(`任务 ${opId} 失败：${o.message||''}`, 'bad'); return; }
+    }catch(e){ /* 继续轮询 */ }
+  }
+  toast(`任务 ${opId} 仍在等待（pending），可到“操作记录”查看。`, 'warn');
+}
+
+
+
+async function loadOps(){
+  const area=$('#opsArea'); area.innerHTML='<div class="empty">加载中…</div>';
+  try{
+    const d = await api.get('/ops?limit=100');
+    const ops = d.ops||[];
+    if(!ops.length){ area.innerHTML='<div class="empty">无操作记录</div>'; return; }
+    const head=`<tr><th>#</th><th>类型</th><th>目标项</th><th>参数</th><th>状态</th><th>结果</th></tr>`;
+    const body=ops.map(o=>`<tr>
+      <td class="kv">${o.id}</td><td>${o.type}</td><td class="kv">${o.item_id||0}</td>
+      <td class="path">${escapeHtml(o.arg||'-')}</td>
+      <td class="state-${o.state}">${o.state}</td>
+      <td class="muted">${escapeHtml(o.message||'')}</td></tr>`).join('');
+    area.innerHTML=`<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+  }catch(e){ area.innerHTML=`<div class="empty">加载失败：${e.message}</div>`; }
+}
+
+function escapeHtml(s){ return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function escapeAttr(s){ return escapeHtml(s).replace(/'/g,'&#39;'); }
+
+// 事件
+document.querySelectorAll('.tabs button').forEach(b=>{
+  b.onclick=()=>{
+    document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');
+    const t=b.dataset.tab;
+    $('#tab-items').style.display = t==='items'?'block':'none';
+    $('#tab-ops').style.display = t==='ops'?'block':'none';
+    if(t==='ops') loadOps(); else loadItems();
+  };
+});
+$('#connect').onclick = ()=>{ state.offset=0; refreshAll(); };
+$('#refreshItems').onclick = ()=>{ state.offset=0; loadItems(); };
+$('#refreshOps').onclick = loadOps;
+$('#fStatus').onchange = ()=>{ state.offset=0; loadItems(); };
+$('#fSid').onchange = ()=>{ state.offset=0; loadItems(); };
+$('#fSearch').addEventListener('keydown', e=>{ if(e.key==='Enter'){ state.offset=0; loadItems(); } });
+
+let autoTimer=null;
+$('#auto').onchange = e=>{
+  if(autoTimer) clearInterval(autoTimer);
+  if(e.target.checked) autoTimer=setInterval(refreshAll, 5000);
+};
+async function refreshAll(){
+  const ok = await loadHealth();
+  if(ok){
+    if($('#tab-items').style.display!=='none') loadItems();
+    if($('#tab-ops').style.display!=='none') loadOps();
+  }
+}
+
+// 初始
+refreshAll();
+</script>
+</body>
+</html>
