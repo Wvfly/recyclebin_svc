@@ -6,9 +6,15 @@
   **2026-09-03 修复 RB-33**（`5dd407a`，Explorer 删 SMB 实测拦截并成功还原）并新增 RB-35
   （初判中文路径，同日复核实为 `LocalSystem` 服务对共享目录无写权限，所有还原均失败）；
   **2026-09-03 新增 RB-36**（本地杀软/EDR 实时扫描以非 `DELETE` 共享持锁，阻断 SMB 删除，
-  环境性非驱动缺陷，将共享加入杀软排除名单即恢复））
-- 条目：RB-01 ~ RB-36（含 5 项大目录树删除场景专项问题、3 项删除拦截盲区、2 项端口线程死锁相关：
-  RB-34 取消等待 + RB-34b 同步采样）
+  环境性非驱动缺陷，将共享加入杀软排除名单即恢复）；
+  **2026-09-04 修复 RB-37**（端口线程 stats worker 按值捕获 `g_Port` 并在完成后 `CloseHandle`，
+  被 Windows 句柄号复用误关刚重连的活连接，表现为连上内核端口后立刻 `GetOverlappedResult`
+  报 `ERROR_INVALID_HANDLE(6)`、每 `RBSVC_RECONNECT_MS` 重连死循环、`notify_sent` 恒 0 而
+  `rename_ok` 持续上涨——即用户长期报的"删除不拦截"；实为 2026-09-02 RB-34 加固未根除的残留，
+  本次以 `DuplicateHandle` 给 worker 独立句柄副本彻底修复）并新增 RB-38（Office 临时文件与任意命名
+  `*.tmp` 如 `FA5E97C4.tmp` 被误暂存进回收站，驱动新增按文件名最终分量匹配的内置排除默认集））
+- 条目：RB-01 ~ RB-38（含 5 项大目录树删除场景专项问题、3 项删除拦截盲区、端口线程死锁相关：
+  RB-34 取消等待 + RB-34b 同步采样 + RB-37 句柄误关残留修复）
 - 评估结论：**核心 P0 阻塞已消除，仍不具备生产部署条件**
   （~~RB-33 为 Explorer / 资源管理器删除的确定性盲区~~ **已于 2026-09-03 修复并实测验证**：
   驱动新增 `IRP_MJ_CREATE` pre/post 回调拦截 `FILE_DELETE_ON_CLOSE`，Explorer 删 SMB 文件
@@ -42,7 +48,7 @@
 > RB-30 为 2026-08-31 **实测还原验证**新增：restore 用 `MoveFileExW` 从 `$Recycle.Bin` 移回时
 > **保留回收站的 `Hidden+System` 属性**，还原后的目录/文件在 Explorer 与 SMB 客户端不可见
 > （用户误以为还原失败）。同日已修复并实测验证（还原后清除属性位）。详见第六章。
-> RB-33、RB-34 为 2026-09-02 **部署与拦截链路实测**新增（详见第六章"六之三"）：
+> RB-33、RB-34 为 2026-09-02 **部署与拦截链路实测**新增（详见 6.3）：
 > **RB-33 是 Explorer / 资源管理器删除（`FILE_DELETE_ON_CLOSE`）的确定性盲区**，已用
 > 同一共享目录的对照实验坐实（SET_INFORMATION 拦得住、DELETE_ON_CLOSE 拦不住）；
 > 这是用户交互式删除的主力路径，意味着**保护对日常操作实际无效**，级别按 P0 对待。
@@ -89,9 +95,11 @@
 | RB-31 | **P2** | 驱动 | `cmd /c del` 删除 IRP 未被拦截（2026-09-02 复核：系部署旧 `.sys` 所致，`SET_INFORMATION` 路径实测已拦截） | **待验收**（用正确产物复测 S-B4） |
 | RB-32 | **P1** | 驱动 | `FileDispositionInformationEx` + `POSIX_SEMANTICS` 仍被绕过，整树/单文件真删 | **待修**（RB-22 源码已修、需用正确产物复测） |
 | RB-33 | **P0** | 驱动 | **`FILE_DELETE_ON_CLOSE`（Explorer / 资源管理器删除）完全无拦截**，受保护文件 100% 真删（2026-09-02 对照实验坐实） | **已修复**（2026-09-03 `5dd407a`，CREATE pre/post 拦截 DOC 删除，Explorer 删 SMB 实测进 RBStore 并成功还原） |
-| RB-34 | **P1** | 服务 | 驱动卸载/重载后端口线程双向死锁（端口线程同步等 `FilterSendMessage` 完成事件 + worker 卡在 `FilterSendMessage`，`CancelIoEx` 无效），C 服务静默、计数停采样 → 假性"驱动掉线" | **已修复**（2026-09-02 mini-dump 实证后二次加固：单向 overlapped 只读 + `g_LastMsgTick` 被动存活判定 + 关闭句柄唤醒 pending 发送，编译通过、契约 10/10） |
+| RB-34 | **P1** | 服务 | 驱动卸载/重载后端口线程双向死锁（端口线程同步等 `FilterSendMessage` 完成事件 + worker 卡在 `FilterSendMessage`，`CancelIoEx` 无效），C 服务静默、计数停采样 → 假性"驱动掉线" | **部分修复（2026-09-02 加固消除双向死锁，但未根除 worker 按值关 `g_Port` 的句柄误关残留；2026-09-04 由 RB-37 以 `DuplicateHandle` 彻底修复）** |
 | RB-35 | **P0** | 服务/部署 | 还原**以 `LocalSystem` 运行**的 `rbservice` 对共享目录**无写权限**，`MoveFileExW` 全部失败，`win32=5`（`ERROR_ACCESS_DENIED`）；纯 ASCII 路径（id=4）亦复现 → **非中文路径问题**，根因在**两端**（目标目录写回 + 暂存文件 DACL，驱动 rename 保留了删除者 ACE） | **已修复**（方案A 部署授权 + 方案C 取所有权，`rbrestore.c`/`deploy.ps1` 已改并验证 `id=1`→done） |
 | RB-36 | **P1** | 部署/运维 | 本地杀软/EDR/索引器/备份 agent 以**非 `DELETE` 共享**的句柄常驻占住共享目录/文件，SMB 删除（`srv2` 以 `DELETE` 打开）被 Windows `SHARING_VIOLATION` 挡在驱动拦截**之前**，表现为"SMB 端删除回收失效" | **环境性（将共享加入杀软/索引器排除名单即恢复，非驱动缺陷）** |
+| RB-37 | **P0** | 服务 | 端口线程 stats worker 按值捕获 `g_Port` 并在 `PortSendWorker` 中 `CloseHandle`，与端口线程的 `FilterGetMessage` 形成竞态；Windows 句柄号复用令该 `CloseHandle` 误关刚重连的活连接 → `GetOverlappedResult` 报 `ERROR_INVALID_HANDLE(6)`、每 `RBSVC_RECONNECT_MS` 重连死循环、`notify_sent` 恒 0 而 `rename_ok`/`intercepts` 持续上涨（即"删除不拦截"真凶：内核拦截/转移正常，连接活不到被读） | **已修复**（2026-09-04 `DuplicateHandle` 给 worker 独立句柄副本，其 `CloseHandle` 只关副本、永不影响 `g_Port`，编译通过、待部署实测） |
+| RB-38 | **P2** | 驱动 | Office 编辑产生的临时文件（锁文件 `~$*`、原子保存临时 `~WRF*.tmp`/`~DF*.tmp`、以及任意命名 `*.tmp` 如 `FA5E97C4.tmp`）被错误暂存进回收站，污染 RBStore 且掩盖真实删除 | **已实施**（驱动 `RbfIsExcluded` 按文件名最终分量匹配，内置默认集 `~$*`/`~WRF*.tmp`/`~DF*.tmp`/`*.tmp`，可由注册表 `ExcludePatterns`(REG_MULTI_SZ) 覆盖；编译通过、待部署实测） |
 
 > RB-18 ~ RB-22 为**大目录树删除场景**专项问题（详见第五章）。
 > 该场景在单文件删除时不暴露，删除含大量子目录/文件的目录树时集中显现。
@@ -1151,7 +1159,7 @@ if (attrs != INVALID_FILE_ATTRIBUTES &&
 
 ---
 
-## 六之二、删除拦截盲区（RB-31 ~ RB-32，2026-09-01 实测）
+## 6.2、删除拦截盲区（RB-31 ~ RB-32，2026-09-01 实测）
 
 > 本组为 `test/l5_e2e/test_l5_user_scenarios.py` 维度 B 用例在 **真实 SMB 拦截链路**
 > 下实测失败暴露的驱动侧拦截盲区。它们不是测试脚本缺陷，而是产品缺陷：受保护共享
@@ -1275,7 +1283,7 @@ WSL、Git for Windows、rsync、某些备份工具均可绕过回收站真删整
 
 ---
 
-## 六之三、2026-09-02 部署与拦截链路实测（RB-33 ~ RB-34）
+## 6.3、2026-09-02 部署与拦截链路实测（RB-33 ~ RB-34）
 
 > 本节为 2026-09-02 在目标机（`DESKTOP-Q1NM7CS`）上做的端到端实测记录。
 > 起因是用户报告"上个版本功能正常、当前变更后失效"，以及"驱动掉线"。
@@ -1436,7 +1444,7 @@ const FLT_OPERATION_REGISTRATION G_Callbacks[] = {
   上方"风险与验证要求"在测试机跑 Verifier 一轮。
 - 还原环节暴露 **RB-35**：初判为"中文路径 `MoveFileExW` 失败 `win32=5`"，
   同日对纯 ASCII 路径 `id=4` 复现同一失败后**更正根因**——`LocalSystem` 服务对共享目录
-  无写权限，所有还原均 `ACCESS_DENIED`，与中文无关（详见六之四）。
+  无写权限，所有还原均 `ACCESS_DENIED`，与中文无关（详见6.4）。
 - 验证过程中因手工还原（绕过 rbservice）导致 DB 状态与文件实际位置短暂不一致，
   已用 `test/fix_db_status.py`（含 SQLite 在线备份 API，WAL 安全）修正。
 
@@ -1543,9 +1551,18 @@ RB-34 的真正根因是**"用户态主动 `FilterSendMessage` 探测 + 端口�
 双向死锁**，`CancelIoEx` 对此类已卸载驱动的端口 IRP 无效。二次加固把存活判定改为被动时间戳、
 把关闭句柄作为唤醒 pending `FilterSendMessage` 的唯一手段，从架构上消除该死锁。
 
+> **2026-09-04 更正（重要）**：2026-09-02 二次加固**未根除** RB-34 的全部残留。其修复说明
+> 第 5 点称"worker 捕获的 `g_Port` 值与端口线程后续重开的新句柄互不干扰"——该假设**错误**：
+> worker 在 `PortSendWorker` 中 `CloseHandle(c->Port)`（即 `g_Port` 的按值副本），而 Windows
+> 释放句柄后会**复用同一句柄编号**；若端口线程在 worker 关闭前已重连并恰好拿到同一编号，
+> worker 这记 `CloseHandle` 关掉的是**刚建好的活连接**，而非它想清理的旧句柄。后果正是
+> 2026-09-04 坐实的"删除不拦截"：连上内核端口后 `GetOverlappedResult` 立即 `ERROR_INVALID_HANDLE(6)`、
+> 每 `RBSVC_RECONNECT_MS` 重连死循环、`notify_sent` 恒 0。该残留由 **RB-37** 以 `DuplicateHandle`
+> 给 worker 独立句柄副本彻底修复（副本是独立句柄表项，`CloseHandle` 永不影响 `g_Port`）。
+
 ---
 
-## 六之四、RB-35 还原失败根因修正：并非中文路径，而是服务（`LocalSystem`）对共享目录无写权限（2026-09-03 复核）
+## 6.4、RB-35 还原失败根因修正：并非中文路径，而是服务（`LocalSystem`）对共享目录无写权限（2026-09-03 复核）
 
 > **重要更正**：本节初版（2026-09-03 当天写入）判定为"rbservice 对中文路径处理缺陷、
 > 非权限问题"，**该结论错误**。同日对 `id=4`（纯 ASCII 路径）复现同一失败后即推翻，
@@ -1650,7 +1667,7 @@ python test\fix_db_status.py --id <N>
 
 ---
 
-## 六之五、RB-36 本地杀软/EDR 实时扫描以非 `DELETE` 共享持锁，阻断 SMB 删除（2026-09-03 实测坐实）
+## 6.5、RB-36 本地杀软/EDR 实时扫描以非 `DELETE` 共享持锁，阻断 SMB 删除（2026-09-03 实测坐实）
 
 - **模块**：部署 / 运维（**环境性，非驱动代码缺陷**）
 - **级别**：**P1**（SMB 端删除功能失效；但删除被**拒绝**而非真删，数据不丢，属 fail-closed 再外层的共享冲突）
@@ -1703,3 +1720,70 @@ python test\fix_db_status.py --id <N>
   若 `delete_denied=0` 且删不动，说明仍有别的本地锁未释放
 
 ---
+
+## 6.6、2026-09-04 端口句柄误关导致"删除不拦截"（RB-37）+ Office 临时文件排除（RB-38）
+
+### RB-37 stats worker 按值捕获并误关 `g_Port`，Windows 句柄号复用引发重连死循环、通知永远读不到
+
+- **模块**：service_c（`rbport.c` `PortQueryStats` / `PortSendWorker`）
+- **级别**：**P0**（"删除可拦截/可还原"这一核心能力对用户**完全不可见**：`/items` 恒空、`notify_sent` 恒 0，与 RB-34 双向死锁的"假性掉线"表现同源但机制不同）
+- **位置**：`service_c/rbport.c` `PortQueryStats()` 中 `c->Port = g_Port;`（按值捕获活句柄）；`PortSendWorker()` 末尾 `CloseHandle(c->Port);`
+- **状态**：**已修复（2026-09-04，`DuplicateHandle` 给 worker 独立句柄副本；编译通过，待部署到目标机实测）**
+
+**现象（2026-09-04 用户现场复现）**
+
+- 驱动拦截/转移**完全正常**：`/stats` 中 `intercepts`/`rename_ok` 随每次删除稳定 +1、`rename_fail=0`、文件确实落入 `E:\RBStore`；
+- 但**通知从未送达数据库**：`notify_sent=0`、`notify_dropped` 与 `intercepts` 同数、`max_queue_depth=0`（丢弃发生在入队之前）；
+- 服务 Application 日志呈**每 `RBSVC_RECONNECT_MS`(5 秒) 两条事件**的精确节奏：`connected to kernel port \RecycleBinPort` 之后立刻 `GetOverlappedResult failed (err=6, ERROR_INVALID_HANDLE)`，随后重连，永无止境。
+
+**根因（与 RB-34 的关系）**
+
+1. `PortQueryStats()` 在 `g_PortLock` 保护下取出 `g_Port`，但仅以 `c->Port = g_Port;` **按值拷贝**给采样 worker（**未** `DuplicateHandle`）；
+2. worker 发完 `FilterSendMessage` 后在 `PortSendWorker` 中 `CloseHandle(c->Port)`——即关闭的是 `g_Port` 的**当时数值**；
+3. **关键**：Windows 关闭句柄后立即把该**句柄编号**放回空闲池，下次 `FilterConnectCommunicationPort` 重连极可能拿到**同一编号**。若端口线程在 worker 关闭之前已重连并取得该编号，则 worker 这记 `CloseHandle` 关掉的是**刚建好的活连接**，而非它本想清理的旧句柄；
+4. 该活连接一关，端口线程的下一次 `FilterGetMessage` 立即 `ERROR_INVALID_HANDLE(6)`，5 秒后重连、再被下一个采样周期误关……如此死循环；
+5. 结果：内核侧一切正常（所以 `rename_ok` 涨），但**端口连接永远活不到被读取的那一刻**，所有通知 `notify_sent=0`。这正是 2026-09-02 RB-34 二次加固声称"按值捕获安全"的那句假设**不成立**之处——详见 RB-34 条目内 2026-09-04 更正。
+
+**修复（2026-09-04，纯用户态）**
+
+- `PortQueryStats()` 在锁内改为 `DuplicateHandle(GetCurrentProcess(), g_Port, GetCurrentProcess(), &c->Port, 0, FALSE, DUPLICATE_SAME_ACCESS)`，给 worker 一份**独立句柄表项**指向同一端口对象；`FilterSendMessage` 在其上同样可用；
+- `PortSendWorker` 的 `CloseHandle(c->Port)` 现在只关这份**副本**，**永远碰不到 `g_Port`**，也绝不会误伤端口线程后续重连得到的任何编号（哪怕恰好相同，因为那是另一个句柄表项）；
+- `DuplicateHandle` 失败时降级跳过本次采样（`LogWarn` + 释放引用），不影响端口线程存活判定（走 `g_LastMsgTick`，见 RB-34）。
+
+**部署与验证（2026-09-04）**
+
+- 本修复纯用户态，部署时**只替换 `rbservice.exe`**（与应用层 `rbapi` 无关）；
+- 验证：替换后删除一文件，`/stats` 应见 `notify_sent` 随 `rename_ok` 同步 +1（不再恒 0），`/items`（`http://127.0.0.1:8800/items`）应出现对应条目；Application 日志不再出现每 5 秒的 `ERROR_INVALID_HANDLE(6)` 重连对。
+
+### RB-38 Office 临时文件 / 任意命名 `*.tmp` 被误暂存进回收站
+
+- **模块**：driver（`rbminiflt.c` `RbfLoadConfig` / `RbfIsExcluded`；`rbminiflt.h` `RBF_EXCLUDE`）
+- **级别**：**P2**（功能增强；不丢数据，但污染 RBStore、且用户编辑 Office 时的临时文件"进回收站"会造成困扰与磁盘占用）
+- **位置**：`RbfStageDelete` 与 `RbfPreCreate` 的排除判定；新增 `G.Exclude[]` 缓存与注册表 `ExcludePatterns`(REG_MULTI_SZ)
+- **状态**：**已实施（2026-09-04，编译通过，待部署实测）**
+
+**需求与现象**
+
+- 用户编辑 Office 文档时会产生大量临时文件：锁文件 `~$report.docx`、原子保存临时 `~WRFxxxx.tmp`/`~DFxxxx.tmp`，以及**任意 8 位十六进制命名**的 `FA5E97C4.tmp` 之类；这些文件在 Office 保存流程中频繁创建/删除，不应被回收站拦截，否则 `E:\RBStore` 被无意义的临时文件塞满，且真实删除反而被淹没；
+- 早期内置默认集**刻意不含裸 `*.tmp`**（怕吞掉用户自建 `.tmp`），但实测 `FA5E97C4.tmp` 这类**任意命名**的临时文件只能由 `*.tmp` 命中，故本次补齐。
+
+**实现**
+
+- 驱动新增 `RBF_EXCLUDE` 缓存（上限 `RBF_MAX_EXCLUDE=16`），从注册表
+  `HKLM\...\Parameters\ExcludePatterns`(REG_MULTI_SZ) 读取，**按文件名最终分量**匹配
+  （如 `~$report.docx`，非整路径）；
+- 未配置该值时回落内置默认集：`~$*`、`~WRF*.tmp`、`~DF*.tmp`、`*.tmp`；pattern 在加载时
+  `RtlUpcaseUnicodeString` 转大写供 `FsRtlIsNameInExpression(..., IgnoreCase=TRUE)` 使用；
+- 在两条删除入口生效：`RbfStageDelete`（命中即跳过暂存、不计 Intercept）与 `RbfPreCreate`
+  （命中即**保留 `FILE_DELETE_ON_CLOSE` 标志**，交由文件系统原生删除——否则若在此剥标志，
+  `RbfStageDelete` 又不再暂存，文件会"既不回收又无人删除"地沦为孤儿）。
+
+**注意（部署）**
+
+- 若部署机**已设** `ExcludePatterns` 注册表值，驱动**只用注册表内容、不再用内置默认**；
+  此时须在该值里**自行加入 `*.tmp` 一行**，否则本次新增的 `*.tmp` 排除不生效；
+- 用户此前要求"不改注册表"，故默认走内置默认集即可，但部署前务必确认该注册表值不存在/为空。
+
+**验证（2026-09-04）**
+
+- 部署新 `rbminiflt.sys` 后，在受保护共享内创建/删除 `FA5E97C4.tmp`、`~$x.docx` 等，应**不**出现在 `E:\RBStore`、不计入 `intercepts`；真实文档删除仍应正常拦截进回收站。
