@@ -842,6 +842,16 @@ db\schema.sql  ──gen_schema.ps1──▶  service_c\schema_sql.h  ──编�
 
 ---
 
+## 许可证
+
+本项目以 [GNU GPL v3.0](LICENSE) 发布。可自由使用、修改、再分发，但**衍生作品必须以相同许可证开源**。
+内核驱动与配套服务整体适用该条款。
+
+第三方组件：SQLite（`service_c/sqlite3*.c`）为公有领域，随源码编译，不受 GPL 限制；
+Windows Driver Kit 仅作构建期 SDK，不随本项目分发。
+
+---
+
 <div align="center">
 
 **历史修复记录**：初版 Python 实现阶段共修复 7 项（B1–B7），
