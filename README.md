@@ -50,6 +50,7 @@
 - [详细部署](#详细部署)
 - [配置参考](#配置参考)
 - [REST API](#rest-api)
+- [页面样例](#页面样例)
 - [运维与监控](#运维与监控)
 - [故障排查](#故障排查)
 - [已知限制](#已知限制)
@@ -597,6 +598,18 @@ Invoke-RestMethod "http://127.0.0.1:8800/ops" -Method Post -Headers $h `
                   -Body '{"type":"restore-tree","arg":"D:\\Share\\Project"}' `
                   -ContentType "application/json"
 ```
+
+---
+
+## 页面样例
+
+`web/index.html` 是浏览器直开的静态页面（`file://` 直接打开，无需部署），所有
+能力来自前文 [REST API](#rest-api) 的几个端点。点"连接"调一次 `/health` 校验 token，
+列表与计数每 5 秒自动刷新。
+
+![web UI](docs/screenshots/web-ui.png)
+
+> 页面只展示已有字段，不缓存 schema；后端字段增删直接刷新可见。
 
 ---
 
