@@ -350,7 +350,12 @@ func (s *Server) handleOps(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		opID, err := s.DB.EnqueueRestore(req.ID, req.Arg)
+		// Enqueue with the *actual* op type, not EnqueueRestore: that wrapper
+		// hardcodes type "restore", which would turn a restore-tree request
+		// into a single restore of item_id=0 and fail with "item 0 not found"
+		// in the C service's drain (RestoreItemById(0)). req.Type is already
+		// validated by IsSupportedOp above, and req.ID is 0 for restore-tree.
+		opID, err := s.DB.EnqueueOp(req.Type, req.ID, req.Arg)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return

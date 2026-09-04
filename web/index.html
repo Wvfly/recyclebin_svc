@@ -376,7 +376,7 @@ async function pollOp(opId){
     try{
       const o = await api.get('/ops/'+opId);
       if(o.state==='done'){ toast(`任务 ${opId} 完成：${o.message||''}`, 'ok'); loadItems(); loadHealth(); return; }
-      if(o.state==='failed'){ toast(`任务 ${opId} 失败：${o.message||''}`, 'bad'); return; }
+      if(o.state==='failed'){ toast(`任务 ${opId} 失败：${o.message||''}`, 'bad'); loadItems(); loadHealth(); return; }
     }catch(e){ /* 继续轮询 */ }
   }
   toast(`任务 ${opId} 仍在等待（pending），可到“操作记录”查看。`, 'warn');
