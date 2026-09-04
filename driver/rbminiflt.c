@@ -184,13 +184,15 @@ NTSTATUS RbfLoadConfig(VOID)
     if (i == 0) {
         /* No registry value (or empty): fall back to a conservative
            built-in set covering the common Office lock/temp files instead
-           of silently protecting nothing. Deliberately does NOT include a
-           bare "*.tmp" -- that would also swallow user-created .tmp files
-           nobody asked to stop recycling. */
+           of silently protecting nothing. Includes a bare "*.tmp" because
+           Office also emits arbitrarily-named temporaries (e.g. FA5E97C4.tmp)
+           that are NOT covered by the ~$* , ~WRF* , ~DF* shapes and would
+           otherwise be staged into the recycle bin on every save. */
         static const PCWSTR defaults[] = {
             L"~$*",        /* Word/Excel/PowerPoint lock file */
             L"~WRF*.tmp",  /* Word atomic-save temp */
             L"~DF*.tmp",   /* Word/Excel misc temp */
+            L"*.tmp",      /* any .tmp (Office atomic-save temp, e.g. FA5E97C4.tmp) */
         };
         for (i = 0; i < RTL_NUMBER_OF(defaults) && i < RBF_MAX_EXCLUDE; i++) {
             RBF_EXCLUDE *ee = &G.Exclude[i];
