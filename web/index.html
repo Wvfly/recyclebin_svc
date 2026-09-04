@@ -6,108 +6,104 @@
 <title>RecycleBin for SMB · 回收站看板</title>
 <style>
   :root{
-    --bg:#070a0e;
-    --panel:rgba(13,21,30,.72);
-    --panel2:rgba(18,28,40,.72);
-    --line:rgba(120,170,200,.16);
-    --line2:rgba(54,226,255,.35);
-    --fg:#cfe6f0; --muted:#6f8aa0;
-    --accent:#36e2ff; --accent2:#3dffb0;
-    --warn:#ffcf5c; --bad:#ff6b6b; --ok:#3dffb0;
-    --staged:#7ab8ff; --landed:#3dffb0; --purged:#7f97a8; --restored:#ffcf5c;
+    --bg:#f3f4f6;
+    --panel:#ffffff;
+    --line:#dfe3e8;
+    --line-strong:#c9cfd6;
+    --fg:#1f2328;
+    --muted:#6a737d;
+    --accent:#2563eb;
+    --accent-dark:#1d4ed8;
+    --ok:#1e7e34; --ok-bg:#e6f4ea;
+    --bad:#c0392b; --bad-bg:#fdecea;
+    --warn:#b45309; --warn-bg:#fef3c7;
+    --staged:#1a56db; --landed:#1e7e34; --purged:#5f6b72; --restored:#b45309;
     --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
-    --sans:system-ui,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif;
+    --sans:system-ui,"Segoe UI","Microsoft YaHei",Roboto,sans-serif;
   }
   *{box-sizing:border-box}
-  body{margin:0;font:13px/1.5 var(--sans);color:var(--fg);
-    background-color:var(--bg);
-    background-image:
-      linear-gradient(rgba(54,226,255,.035) 1px,transparent 1px),
-      linear-gradient(90deg,rgba(54,226,255,.035) 1px,transparent 1px),
-      radial-gradient(1100px 520px at 82% -12%,rgba(54,226,255,.07),transparent 60%);
-    background-size:34px 34px,34px 34px,100% 100%;
-    background-attachment:fixed}
-  header{display:flex;align-items:center;gap:14px;padding:12px 20px;position:sticky;top:0;z-index:10;
-    background:rgba(7,10,14,.86);backdrop-filter:blur(8px);
-    border-bottom:1px solid var(--line);box-shadow:0 1px 0 var(--line2)}
-  header h1{font:600 15px/1 var(--mono);margin:0;letter-spacing:.14em;text-transform:uppercase;color:var(--fg)}
-  header h1::before{content:"\25C2\25C2 ";color:var(--accent)}
+  body{margin:0;font:13px/1.5 var(--sans);color:var(--fg);background:var(--bg)}
+  header{display:flex;align-items:center;gap:14px;padding:10px 16px;
+    background:var(--panel);border-bottom:1px solid var(--line)}
+  header h1{font-size:15px;font-weight:600;margin:0}
   header .sp{flex:1}
   header input,header button{font:inherit}
   .conn{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-  .conn input{background:var(--panel2);border:1px solid var(--line);color:var(--fg);font-family:var(--mono);
-    padding:6px 9px;border-radius:3px;width:230px;outline:none}
-  .conn input:focus{border-color:var(--accent);box-shadow:0 0 0 1px var(--line2)}
+  .conn input{background:#fff;border:1px solid var(--line-strong);color:var(--fg);
+    padding:5px 8px;border-radius:4px;width:230px;outline:none}
+  .conn input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(37,99,235,.15)}
   .conn input.tok{width:150px}
-  button{cursor:pointer;background:var(--panel2);border:1px solid var(--line);color:var(--fg);
-    font:600 12px/1 var(--mono);letter-spacing:.06em;text-transform:uppercase;
-    padding:7px 12px;border-radius:3px;transition:.15s}
-  button:hover{border-color:var(--accent);box-shadow:0 0 10px rgba(54,226,255,.25);color:#fff}
-  button.primary{background:linear-gradient(180deg,rgba(54,226,255,.22),rgba(54,226,255,.08));
-    border-color:var(--accent);color:var(--accent)}
-  button.primary:hover{box-shadow:0 0 14px rgba(54,226,255,.45);color:#fff}
-  .wrap{padding:18px 20px;max-width:1240px;margin:0 auto}
+  button{cursor:pointer;background:#fff;border:1px solid var(--line-strong);color:var(--fg);
+    font-size:12px;padding:6px 12px;border-radius:4px}
+  button:hover{background:#f0f2f5}
+  button:disabled{opacity:.5;cursor:default}
+  button:disabled:hover{background:#fff}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.primary:hover{background:var(--accent-dark)}
+  .wrap{padding:16px;max-width:1240px;margin:0 auto}
   /* 状态面板固定右侧, 不随回收项滚动; 窄屏退化为普通流 */
-  #statusPanel{position:fixed;top:52px;right:18px;width:340px;max-height:calc(100vh - 70px);
-    overflow:auto;z-index:8;padding-right:4px}
+  #statusPanel{position:fixed;top:56px;right:16px;width:340px;max-height:calc(100vh - 72px);
+    overflow:auto;z-index:8}
   #statusPanel .cards{grid-template-columns:1fr 1fr}
   @media (max-width:980px){
-    #statusPanel{position:static;width:auto;max-height:none;overflow:visible;padding-right:0}
+    #statusPanel{position:static;width:auto;max-height:none;overflow:visible}
   }
   @media (min-width:981px){
     .wrap{max-width:none;padding-right:372px}
   }
-  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
-  .card{position:relative;background:var(--panel);border:1px solid var(--line);border-left:2px solid var(--accent);
-    padding:12px 14px;
-    clip-path:polygon(0 0,calc(100% - 9px) 0,100% 9px,100% 100%,9px 100%,0 calc(100% - 9px))}
-  .card .k{color:var(--muted);font:600 10px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase}
-  .card .v{font:700 26px/1 var(--mono);margin-top:8px;color:var(--fg);text-shadow:0 0 12px rgba(54,226,255,.18)}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:10px 12px}
+  .card .k{color:var(--muted);font-size:12px}
+  .card .v{font-size:22px;font-weight:600;margin-top:4px}
   .card .v small{font-size:12px;font-weight:400;color:var(--muted)}
-  .pill{display:inline-block;padding:2px 8px;border:1px solid currentColor;border-radius:2px;
-    font:600 11px/1.4 var(--mono);letter-spacing:.05em;text-transform:uppercase;box-shadow:0 0 8px -2px currentColor}
-  .pill.ok{color:var(--ok)} .pill.bad{color:var(--bad)} .pill.warn{color:var(--warn)}
-  .banner{padding:10px 14px;border:1px solid var(--line);border-left:2px solid var(--accent);
-    border-radius:3px;margin-bottom:14px;font-family:var(--mono);font-size:12px;background:var(--panel)}
-  .banner.bad{border-left-color:var(--bad);color:#ffb4b4;background:rgba(255,107,107,.06)}
-  .banner.warn{border-left-color:var(--warn);color:#ffe2a0;background:rgba(255,207,92,.06)}
-  .banner.ok{border-left-color:var(--ok);color:#aef0d2;background:rgba(61,255,176,.06)}
-  .tabs{display:flex;gap:0;margin:6px 0 14px;border:1px solid var(--line);border-radius:3px;
-    overflow:hidden;width:max-content}
-  .tabs button{border:none;border-right:1px solid var(--line);border-radius:0}
-  .tabs button:last-child{border-right:none}
-  .tabs button.active{background:rgba(54,226,255,.14);color:var(--accent);box-shadow:inset 0 -2px 0 var(--accent)}
-  .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
-  .toolbar input,.toolbar select{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
-    font-family:var(--mono);padding:6px 9px;border-radius:3px;outline:none}
-  .toolbar input:focus,.toolbar select:focus{border-color:var(--accent)}
+  .pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;line-height:1.6;
+    background:#eceff1;color:var(--purged)}
+  .pill.ok{background:var(--ok-bg);color:var(--ok)}
+  .pill.bad{background:var(--bad-bg);color:var(--bad)}
+  .pill.warn{background:var(--warn-bg);color:var(--warn)}
+  .banner{padding:9px 12px;border:1px solid var(--line);border-left:3px solid var(--accent);
+    border-radius:4px;margin-bottom:12px;background:var(--panel)}
+  .banner.bad{border-left-color:var(--bad);background:var(--bad-bg);color:#7a241a}
+  .banner.warn{border-left-color:var(--warn);background:var(--warn-bg);color:#7c4a03}
+  .banner.ok{border-left-color:var(--ok);background:var(--ok-bg);color:#14532d}
+  .tabs{display:flex;gap:16px;margin:0 0 12px;border-bottom:1px solid var(--line)}
+  .tabs button{border:none;background:none;border-radius:0;padding:6px 2px;color:var(--muted);
+    border-bottom:2px solid transparent;margin-bottom:-1px}
+  .tabs button:hover{background:none;color:var(--fg)}
+  .tabs button.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+  .toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+  .toolbar input,.toolbar select{background:#fff;border:1px solid var(--line-strong);color:var(--fg);
+    padding:5px 8px;border-radius:4px;outline:none}
+  .toolbar input:focus,.toolbar select:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(37,99,235,.15)}
   .toolbar input.search{flex:1;min-width:220px}
-  table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);
-    border-radius:3px}
-  th,td{text-align:left;padding:9px 11px;border-bottom:1px solid var(--line);vertical-align:top}
-  th{background:rgba(54,226,255,.06);color:var(--accent);font:600 11px/1.3 var(--mono);
-    letter-spacing:.08em;text-transform:uppercase}
+  table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line)}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:#f6f7f9;color:var(--muted);font-size:12px;font-weight:600;white-space:nowrap}
+  tbody tr:nth-child(even){background:#fafbfc}
+  tbody tr:hover{background:#f0f6ff}
   /* 驱动计数器小表头在固定面板内吸顶 */
-  #driverDetail th{position:sticky;top:0;z-index:5;
-    background:rgba(7,10,14,.92);backdrop-filter:blur(6px);
-    box-shadow:0 1px 0 var(--line2)}
-  tbody tr:hover{background:rgba(54,226,255,.05)}
-  td.path{font-family:var(--mono);font-size:12.5px;word-break:break-all}
+  #driverDetail th{position:sticky;top:0;z-index:5;background:#f6f7f9;box-shadow:0 1px 0 var(--line)}
+  td.path{font-family:var(--mono);font-size:12px;word-break:break-all}
   .row-actions{display:flex;gap:6px;flex-wrap:wrap}
-  .row-actions button{padding:4px 9px;font-size:11px}
-  .pager{display:flex;gap:8px;align-items:center;margin-top:12px;font-family:var(--mono);font-size:12px}
+  .row-actions button{padding:3px 8px;font-size:12px}
+  .pager{display:flex;gap:8px;align-items:center;margin-top:10px;font-size:12px}
+  .pager select{font:inherit;border:1px solid var(--line-strong);border-radius:4px;
+    padding:2px 4px;background:#fff}
   .muted{color:var(--muted)}
-  .empty{padding:30px;text-align:center;color:var(--muted);font-family:var(--mono);letter-spacing:.05em}
-  .toast{position:fixed;right:18px;bottom:18px;background:var(--panel2);border:1px solid var(--accent);
-    padding:11px 15px;border-radius:3px;max-width:360px;box-shadow:0 0 18px rgba(54,226,255,.25);
-    font-family:var(--mono);font-size:12px;opacity:0;transform:translateY(8px);transition:.2s;pointer-events:none;z-index:50}
+  .empty{padding:28px;text-align:center;color:var(--muted);background:var(--panel);
+    border:1px solid var(--line);border-radius:6px}
+  .toast{position:fixed;right:16px;bottom:16px;background:#24292f;color:#fff;
+    border-left:3px solid var(--accent);padding:10px 14px;border-radius:4px;max-width:380px;
+    font-size:12px;box-shadow:0 4px 14px rgba(0,0,0,.18);
+    opacity:0;transform:translateY(6px);transition:.2s;pointer-events:none;z-index:50}
   .toast.show{opacity:1;transform:none}
-  .toast.bad{border-color:var(--bad);box-shadow:0 0 18px rgba(255,107,107,.3)}
-  .toast.ok{border-color:var(--ok);box-shadow:0 0 18px rgba(61,255,176,.3)}
+  .toast.bad{border-left-color:var(--bad)}
+  .toast.ok{border-left-color:var(--ok)}
+  .toast.warn{border-left-color:var(--warn)}
   .state-pending{color:var(--warn)} .state-done{color:var(--ok)} .state-failed{color:var(--bad)}
-  .kv{font-family:var(--mono);font-size:12.5px}
-  details{margin-top:6px} summary{cursor:pointer;color:var(--muted);font-family:var(--mono);font-size:12px}
-  .sec-title{font:600 11px/1 var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.12em;margin:18px 0 8px}
+  .kv{font-family:var(--mono);font-size:12px}
+  details{margin-top:6px} summary{cursor:pointer;color:var(--muted);font-size:12px}
+  .sec-title{font-size:12px;font-weight:600;color:var(--muted);margin:14px 0 6px}
 </style>
 </head>
 <body>
@@ -238,14 +234,14 @@ async function loadHealth(){
     } else {
       const pc = d.protected_count||0;
       if(pc===0){
-        banner('⚠ 警告：protected_count = 0，过滤器已挂载但<strong>未加载任何受保护前缀</strong>，共享形同未受保护（RB-29）。', 'bad');
+        banner('警告：protected_count = 0，过滤器已挂载但<strong>未加载任何受保护前缀</strong>，共享形同未受保护（RB-29）。', 'bad');
       } else {
         banner(`驱动在线：受保护前缀 ${pc} 个，累计拦截 ${d.intercepts||0}，改名成功 ${d.rename_ok||0} / 失败 ${d.rename_fail||0}，拒绝删除 ${d.delete_denied||0}，通知丢弃 ${d.notify_dropped||0}。`, 'ok');
       }
       // 追加驱动明细
       const t = d.ts? fmtTime(d.ts):'-';
       const extra = `<div class="sec-title driver">驱动计数器 · ${t}</div>
-        <table><thead><tr><th>METRIC</th><th>VALUE</th><th>METRIC</th><th>VALUE</th></tr></thead><tbody>
+        <table><thead><tr><th>指标</th><th>值</th><th>指标</th><th>值</th></tr></thead><tbody>
         <tr><td class="kv">intercepts</td><td>${d.intercepts||0}</td><td class="kv">rename_ok / rename_fail</td><td>${d.rename_ok||0} / ${d.rename_fail||0}</td></tr>
         <tr><td class="kv">delete_denied</td><td>${d.delete_denied||0}</td><td class="kv">notify_sent / dropped</td><td>${d.notify_sent||0} / ${d.notify_dropped||0}</td></tr>
         <tr><td class="kv">notify_queue_full</td><td>${d.notify_queue_full||0}</td><td class="kv">queue_depth / max</td><td>${d.queue_depth||0} / ${d.max_queue_depth||0}</td></tr>
@@ -320,8 +316,8 @@ function renderItems(){
       <td class="kv">${fmtTime(it.delete_time)}</td>
       <td>${statusPill(it.status)}</td>
       <td><div class="row-actions">
-        ${canRestore?`<button class="primary" data-act="restore" data-id="${it.id}">还原</button>`:''}
-        ${canRestore&&isDir?`<button data-act="tree" data-path="${escapeAttr(path)}">还原整棵</button>`:''}
+        ${canRestore&&isDir?`<button class="primary" data-act="tree" data-path="${escapeAttr(path)}">还原目录</button>`:''}
+        ${canRestore&&!isDir?`<button class="primary" data-act="restore" data-id="${it.id}">还原文件</button>`:''}
       </div></td>
     </tr>`;
   }).join('');
