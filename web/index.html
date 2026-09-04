@@ -47,6 +47,16 @@
     border-color:var(--accent);color:var(--accent)}
   button.primary:hover{box-shadow:0 0 14px rgba(54,226,255,.45);color:#fff}
   .wrap{padding:18px 20px;max-width:1240px;margin:0 auto}
+  /* 状态面板固定右侧, 不随回收项滚动; 窄屏退化为普通流 */
+  #statusPanel{position:fixed;top:52px;right:18px;width:340px;max-height:calc(100vh - 70px);
+    overflow:auto;z-index:8;padding-right:4px}
+  #statusPanel .cards{grid-template-columns:1fr 1fr}
+  @media (max-width:980px){
+    #statusPanel{position:static;width:auto;max-height:none;overflow:visible;padding-right:0}
+  }
+  @media (min-width:981px){
+    .wrap{max-width:none;padding-right:372px}
+  }
   .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
   .card{position:relative;background:var(--panel);border:1px solid var(--line);border-left:2px solid var(--accent);
     padding:12px 14px;
@@ -77,6 +87,10 @@
   th,td{text-align:left;padding:9px 11px;border-bottom:1px solid var(--line);vertical-align:top}
   th{background:rgba(54,226,255,.06);color:var(--accent);font:600 11px/1.3 var(--mono);
     letter-spacing:.08em;text-transform:uppercase}
+  /* 驱动计数器小表头在固定面板内吸顶 */
+  #driverDetail th{position:sticky;top:0;z-index:5;
+    background:rgba(7,10,14,.92);backdrop-filter:blur(6px);
+    box-shadow:0 1px 0 var(--line2)}
   tbody tr:hover{background:rgba(54,226,255,.05)}
   td.path{font-family:var(--mono);font-size:12.5px;word-break:break-all}
   .row-actions{display:flex;gap:6px;flex-wrap:wrap}
@@ -109,9 +123,11 @@
 </header>
 
 <div class="wrap">
-  <div id="banner" class="banner" style="display:none"></div>
+  <div id="statusPanel">
+    <div id="banner" class="banner" style="display:none"></div>
 
-  <div class="cards" id="cards"></div>
+    <div class="cards" id="cards"></div>
+  </div>
 
   <div class="tabs">
     <button data-tab="items" class="active">回收项</button>
@@ -228,8 +244,8 @@ async function loadHealth(){
       }
       // 追加驱动明细
       const t = d.ts? fmtTime(d.ts):'-';
-      const extra = `<div class="sec-title">驱动计数器（${t}）</div>
-        <table><tbody>
+      const extra = `<div class="sec-title driver">驱动计数器 · ${t}</div>
+        <table><thead><tr><th>METRIC</th><th>VALUE</th><th>METRIC</th><th>VALUE</th></tr></thead><tbody>
         <tr><td class="kv">intercepts</td><td>${d.intercepts||0}</td><td class="kv">rename_ok / rename_fail</td><td>${d.rename_ok||0} / ${d.rename_fail||0}</td></tr>
         <tr><td class="kv">delete_denied</td><td>${d.delete_denied||0}</td><td class="kv">notify_sent / dropped</td><td>${d.notify_sent||0} / ${d.notify_dropped||0}</td></tr>
         <tr><td class="kv">notify_queue_full</td><td>${d.notify_queue_full||0}</td><td class="kv">queue_depth / max</td><td>${d.queue_depth||0} / ${d.max_queue_depth||0}</td></tr>
