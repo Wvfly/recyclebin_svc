@@ -281,7 +281,8 @@ DWORD WINAPI PortThreadProc(LPVOID param)
  * FilterSendMessage(), the kernel cancels the IRP and the call returns with
  * ERROR_OPERATION_ABORTED, so the worker always drains -- it cannot wedge. */
 typedef struct _PORT_SEND_CTX {
-    HANDLE  Port;          /* the worker's OWN copy of the handle */
+    HANDLE  Port;          /* the worker's OWN DuplicateHandle()'d copy --
+                               see RB-35 below. Never the live g_Port value. */
     RBF_REPLY Req;
     RBF_STATS Stats;
     DWORD   BytesReturned;
@@ -311,10 +312,22 @@ static DWORD WINAPI PortSendWorker(LPVOID param)
     SetEvent(c->Done);
     InterlockedExchange(&g_SendInFlight, 0);
 
-    /* The worker owns its copy of the port handle and closes it here. This is
-     * safe even if the port thread already closed g_Port: they are distinct
-     * handle values (DuplicateHandle-style duplication is NOT used -- the
-     * worker captured g_Port at send time, which is the live handle value). */
+    /* RB-35: c->Port is a DuplicateHandle()'d copy (see PortQueryStats),
+     * never the raw g_Port value. Closing it here can never affect g_Port
+     * or whatever connection now holds g_Port's old numeric value -- a
+     * duplicated handle is its own handle-table entry.
+     *
+     * The previous version of this code closed g_Port directly (captured by
+     * value, not duplicated). That raced with the port thread's own use of
+     * g_Port: if this worker's CloseHandle() landed while the port thread
+     * had already reconnected and, by coincidence, been handed the exact
+     * same handle NUMBER for the new connection (routine on Windows, which
+     * reuses freed handle slots), this call silently closed a live,
+     * freshly-established connection instead of the stale one it meant to
+     * clean up. Symptom: "connected to kernel port" immediately followed by
+     * GetOverlappedResult failing with ERROR_INVALID_HANDLE (err=6), an
+     * endless reconnect loop, and notify_sent stuck at 0 forever even
+     * though the kernel side (intercepts/rename_ok) was working fine. */
     CloseHandle(c->Port);
     PortSendCtxRelease(c);   /* drop the worker's reference */
     return 0;
@@ -357,8 +370,33 @@ int PortQueryStats(RBF_STATS *stats)
         return -1;
     }
 
-    /* Capture the live handle value; the worker closes THIS copy. */
-    c->Port = g_Port;
+    /* Give the worker its OWN handle via DuplicateHandle, captured under the
+     * same lock that guards g_Port. The worker's later CloseHandle() must
+     * NEVER touch the live g_Port value: it originally closed g_Port
+     * directly, which raced with the port thread's next FilterGetMessage()
+     * on that same handle -- and once closed, Windows tends to hand the
+     * exact same handle NUMBER to the very next FilterConnectCommunicationPort,
+     * so the worker could end up closing a brand-new, live connection instead
+     * of the stale one it captured. Symptom: "connected to kernel port" is
+     * immediately followed by GetOverlappedResult failing with
+     * ERROR_INVALID_HANDLE (6), the port thread tears down and reconnects
+     * every RBSVC_RECONNECT_MS forever, and no notification is ever read
+     * (notify_sent stays 0 while rename_ok climbs -- the kernel side is
+     * fine, the connection just never survives long enough to be read).
+     * A duplicated handle is a distinct handle table entry pointing at the
+     * same port object: FilterSendMessage works on it identically, and
+     * closing it can never affect g_Port or whatever now holds its old
+     * numeric value. */
+    if (!DuplicateHandle(GetCurrentProcess(), g_Port,
+                         GetCurrentProcess(), &c->Port,
+                         0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        LogWarn(L"DuplicateHandle failed (err=%lu), skipping stats sample",
+                GetLastError());
+        LeaveCriticalSection(&g_PortLock);
+        InterlockedExchange(&g_SendInFlight, 0);
+        HeapFree(GetProcessHeap(), 0, c);
+        return -1;
+    }
     c->Req.Ack = RBF_CMD_QUERY_STATS;
     c->Refs = 2;                     /* caller + worker */
     c->Done = CreateEventW(NULL, TRUE, FALSE, NULL);

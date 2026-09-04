@@ -147,9 +147,69 @@ NTSTATUS RbfLoadConfig(VOID)
      * "this driver protects nothing" instead of a healthy-looking zero. */
     G.Stats.ProtectedCount = G.ProtectedCount;
 
+    /* ExcludePatterns (REG_MULTI_SZ) -- RB-34.
+       Matched against a delete's FINAL COMPONENT (e.g. "~$report.docx"),
+       not the full path. Lets Office/temp-file churn (lock files, atomic
+       save temporaries) pass through as a real delete instead of being
+       staged into the recycle bin on every keystroke-adjacent save. */
+    RtlInitUnicodeString(&keyName, L"ExcludePatterns");
+    status = ZwQueryValueKey(hKey, &keyName, KeyValuePartialInformation,
+                             kvpi, kvpiLen, &resultLen);
+    i = 0;
+    if (NT_SUCCESS(status) && kvpi->Type == REG_MULTI_SZ && kvpi->DataLength > 0) {
+        PUCHAR multiEnd = (PUCHAR)kvpi->Data + kvpi->DataLength;
+        multi = (PWSTR)kvpi->Data;
+        for (p = multi; (PUCHAR)p + sizeof(WCHAR) <= multiEnd && *p &&
+                        i < RBF_MAX_EXCLUDE; ) {
+            SIZE_T len = 0;
+            PWSTR cur = p;
+            while ((PUCHAR)p + sizeof(WCHAR) <= multiEnd && *p) { p++; len++; }
+            if ((PUCHAR)p + sizeof(WCHAR) <= multiEnd) {
+                p++; /* skip NULL */
+            }
+            if (len < RBF_MAX_NAME) {
+                RBF_EXCLUDE *ee = &G.Exclude[i];
+                ee->Pattern.Buffer = ee->Buffer;
+                ee->Pattern.MaximumLength = (USHORT)(RBF_MAX_NAME * sizeof(WCHAR));
+                RtlCopyMemory(ee->Buffer, cur, len * sizeof(WCHAR));
+                ee->Buffer[len] = L'\0';
+                ee->Pattern.Length = (USHORT)(len * sizeof(WCHAR));
+                /* FsRtlIsNameInExpression requires Expression uppercase
+                   when IgnoreCase=TRUE (see RbfIsExcluded). */
+                RtlUpcaseUnicodeString(&ee->Pattern, &ee->Pattern, FALSE);
+                i++;
+            }
+        }
+    }
+    if (i == 0) {
+        /* No registry value (or empty): fall back to a conservative
+           built-in set covering the common Office lock/temp files instead
+           of silently protecting nothing. Deliberately does NOT include a
+           bare "*.tmp" -- that would also swallow user-created .tmp files
+           nobody asked to stop recycling. */
+        static const PCWSTR defaults[] = {
+            L"~$*",        /* Word/Excel/PowerPoint lock file */
+            L"~WRF*.tmp",  /* Word atomic-save temp */
+            L"~DF*.tmp",   /* Word/Excel misc temp */
+        };
+        for (i = 0; i < RTL_NUMBER_OF(defaults) && i < RBF_MAX_EXCLUDE; i++) {
+            RBF_EXCLUDE *ee = &G.Exclude[i];
+            SIZE_T len = wcslen(defaults[i]);
+            ee->Pattern.Buffer = ee->Buffer;
+            ee->Pattern.MaximumLength = (USHORT)(RBF_MAX_NAME * sizeof(WCHAR));
+            RtlCopyMemory(ee->Buffer, defaults[i], len * sizeof(WCHAR));
+            ee->Buffer[len] = L'\0';
+            ee->Pattern.Length = (USHORT)(len * sizeof(WCHAR));
+            RtlUpcaseUnicodeString(&ee->Pattern, &ee->Pattern, FALSE);
+        }
+        DbgPrint("[RBF] No ExcludePatterns configured, using %lu built-in defaults\n", i);
+    }
+    G.ExcludeCount = i;
+
     ExFreePoolWithTag(kvpi, RBF_TAG);
     ZwClose(hKey);
-    DbgPrint("[RBF] Loaded %lu protected paths\n", G.ProtectedCount);
+    DbgPrint("[RBF] Loaded %lu protected paths, %lu exclude patterns\n",
+             G.ProtectedCount, G.ExcludeCount);
     return STATUS_SUCCESS;
 }
 
@@ -161,6 +221,12 @@ VOID RbfFreeConfig(VOID)
         G.Protected[i].Prefix.Length = 0;
     }
     G.ProtectedCount = 0;
+
+    for (i = 0; i < G.ExcludeCount; i++) {
+        G.Exclude[i].Pattern.Buffer = NULL;
+        G.Exclude[i].Pattern.Length = 0;
+    }
+    G.ExcludeCount = 0;
 }
 
 /* Check if Path matches a protected prefix. Path is NT form
@@ -205,6 +271,34 @@ BOOLEAN RbfIsProtected(_In_ PCUNICODE_STRING Path)
         if (buf != stackBuf) ExFreePoolWithTag(buf, RBF_TAG);
     }
     return matched;
+}
+
+/* Check if a delete's final path component (e.g. "~$report.docx") matches
+ * a configured exclude pattern (RB-34): Office lock files / atomic-save
+ * temporaries that churn constantly and were never meant to be recycled.
+ *
+ * FinalComponent must come from an already-parsed PFLT_FILE_NAME_INFORMATION
+ * (FltParseFileNameInformation called beforehand by the caller).
+ *
+ * FsRtlIsNameInExpression, IgnoreCase=TRUE, requires Expression (our stored
+ * pattern) to already be uppercase -- done once at load time in
+ * RbfLoadConfig. Name (FinalComponent) is passed as-is; the routine handles
+ * the case-insensitive comparison internally. */
+BOOLEAN RbfIsExcluded(_In_ PCUNICODE_STRING FinalComponent)
+{
+    ULONG i;
+
+    if (G.ExcludeCount == 0 || FinalComponent == NULL || FinalComponent->Length == 0)
+        return FALSE;
+
+    for (i = 0; i < G.ExcludeCount; i++) {
+        if (FsRtlIsNameInExpression(&G.Exclude[i].Pattern,
+                                    (PUNICODE_STRING)FinalComponent,
+                                    TRUE, NULL)) {
+            return TRUE;
+        }
+    }
+    return FALSE;
 }
 
 /* ============================================================
@@ -1359,6 +1453,17 @@ RbfStageDelete(
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
+    /* RB-34: filename excluded (Office lock/temp files etc)? Forward as a
+       real delete -- never staged, never counted as an Intercept. Checked
+       here so it covers BOTH callers of RbfStageDelete (the explicit
+       SetInformation path and the FILE_DELETE_ON_CLOSE path from
+       RbfPostCreate) from a single point, and before the queue slot /
+       staging-dir work below so excluded churn costs nothing. */
+    if (RbfIsExcluded(&nameInfo->FinalComponent)) {
+        FltReleaseFileNameInformation(nameInfo);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
     InterlockedIncrement64((volatile LONG64 *)&G.Stats.Intercepts);
 
     /* Get requestor SID: real client SID from the requestor token
@@ -1528,6 +1633,17 @@ RbfPreCreate(
 
     if (!NT_SUCCESS(FltParseFileNameInformation(nameInfo)) ||
         !RbfIsProtected(&nameInfo->Name)) {
+        FltReleaseFileNameInformation(nameInfo);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    /* RB-34: excluded filename (Office lock/temp files etc)? Leave the DOC
+     * flag alone and let the filesystem delete it natively on close -- we
+     * must NOT strip it here, because RbfStageDelete's matching exclusion
+     * check (in RbfPostCreate) only skips staging; it does not re-issue the
+     * delete. Stripping the flag for an excluded name would leave the file
+     * behind forever with no one left to delete it. */
+    if (RbfIsExcluded(&nameInfo->FinalComponent)) {
         FltReleaseFileNameInformation(nameInfo);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }

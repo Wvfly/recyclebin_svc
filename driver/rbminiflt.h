@@ -37,6 +37,12 @@
 /* Maximum number of protected path entries cached in driver */
 #define RBF_MAX_PROTECTED   16
 
+/* Maximum number of filename exclude patterns cached in driver (RB-34).
+   Matched against the FINAL COMPONENT only (not the full path), so a
+   pattern like "~$*" excludes Office lock files in any protected
+   directory without needing a per-folder registry entry. */
+#define RBF_MAX_EXCLUDE     16
+
 /* Bounded async notification queue (fire-and-forget, never blocks delete path) */
 #define RBF_QUEUE_MAX       512
 
@@ -149,6 +155,15 @@ typedef struct _RBF_PROTECTED {
     WCHAR           Buffer[RBF_MAX_PATH];
 } RBF_PROTECTED, *PRBF_PROTECTED;
 
+/* Filename exclude-pattern cache entry (RB-34).
+   Pattern is stored UPPERCASE: FsRtlIsNameInExpression requires the
+   Expression argument to already be uppercase when IgnoreCase=TRUE;
+   the Name argument (the file's actual final component) is passed as-is. */
+typedef struct _RBF_EXCLUDE {
+    UNICODE_STRING  Pattern;        /* e.g. "~$*", uppercase */
+    WCHAR           Buffer[RBF_MAX_NAME];
+} RBF_EXCLUDE, *PRBF_EXCLUDE;
+
 /* Driver global state */
 typedef struct _RBF_GLOBAL {
     PFLT_FILTER     Filter;
@@ -194,6 +209,14 @@ typedef struct _RBF_GLOBAL {
     /* Protected path cache (uppercase) */
     RBF_PROTECTED   Protected[RBF_MAX_PROTECTED];
     ULONG           ProtectedCount;
+
+    /* Filename exclude-pattern cache (RB-34): Office lock/temp files etc.
+       A delete whose final component matches one of these is forwarded
+       untouched (real delete), never staged, never counted as an
+       Intercept. Loaded from Parameters\ExcludePatterns; falls back to a
+       built-in Office-safe default set when that value is absent. */
+    RBF_EXCLUDE     Exclude[RBF_MAX_EXCLUDE];
+    ULONG           ExcludeCount;
 
     /* Staging root (NT form, e.g. \Device\HarddiskVolume1\RBStore) */
     UNICODE_STRING  StoreRoot;
@@ -241,6 +264,7 @@ NTSTATUS RbfInstanceQueryTeardown(PCFLT_RELATED_OBJECTS,
 NTSTATUS RbfLoadConfig(VOID);
 VOID     RbfFreeConfig(VOID);
 BOOLEAN  RbfIsProtected(_In_ PCUNICODE_STRING Path);
+BOOLEAN  RbfIsExcluded(_In_ PCUNICODE_STRING FinalComponent);
 
 /* Staging / move */
 NTSTATUS RbfEnsureStoreDir(_In_ PCUNICODE_STRING VolumeName,
