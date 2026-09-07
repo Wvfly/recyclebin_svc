@@ -56,3 +56,60 @@ func fillUsernames(items []db.Item) {
 		items[i].Username = lookupSidName(items[i].Sid)
 	}
 }
+
+// buildItemFilter turns a status and a "SID or username" string into a filter.
+//
+// The schema stores only SIDs; usernames exist nowhere in the database, they
+// are resolved at query time. So a username cannot be matched in SQL directly.
+// Instead we resolve it to the SIDs that belong to it and filter by that set,
+// which keeps the WHERE clause (and therefore LIMIT/OFFSET and COUNT) correct.
+//
+// Interpretation of userOrSid:
+//   - ""            -> no SID filter
+//   - "S-..."       -> SID, matched as a prefix so a partial SID works
+//   - anything else -> username fragment, matched case-insensitively against
+//                      "DOMAIN\\account" (so "alice" and "CORP\\alice" both work)
+//
+// A username that resolves to no known account yields Sids = []string{}, i.e.
+// match nothing. Returning "no filter" there would silently show every row,
+// which looks like the filter was ignored.
+func (s *Server) buildItemFilter(status, userOrSid string) (db.ItemFilter, error) {
+	f := db.ItemFilter{Status: status}
+	if userOrSid == "" {
+		return f, nil
+	}
+	if strings.HasPrefix(userOrSid, "S-") {
+		f.SidPrefix = userOrSid
+		return f, nil
+	}
+
+	if s.DB == nil {
+		// No database (tests, or a request dbUnavailable() already rejected).
+		// Match nothing rather than panicking, and never fall back to "no filter".
+		f.Sids = []string{}
+		return f, nil
+	}
+	sids, err := s.DB.DistinctSids()
+	if err != nil {
+		return f, err
+	}
+	f.Sids = sidsMatchingUser(sids, userOrSid)
+	return f, nil
+}
+
+// sidsMatchingUser returns the SIDs whose resolved account name contains
+// needle (case-insensitive). SIDs that do not resolve to a name are skipped.
+func sidsMatchingUser(sids []string, needle string) []string {
+	want := strings.ToLower(needle)
+	out := []string{} // non-nil: "resolved to zero accounts" != "no filter"
+	for _, sid := range sids {
+		name := lookupSidName(sid)
+		if name == "" {
+			continue
+		}
+		if strings.Contains(strings.ToLower(name), want) {
+			out = append(out, sid)
+		}
+	}
+	return out
+}

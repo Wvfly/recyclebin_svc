@@ -153,6 +153,9 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /items?limit=&offset=&status=&sid=
+//
+// `sid` accepts either a SID or a username fragment, so one box in the UI can
+// filter by either (see buildItemFilter).
 func (s *Server) handleItems(w http.ResponseWriter, r *http.Request) {
 	if !s.authorized(r) {
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
@@ -171,7 +174,13 @@ func (s *Server) handleItems(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	offset, _ := strconv.Atoi(q.Get("offset"))
 
-	items, err := s.DB.ListItems(limit, offset, q.Get("status"), q.Get("sid"))
+	filter, err := s.buildItemFilter(q.Get("status"), q.Get("sid"))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	items, err := s.DB.ListItemsFiltered(limit, offset, filter)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -182,7 +191,7 @@ func (s *Server) handleItems(w http.ResponseWriter, r *http.Request) {
 	fillUsernames(items)
 	// total drives front-end pagination; a count failure must not break the
 	// page itself, so fall back to -1 (unknown) and let the UI cope.
-	total, err := s.DB.CountItems(q.Get("status"), q.Get("sid"))
+	total, err := s.DB.CountItemsFiltered(filter)
 	if err != nil {
 		total = -1
 	}

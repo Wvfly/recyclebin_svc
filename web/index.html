@@ -140,7 +140,7 @@
         <option value="purged">purged</option>
         <option value="restored">restored</option>
       </select>
-      <input id="fSid" placeholder="SID 过滤" style="width:200px">
+      <input id="fSid" placeholder="SID / 用户名" title="可按 SID（支持前缀，如 S-1-5-21）或用户名片段过滤（如 alice、CORP\alice），留空不过滤" style="width:240px">
       <input id="fSearch" class="search" placeholder="按路径搜索（子串，回车）">
       <button id="refreshItems" class="primary">刷新</button>
     </div>
@@ -415,6 +415,7 @@ $('#refreshItems').onclick = ()=>{ state.offset=0; loadItems(); };
 $('#refreshOps').onclick = loadOps;
 $('#fStatus').onchange = ()=>{ state.offset=0; loadItems(); };
 $('#fSid').onchange = ()=>{ state.offset=0; loadItems(); };
+$('#fSid').addEventListener('keydown', e=>{ if(e.key==='Enter'){ state.offset=0; loadItems(); } });
 $('#fSearch').addEventListener('keydown', e=>{ if(e.key==='Enter'){ state.offset=0; loadItems(); } });
 
 let autoTimer=null;

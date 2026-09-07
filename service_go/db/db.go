@@ -261,8 +261,31 @@ func scanItems(rows *sql.Rows) ([]Item, error) {
 	return out, rows.Err()
 }
 
+// ItemFilter narrows a listing to one status and/or a set of SIDs.
+//
+// Only one of SidExact / SidPrefix / Sids is expected to be set by a given
+// caller; the three forms exist because the UI accepts either a SID or a
+// username, and a username has to be resolved to a set of SIDs first.
+type ItemFilter struct {
+	Status string
+	// SidExact matches one SID verbatim.
+	SidExact string
+	// SidPrefix matches SIDs starting with this string (LIKE 'prefix%',
+	// which still uses an index, unlike a leading wildcard).
+	SidPrefix string
+	// Sids matches any SID in this set. A non-nil but empty slice means
+	// "match nothing" (the caller resolved a username to zero accounts).
+	Sids []string
+}
+
 // ListItems returns a page of items, optionally filtered by status and/or SID.
+// It is the SID-exact special case of ListItemsFiltered.
 func (d *DB) ListItems(limit, offset int, status, sid string) ([]Item, error) {
+	return d.ListItemsFiltered(limit, offset, ItemFilter{Status: status, SidExact: sid})
+}
+
+// ListItemsFiltered returns a page of items matching f.
+func (d *DB) ListItemsFiltered(limit, offset int, f ItemFilter) ([]Item, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -277,13 +300,22 @@ func (d *DB) ListItems(limit, offset int, status, sid string) ([]Item, error) {
 	var args []interface{}
 	var conds []string
 
-	if status != "" {
+	if f.Status != "" {
 		conds = append(conds, "status = ?")
-		args = append(args, status)
+		args = append(args, f.Status)
 	}
-	if sid != "" {
+	switch {
+	case f.SidExact != "":
 		conds = append(conds, "sid = ?")
-		args = append(args, sid)
+		args = append(args, f.SidExact)
+	case f.SidPrefix != "":
+		conds = append(conds, "sid LIKE ? ESCAPE '\\'")
+		args = append(args, likeEscape(f.SidPrefix)+"%")
+	case f.Sids != nil:
+		if len(f.Sids) == 0 {
+			return []Item{}, nil // matched no account: nothing to return
+		}
+		conds = append(conds, sidInClause(f.Sids, &args))
 	}
 	if len(conds) > 0 {
 		q += " WHERE " + conds[0]
@@ -303,6 +335,37 @@ func (d *DB) ListItems(limit, offset int, status, sid string) ([]Item, error) {
 	defer rows.Close()
 
 	return scanItems(rows)
+}
+
+// sidInClause appends placeholders for sids to args and returns the fragment.
+func sidInClause(sids []string, args *[]interface{}) string {
+	ph := make([]string, 0, len(sids))
+	for _, s := range sids {
+		ph = append(ph, "?")
+		*args = append(*args, s)
+	}
+	return "sid IN (" + strings.Join(ph, ",") + ")"
+}
+
+// DistinctSids returns every SID recorded in items. Used to resolve a username
+// typed in the UI into the SIDs that belong to it, since the schema stores
+// only SIDs and usernames are resolved at query time.
+func (d *DB) DistinctSids() ([]string, error) {
+	rows, err := d.ro.Query("SELECT DISTINCT sid FROM items")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var sid string
+		if err := rows.Scan(&sid); err != nil {
+			return nil, err
+		}
+		out = append(out, sid)
+	}
+	return out, rows.Err()
 }
 
 // likeEscape neutralises the LIKE metacharacters in user input (RB-09).
@@ -356,16 +419,31 @@ func (d *DB) SearchItems(pattern string, limit, offset int) ([]Item, error) {
 // CountItems returns the number of rows matching the same filters as ListItems.
 // The front-end uses it to render an accurate pager (total / last page).
 func (d *DB) CountItems(status, sid string) (int64, error) {
+	return d.CountItemsFiltered(ItemFilter{Status: status, SidExact: sid})
+}
+
+// CountItemsFiltered counts rows matching f. It must apply exactly the same
+// conditions as ListItemsFiltered or the pager will disagree with the rows.
+func (d *DB) CountItemsFiltered(f ItemFilter) (int64, error) {
 	q := "SELECT COUNT(*) FROM items"
 	var args []interface{}
 	var conds []string
-	if status != "" {
+	if f.Status != "" {
 		conds = append(conds, "status = ?")
-		args = append(args, status)
+		args = append(args, f.Status)
 	}
-	if sid != "" {
+	switch {
+	case f.SidExact != "":
 		conds = append(conds, "sid = ?")
-		args = append(args, sid)
+		args = append(args, f.SidExact)
+	case f.SidPrefix != "":
+		conds = append(conds, "sid LIKE ? ESCAPE '\\'")
+		args = append(args, likeEscape(f.SidPrefix)+"%")
+	case f.Sids != nil:
+		if len(f.Sids) == 0 {
+			return 0, nil
+		}
+		conds = append(conds, sidInClause(f.Sids, &args))
 	}
 	if len(conds) > 0 {
 		q += " WHERE " + conds[0]
