@@ -33,6 +33,22 @@ rem   - Run from any directory; paths are resolved relative to this script.
 rem ============================================================
 setlocal
 
+rem ---- colored output (ANSI; works on Windows 10+ / Windows Terminal) ----
+for /f "delims=" %%i in ('powershell -NoProfile -Command "Write-Output ([char]27)" 2^>nul') do set "ESC=%%i"
+if not defined ESC for /f "delims=" %%i in ('prompt $E ^& cmd /c "exit /b"') do set "ESC=%%i"
+if defined ESC (
+    set "C_OK=%ESC%[92m"
+    set "C_WARN=%ESC%[93m"
+    set "C_ERR=%ESC%[91m"
+    set "C_SKIP=%ESC%[96m"
+    set "C_HDR=%ESC%[96m"
+    set "C_RST=%ESC%[0m"
+) else (
+    set "C_OK=" & set "C_WARN=" & set "C_ERR=" & set "C_SKIP=" & set "C_HDR=" & set "C_RST="
+)
+rem Best-effort: turn on virtual-terminal processing so colors show in conhost too.
+powershell -NoProfile -Command "try{$h=[Console]::OpenStandardOutput().Handle;Add-Type 'using System;using System.Runtime.InteropServices;public class RBK{[DllImport(\"kernel32\")]public static extern bool GetConsoleMode(IntPtr h,out uint m);[DllImport(\"kernel32\")]public static extern bool SetConsoleMode(IntPtr h,uint m);}';uint m;if([RBK]::GetConsoleMode($h,[ref]$m)){[RBK]::SetConsoleMode($h,$m -bor 4)}|Out-Null}catch{}" >nul 2>&1
+
 set "CFG=%~1"
 if "%CFG%"=="" set "CFG=Release"
 
@@ -41,7 +57,7 @@ if /i "%CFG%"=="-h"  goto :usage
 if /i "%CFG%"=="--help" goto :usage
 
 if /i not "%CFG%"=="Release" if /i not "%CFG%"=="Debug" (
-    echo [ERROR] Unknown configuration "%CFG%" - expected Release or Debug.
+    call :c_err [ERROR] Unknown configuration "%CFG%" - expected Release or Debug.
     exit /b 1
 )
 
@@ -49,16 +65,18 @@ set "OPT=%~2"
 set "DO_SIGN=1"
 if /i "%OPT%"=="nosign" set "DO_SIGN=0"
 if defined OPT if /i not "%OPT%"=="nosign" (
-    echo [ERROR] Unknown option "%OPT%" - expected "nosign".
+    call :c_err [ERROR] Unknown option "%OPT%" - expected "nosign".
     exit /b 1
 )
 
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
-echo ============================================================
-echo  RecycleBin for SMB - full build ^(%CFG%^)
-echo ============================================================
+call :c_hdr ============================================================
+call :c_hdr  RecycleBin for SMB - full build ^(%CFG%^)
+call :c_hdr ============================================================
+call :c_hdr   Author : wuweigang
+call :c_hdr   Repo   : https://github.com/Wvfly/recyclebin_svc
 echo   Root: %ROOT%
 echo.
 
@@ -74,19 +92,19 @@ echo   done.
 echo.
 
 rem ============================================================
-echo [1/3] Kernel driver    -^> driver\rbminiflt.sys
-echo ============================================================
+call :c_hdr [1/3] Kernel driver    -^> driver\rbminiflt.sys
+call :c_hdr ============================================================
 pushd "%ROOT%\driver"
 if not exist "build.cmd" (
     popd
-    echo [ERROR] driver\build.cmd not found.
+    call :c_err [ERROR] driver\build.cmd not found.
     exit /b 1
 )
 call build.cmd %CFG%
 if errorlevel 1 (
     popd
     echo.
-    echo [FAILED] Driver build failed.
+    call :c_err [FAILED] Driver build failed.
     echo.
     echo   Common causes:
     echo     - WDK not installed. driver\build.cmd auto-detects the WDK/VS;
@@ -96,11 +114,11 @@ if errorlevel 1 (
 )
 if not exist "rbminiflt.sys" (
     popd
-    echo [FAILED] build.cmd succeeded but rbminiflt.sys is missing.
+    call :c_err [FAILED] build.cmd succeeded but rbminiflt.sys is missing.
     exit /b 1
 )
 popd
-echo   [OK] rbminiflt.sys
+call :c_ok   [OK] rbminiflt.sys
 echo.
 
 rem ------------------------------------------------------------
@@ -118,7 +136,7 @@ rem succeeds, but the driver then needs test-signing enabled
 rem (bcdedit /set testsigning on) or a manual sign before deploy.
 rem ------------------------------------------------------------
 if "%DO_SIGN%"=="0" (
-    echo [SKIP] Driver signing disabled ^(nosign^).
+    call :c_skip [SKIP] Driver signing disabled ^(nosign^).
     goto :sign_done
 )
 
@@ -146,7 +164,7 @@ if not defined SIGNTOOL (
     if defined SBIN call set "SIGNTOOL=%%SBIN%%"
 )
 if not defined SIGNTOOL (
-    echo [WARN] signtool.exe not found - rbminiflt.sys NOT signed.
+    call :c_warn [WARN] signtool.exe not found - rbminiflt.sys NOT signed.
     echo        Deploy only with test-signing enabled, or sign manually:
     echo        signtool sign /sha1 %RBF_CERT_SHA1% /fd sha256 /tr http://timestamp.digicert.com /td sha256 rbminiflt.sys
     goto :sign_done
@@ -157,31 +175,31 @@ pushd "%ROOT%\driver"
 "%SIGNTOOL%" sign %SM_OPTION% /sha1 "%RBF_CERT_SHA1%" /fd sha256 /tr http://timestamp.digicert.com /td sha256 rbminiflt.sys
 if errorlevel 1 (
     popd
-    echo [WARN] Signing failed - rbminiflt.sys NOT signed.
+    call :c_warn [WARN] Signing failed - rbminiflt.sys NOT signed.
     echo        Deploy only with test-signing enabled, or sign manually:
     echo        signtool sign /sha1 %RBF_CERT_SHA1% /fd sha256 /tr http://timestamp.digicert.com /td sha256 rbminiflt.sys
     goto :sign_done
 )
 popd
-echo   [OK] rbminiflt.sys signed.
+call :c_ok   [OK] rbminiflt.sys signed.
 echo.
 
 :sign_done
 
 rem ============================================================
-echo [2/3] Core service     -^> service_c\rbservice.exe
-echo ============================================================
+call :c_hdr [2/3] Core service     -^> service_c\rbservice.exe
+call :c_hdr ============================================================
 pushd "%ROOT%\service_c"
 if not exist "build.cmd" (
     popd
-    echo [ERROR] service_c\build.cmd not found.
+    call :c_err [ERROR] service_c\build.cmd not found.
     exit /b 1
 )
 call build.cmd %CFG%
 if errorlevel 1 (
     popd
     echo.
-    echo [FAILED] Core service build failed.
+    call :c_err [FAILED] Core service build failed.
     echo.
     echo   Common causes:
     echo     - Visual Studio 2022 with "Desktop development with C++" missing.
@@ -193,21 +211,21 @@ if errorlevel 1 (
 )
 if not exist "rbservice.exe" (
     popd
-    echo [FAILED] build.cmd succeeded but rbservice.exe is missing.
+    call :c_err [FAILED] build.cmd succeeded but rbservice.exe is missing.
     exit /b 1
 )
 popd
-echo   [OK] rbservice.exe
+call :c_ok   [OK] rbservice.exe
 echo.
 
 rem ============================================================
-echo [3/3] Management API   -^> service_go\rbapi.exe
-echo ============================================================
+call :c_hdr [3/3] Management API   -^> service_go\rbapi.exe
+call :c_hdr ============================================================
 pushd "%ROOT%\service_go"
 
 where go >nul 2>&1
 if errorlevel 1 (
-    echo   [SKIP] Go toolchain not found on PATH.
+    call :c_skip   [SKIP] Go toolchain not found on PATH.
     echo          rbapi.exe is optional - the core service works without it.
     echo          Install Go 1.22+ from https://go.dev/dl/ to build it.
     popd
@@ -238,7 +256,7 @@ go build -o rbapi.exe .
 if errorlevel 1 (
     popd
     echo.
-    echo [FAILED] Go build failed.
+    call :c_err [FAILED] Go build failed.
     echo.
     echo   Common causes:
     echo     - Module download failed. Try:  go mod tidy
@@ -248,10 +266,10 @@ if errorlevel 1 (
 )
 if not exist "rbapi.exe" (
     popd
-    echo [FAILED] go build succeeded but rbapi.exe is missing.
+    call :c_err [FAILED] go build succeeded but rbapi.exe is missing.
     exit /b 1
 )
-echo   [OK] rbapi.exe
+call :c_ok   [OK] rbapi.exe
 popd
 
 :after_api
@@ -262,18 +280,18 @@ rem Contract verification
 rem ============================================================
 where python >nul 2>&1
 if errorlevel 1 (
-    echo [SKIP] python not found - skipping contract verification.
+    call :c_skip [SKIP] python not found - skipping contract verification.
     goto :collect
 )
 
-echo ============================================================
-echo  Contract verification
-echo ============================================================
+call :c_hdr ============================================================
+call :c_hdr  Contract verification
+call :c_hdr ============================================================
 pushd "%ROOT%"
 
 if defined API_SKIPPED (
     echo.
-    echo   [SKIP] verify_contract.py needs rbapi.exe, which was not built
+    call :c_skip   [SKIP] verify_contract.py needs rbapi.exe, which was not built
     echo          ^(Go toolchain missing^). The C ^<-^> Go contract check is
     echo          skipped; C service verification still runs below.
 ) else (
@@ -283,7 +301,7 @@ if defined API_SKIPPED (
     if errorlevel 1 (
         popd
         echo.
-        echo [FAILED] Contract verification failed.
+        call :c_err [FAILED] Contract verification failed.
         echo          The C service and Go API disagree about the database.
         exit /b 1
     )
@@ -295,7 +313,7 @@ python "db\verify_c_contract.py"
 if errorlevel 1 (
     popd
     echo.
-    echo [FAILED] C contract verification failed.
+    call :c_err [FAILED] C contract verification failed.
     exit /b 1
 )
 
@@ -304,9 +322,9 @@ echo.
 
 rem ============================================================
 :collect
-echo ============================================================
-echo  Collecting artifacts -^> target\%CFG%\
-echo ============================================================
+call :c_hdr ============================================================
+call :c_hdr  Collecting artifacts -^> target\%CFG%\
+call :c_hdr ============================================================
 set "TARGET=%~dp0target\%CFG%"
 if not exist "%TARGET%" mkdir "%TARGET%"
 
@@ -342,56 +360,56 @@ if exist "%ROOT%\web\index.html" (
     copy /y "%ROOT%\web\index.html" "%TARGET%\index.html" >nul
     if errorlevel 1 goto :collect_failed
 ) else (
-    echo   [WARN] web\index.html not found - console skipped
+    call :c_warn   [WARN] web\index.html not found - console skipped
 )
 
-echo   [OK] binaries + INF + deploy.ps1 + index.html in %TARGET%
+call :c_ok   [OK] binaries + INF + deploy.ps1 + index.html in %TARGET%
 echo.
 goto :summary
 
 :collect_failed
 echo.
-echo [FAILED] Could not collect build artifacts into %TARGET%.
+call :c_err [FAILED] Could not collect build artifacts into %TARGET%.
 exit /b 1
 
 rem ============================================================
 :summary
-echo ============================================================
-echo  BUILD SUCCESSFUL ^(%CFG%^)
-echo ============================================================
+call :c_hdr ============================================================
+call :c_ok  BUILD SUCCESSFUL ^(%CFG%^)
+call :c_hdr ============================================================
 echo.
-echo   Outputs:
+call :c_hdr   Outputs:
 
 if exist "%ROOT%\driver\rbminiflt.sys" (
-    for %%F in ("%ROOT%\driver\rbminiflt.sys") do echo     rbminiflt.sys     %%~zF bytes   driver\rbminiflt.sys
+    for %%F in ("%ROOT%\driver\rbminiflt.sys") do call :c_hdr     rbminiflt.sys     %%~zF bytes   driver\rbminiflt.sys
 ) else (
-    echo     rbminiflt.sys     MISSING
+    call :c_err     rbminiflt.sys     MISSING
 )
 
 if exist "%ROOT%\service_c\rbservice.exe" (
-    for %%F in ("%ROOT%\service_c\rbservice.exe") do echo     rbservice.exe     %%~zF bytes   service_c\rbservice.exe
+    for %%F in ("%ROOT%\service_c\rbservice.exe") do call :c_hdr     rbservice.exe     %%~zF bytes   service_c\rbservice.exe
 ) else (
-    echo     rbservice.exe     MISSING
+    call :c_err     rbservice.exe     MISSING
 )
 
 if defined API_SKIPPED (
-    echo     rbapi.exe         not built ^(Go toolchain missing - optional^)
+    call :c_skip     rbapi.exe         not built ^(Go toolchain missing - optional^)
     echo.
     echo   Note: C ^<-^> Go contract verification was skipped too, since it
     echo         needs rbapi.exe. Install Go and re-run to enable it.
 ) else (
     if exist "%ROOT%\service_go\rbapi.exe" (
-        for %%F in ("%ROOT%\service_go\rbapi.exe") do echo     rbapi.exe         %%~zF bytes   service_go\rbapi.exe
+        for %%F in ("%ROOT%\service_go\rbapi.exe") do call :c_hdr     rbapi.exe         %%~zF bytes   service_go\rbapi.exe
     ) else (
-        echo     rbapi.exe         MISSING
+        call :c_err     rbapi.exe         MISSING
     )
 )
 
 echo.
-echo   Deploy package ready: %TARGET%
-echo     ^(self-contained: binaries + rbminiflt.inf + deploy.ps1 + index.html^)
+call :c_hdr   Deploy package ready: %TARGET%
+call :c_hdr     ^(self-contained: binaries + rbminiflt.inf + deploy.ps1 + index.html^)
 echo.
-echo   Next steps:
+call :c_hdr   Next steps:
 echo     1. Copy the whole folder above to the target machine
 echo     2. Edit deploy.ps1 there: set ProtectedPaths and StoreRoot on the SAME volume
 echo     3. bcdedit /set testsigning on   ^(then reboot^)
@@ -435,3 +453,23 @@ echo.
 exit /b 0
 
 endlocal
+
+rem ============================================================
+rem Colorized echo helpers: prefix a status keyword, color the whole line.
+rem Call as:  call :c_ok  [OK] something    (text passed verbatim via %*)
+rem ============================================================
+:c_ok
+echo %C_OK%%*%C_RST%
+exit /b 0
+:c_warn
+echo %C_WARN%%*%C_RST%
+exit /b 0
+:c_err
+echo %C_ERR%%*%C_RST%
+exit /b 0
+:c_skip
+echo %C_SKIP%%*%C_RST%
+exit /b 0
+:c_hdr
+echo %C_HDR%%*%C_RST%
+exit /b 0

@@ -4,6 +4,19 @@ REM Run inside "x64 Native Tools Command Prompt for VS 2022"
 REM or just double-click (it locates the toolchain automatically).
 
 setlocal EnableDelayedExpansion
+
+REM ---- colored output (ANSI; degrades to plain text if ESC unavailable) ----
+for /f "delims=" %%i in ('powershell -NoProfile -Command "Write-Output ([char]27)" 2^>nul') do set "ESC=%%i"
+if not defined ESC for /f "delims=" %%i in ('prompt $E ^& cmd /c "exit /b"') do set "ESC=%%i"
+if defined ESC (
+    set "C_ERR=%ESC%[91m"
+    set "C_OK=%ESC%[92m"
+    set "C_RST=%ESC%[0m"
+) else (
+    set "C_ERR=" & set "C_OK=" & set "C_RST="
+)
+powershell -NoProfile -Command "try{$h=[Console]::OpenStandardOutput().Handle;Add-Type 'using System;using System.Runtime.InteropServices;public class RBK{[DllImport(\"kernel32\")]public static extern bool GetConsoleMode(IntPtr h,out uint m);[DllImport(\"kernel32\")]public static extern bool SetConsoleMode(IntPtr h,uint m);}';uint m;if([RBK]::GetConsoleMode($h,[ref]$m)){[RBK]::SetConsoleMode($h,$m -bor 4)}|Out-Null}catch{}" >nul 2>&1
+
 set CFG=Release
 if not "%1"=="" set CFG=%1
 
@@ -35,7 +48,7 @@ for %%E in (Community Professional Enterprise BuildTools) do (
     if not defined VSED if exist "!VSROOT!\%%E\VC\Tools\MSVC" set "VSED=%%E"
 )
 if not defined VSED (
-    echo [ERROR] Cannot find Visual Studio 2019/2022 under !VSROOT!.
+    echo %C_ERR%[ERROR] Cannot find Visual Studio 2019/2022 under !VSROOT!.%C_RST%
     echo         Install with the "Desktop development with C++" workload.
     exit /b 1
 )
@@ -44,7 +57,7 @@ for /f "delims=" %%V in ('dir /b /ad "!VSROOT!\!VSED!\VC\Tools\MSVC\14.*" 2^>nul
     if not defined MSVCVER set "MSVCVER=%%V"
 )
 if not defined MSVCVER (
-    echo [ERROR] No MSVC toolset under !VSROOT!\!VSED!\VC\Tools\MSVC.
+    echo %C_ERR%[ERROR] No MSVC toolset under !VSROOT!\!VSED!\VC\Tools\MSVC.%C_RST%
     exit /b 1
 )
 set "MSVC=!VSROOT!\!VSED!\VC\Tools\MSVC\!MSVCVER!"
@@ -58,7 +71,7 @@ for /f "delims=" %%V in ('dir /b /ad "!WDKROOT!\Include\10.*" 2^>nul ^| sort /r'
     if not defined WDKVER set "WDKVER=%%V"
 )
 if not defined WDKVER (
-    echo [ERROR] Cannot find the Windows WDK under !WDKROOT!\Include.
+    echo %C_ERR%[ERROR] Cannot find the Windows WDK under !WDKROOT!\Include.%C_RST%
     echo         Install the WDK matching your Windows SDK version.
     exit /b 1
 )
@@ -70,6 +83,8 @@ exit /b 0
 
 if not exist Build mkdir Build
 
+echo === RecycleBin for SMB - driver build (author: wuweigang) ===
+echo === Repo: https://github.com/Wvfly/recyclebin_svc ===
 echo === Compiling rbminiflt.c ===
 if "%CFG%"=="Debug" (
     "%BIN%\cl.exe" /c /kernel /W4 /wd4324 /Zi /Od /D_AMD64_ /D_WIN64 /FoBuild\rbminiflt_dbg.obj rbminiflt.c

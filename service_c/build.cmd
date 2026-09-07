@@ -11,6 +11,21 @@ rem fltuser.h and fltlib.lib (kernel communication port APIs).
 
 setlocal
 
+REM ---- colored output (ANSI; degrades to plain text if ESC unavailable) ----
+for /f "delims=" %%i in ('powershell -NoProfile -Command "Write-Output ([char]27)" 2^>nul') do set "ESC=%%i"
+if not defined ESC for /f "delims=" %%i in ('prompt $E ^& cmd /c "exit /b"') do set "ESC=%%i"
+if defined ESC (
+    set "C_OK=%ESC%[92m"
+    set "C_WARN=%ESC%[93m"
+    set "C_ERR=%ESC%[91m"
+    set "C_SKIP=%ESC%[96m"
+    set "C_HDR=%ESC%[96m"
+    set "C_RST=%ESC%[0m"
+) else (
+    set "C_OK=" & set "C_WARN=" & set "C_ERR=" & set "C_SKIP=" & set "C_HDR=" & set "C_RST="
+)
+powershell -NoProfile -Command "try{$h=[Console]::OpenStandardOutput().Handle;Add-Type 'using System;using System.Runtime.InteropServices;public class RBK{[DllImport(\"kernel32\")]public static extern bool GetConsoleMode(IntPtr h,out uint m);[DllImport(\"kernel32\")]public static extern bool SetConsoleMode(IntPtr h,uint m);}';uint m;if([RBK]::GetConsoleMode($h,[ref]$m)){[RBK]::SetConsoleMode($h,$m -bor 4)}|Out-Null}catch{}" >nul 2>&1
+
 set BUILD_TYPE=%1
 if "%BUILD_TYPE%"=="" set BUILD_TYPE=Release
 
@@ -27,14 +42,14 @@ for %%B in ("C:\Program Files" "C:\Program Files (x86)") do (
     )
 )
 if not defined FOUND_VCVARS (
-    echo [ERROR] Cannot find vcvars64.bat. Install Visual Studio 2019/2022 with
+    call :c_err [ERROR] Cannot find vcvars64.bat. Install Visual Studio 2019/2022 with
     echo         the "Desktop development with C++" workload.
     exit /b 1
 )
 
 call "%VCVARS%" >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] vcvars64.bat failed to initialize the build environment.
+    call :c_err [ERROR] vcvars64.bat failed to initialize the build environment.
     exit /b 1
 )
 
@@ -44,7 +59,7 @@ rem cannot drift apart. This guarantees the embedded DDL always matches.
 echo Regenerating schema_sql.h from ..\db\schema.sql ...
 powershell -NoProfile -ExecutionPolicy Bypass -File "..\db\gen_schema.ps1"
 if errorlevel 1 (
-    echo [ERROR] Failed to generate schema_sql.h from db\schema.sql.
+    call :c_err [ERROR] Failed to generate schema_sql.h from db\schema.sql.
     exit /b 1
 )
 
@@ -71,13 +86,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "Write-Host '  sqlite3.c/h ready'"
 if errorlevel 1 (
     echo.
-    echo [ERROR] Could not download the SQLite amalgamation.
+    call :c_err [ERROR] Could not download the SQLite amalgamation.
     echo         Manually place sqlite3.c and sqlite3.h in this directory, or
     echo         download from: https://www.sqlite.org/download.html
     exit /b 1
 )
 if not exist "sqlite3.c" (
-    echo [ERROR] sqlite3.c still missing after download attempt.
+    call :c_err [ERROR] sqlite3.c still missing after download attempt.
     exit /b 1
 )
 
@@ -98,6 +113,8 @@ set LIBS=fltlib.lib wtsapi32.lib advapi32.lib shell32.lib user32.lib netapi32.li
 
 set SOURCES=rbservice.c rbdb.c rbstore.c rbvol.c rbpolicy.c rbrestore.c rbport.c rbconfig.c rblog.c rbconcile.c rbsession.c sqlite3.c
 
+echo RecycleBin for SMB - service build (author: wuweigang)
+echo Repo: https://github.com/Wvfly/recyclebin_svc
 echo Building rbservice.exe (%BUILD_TYPE%)...
 echo.
 
@@ -105,17 +122,36 @@ cl %CFLAGS% %SOURCES% /link %LFLAGS% %LIBS% /OUT:rbservice.exe
 
 if errorlevel 1 (
     echo.
-    echo [FAILED] Compilation errors above.
+    call :c_err [FAILED] Compilation errors above.
     exit /b 1
 )
 
 echo.
-echo [OK] rbservice.exe built.
+call :c_ok [OK] rbservice.exe built.
 
 rem ---- Clean intermediates ------------------------------------------------
 for %%f in (%SOURCES%) do (
     if exist "%%~nf.obj" del "%%~nf.obj" >nul 2>&1
 )
 
-echo [OK] Cleaned intermediate files.
+call :c_ok [OK] Cleaned intermediate files.
 endlocal
+
+rem ============================================================
+rem Colorized echo helpers
+rem ============================================================
+:c_ok
+echo %C_OK%%*%C_RST%
+exit /b 0
+:c_warn
+echo %C_WARN%%*%C_RST%
+exit /b 0
+:c_err
+echo %C_ERR%%*%C_RST%
+exit /b 0
+:c_skip
+echo %C_SKIP%%*%C_RST%
+exit /b 0
+:c_hdr
+echo %C_HDR%%*%C_RST%
+exit /b 0
