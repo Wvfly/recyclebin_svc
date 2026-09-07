@@ -18,7 +18,7 @@ if defined ESC (
     set "C_OK=%ESC%[92m"
     set "C_WARN=%ESC%[93m"
     set "C_ERR=%ESC%[91m"
-    set "C_SKIP=%ESC%[96m"
+    set "C_SKIP=%ESC%[93m"
     set "C_HDR=%ESC%[96m"
     set "C_RST=%ESC%[0m"
 ) else (

@@ -40,11 +40,12 @@ if defined ESC (
     set "C_OK=%ESC%[92m"
     set "C_WARN=%ESC%[93m"
     set "C_ERR=%ESC%[91m"
-    set "C_SKIP=%ESC%[96m"
+    set "C_SKIP=%ESC%[93m"
     set "C_HDR=%ESC%[96m"
+    set "C_OUT=%ESC%[94m"
     set "C_RST=%ESC%[0m"
 ) else (
-    set "C_OK=" & set "C_WARN=" & set "C_ERR=" & set "C_SKIP=" & set "C_HDR=" & set "C_RST="
+    set "C_OK=" & set "C_WARN=" & set "C_ERR=" & set "C_SKIP=" & set "C_HDR=" & set "C_OUT=" & set "C_RST="
 )
 rem Best-effort: turn on virtual-terminal processing so colors show in conhost too.
 powershell -NoProfile -Command "try{$h=[Console]::OpenStandardOutput().Handle;Add-Type 'using System;using System.Runtime.InteropServices;public class RBK{[DllImport(\"kernel32\")]public static extern bool GetConsoleMode(IntPtr h,out uint m);[DllImport(\"kernel32\")]public static extern bool SetConsoleMode(IntPtr h,uint m);}';uint m;if([RBK]::GetConsoleMode($h,[ref]$m)){[RBK]::SetConsoleMode($h,$m -bor 4)}|Out-Null}catch{}" >nul 2>&1
@@ -381,13 +382,13 @@ echo.
 call :c_hdr   Outputs:
 
 if exist "%ROOT%\driver\rbminiflt.sys" (
-    for %%F in ("%ROOT%\driver\rbminiflt.sys") do call :c_hdr     rbminiflt.sys     %%~zF bytes   driver\rbminiflt.sys
+    for %%F in ("%ROOT%\driver\rbminiflt.sys") do call :c_out     rbminiflt.sys     %%~zF bytes   driver\rbminiflt.sys
 ) else (
     call :c_err     rbminiflt.sys     MISSING
 )
 
 if exist "%ROOT%\service_c\rbservice.exe" (
-    for %%F in ("%ROOT%\service_c\rbservice.exe") do call :c_hdr     rbservice.exe     %%~zF bytes   service_c\rbservice.exe
+    for %%F in ("%ROOT%\service_c\rbservice.exe") do call :c_out     rbservice.exe     %%~zF bytes   service_c\rbservice.exe
 ) else (
     call :c_err     rbservice.exe     MISSING
 )
@@ -399,7 +400,7 @@ if defined API_SKIPPED (
     echo         needs rbapi.exe. Install Go and re-run to enable it.
 ) else (
     if exist "%ROOT%\service_go\rbapi.exe" (
-        for %%F in ("%ROOT%\service_go\rbapi.exe") do call :c_hdr     rbapi.exe         %%~zF bytes   service_go\rbapi.exe
+        for %%F in ("%ROOT%\service_go\rbapi.exe") do call :c_out     rbapi.exe         %%~zF bytes   service_go\rbapi.exe
     ) else (
         call :c_err     rbapi.exe         MISSING
     )
@@ -409,11 +410,11 @@ echo.
 call :c_hdr   Deploy package ready: %TARGET%
 call :c_hdr     ^(self-contained: binaries + rbminiflt.inf + deploy.ps1 + index.html^)
 echo.
-call :c_hdr   Next steps:
-echo     1. Copy the whole folder above to the target machine
-echo     2. Edit deploy.ps1 there: set ProtectedPaths and StoreRoot on the SAME volume
-echo     3. bcdedit /set testsigning on   ^(then reboot^)
-echo     4. powershell -ExecutionPolicy Bypass -File .\deploy.ps1
+call :c_warn   Next steps:
+call :c_warn     1. Copy the whole folder above to the target machine
+call :c_warn     2. Edit deploy.ps1 there: set ProtectedPaths and StoreRoot on the SAME volume
+call :c_warn     3. bcdedit /set testsigning on   ^(then reboot^)
+call :c_warn     4. powershell -ExecutionPolicy Bypass -File .\deploy.ps1
 echo.
 exit /b 0
 
@@ -472,4 +473,7 @@ echo %C_SKIP%%*%C_RST%
 exit /b 0
 :c_hdr
 echo %C_HDR%%*%C_RST%
+exit /b 0
+:c_out
+echo %C_OUT%%*%C_RST%
 exit /b 0
