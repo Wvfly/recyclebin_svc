@@ -27,40 +27,44 @@ jobs:
           go-version: '1.22'
           cache: false
 
-      # Install WDK using Windows Package Manager (winget)
-      - name: Install WDK via Winget
-        shell: pwsh
+      # Install WDK - windows-2022 usually has it pre-installed
+      # If not, we use a fallback approach
+      - name: Verify/Install WDK
+        shell: cmd
         run: |
-          $ErrorActionPreference = 'Stop'
-          Write-Host "Installing Windows Driver Kit via winget..."
-          winget install -e --id Microsoft.WindowsDriverKit --accept-source-agreements --accept-package-agreements
-          
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "Winget installation had issues (exit code: $LASTEXITCODE), continuing..."
-          }
-          
-          # Verify installation
-          $kitsRoot = "C:\Program Files (x86)\Windows Kits\10"
-          if (-not (Test-Path $kitsRoot)) { $kitsRoot = "C:\Program Files\Windows Kits\10" }
-          if (-not (Test-Path $kitsRoot)) { 
-            throw "Windows Kits not found after WDK installation"
-          }
-          
-          Write-Host "Windows Kits found at: $kitsRoot"
+          echo Checking for Windows Driver Kit installation...
+          if exist "C:\Program Files (x86)\Windows Kits\10\Include" (
+            echo Windows Kits 10 Include found
+            dir "C:\Program Files (x86)\Windows Kits\10\Include"
+          ) else if exist "C:\Program Files\Windows Kits\10\Include" (
+            echo Windows Kits 10 Include found
+            dir "C:\Program Files\Windows Kits\10\Include"
+          ) else (
+            echo Windows Kits not found - attempting winget install
+            C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe install -e --id Microsoft.WindowsDriverKit --accept-source-agreements --accept-package-agreements || echo Winget install attempt completed
+          )
 
       # Fast-fail check that the SDK + WDK layout driver\build.cmd expects
-      # is actually present after the merge above. This catches missing ucrt
-      # / um / shared headers in the runner's SDK before a 10-minute build
-      # trip fails for an unrelated-looking reason.
+      # is actually present. This catches missing ucrt / um / shared headers
+      # in the runner's SDK before a 10-minute build trip fails.
       - name: Verify SDK+WDK layout
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $kitsRoot = "C:\Program Files (x86)\Windows Kits\10"
           if (-not (Test-Path $kitsRoot)) { $kitsRoot = "C:\Program Files\Windows Kits\10" }
+          
+          Write-Host "Looking for SDK in: $kitsRoot"
+          if (-not (Test-Path "$kitsRoot\Include")) {
+            throw "Windows Kits Include directory not found at $kitsRoot"
+          }
+          
           $ver = Get-ChildItem "$kitsRoot\Include" -Directory |
                  Sort-Object { [Version]($_.Name -replace '^\D+', '0.0') } |
                  Select-Object -Last 1 -ExpandProperty Name
           if (-not $ver) { throw "no SDK include tree under $kitsRoot" }
+          
+          Write-Host "Found SDK version: $ver"
           $must = @(
             "$kitsRoot\Include\$ver\ucrt",
             "$kitsRoot\Include\$ver\shared",
@@ -70,7 +74,11 @@ jobs:
             "$kitsRoot\Lib\$ver\km\x64\fltMgr.lib"
           )
           foreach ($p in $must) {
-            if (-not (Test-Path $p)) { throw "missing: $p" }
+            if (-not (Test-Path $p)) { 
+              Write-Host "Missing: $p"
+              throw "missing: $p" 
+            }
+            Write-Host "OK: $p"
           }
           Write-Host "SDK+WDK layout OK at $ver"
 
