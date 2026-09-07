@@ -68,7 +68,10 @@ jobs:
 
           $extract = "$env:RUNNER_TEMP\wdk-extract"
           if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
-          Expand-Archive -Path $nupkg -DestinationPath $extract
+          # .nupkg is a zip, but Expand-Archive rejects non-.zip extensions,
+          # so use System.IO.Compression.ZipFile directly.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+          [System.IO.Compression.ZipFile]::ExtractToDirectory($nupkg, $extract)
 
           # NuGet layout:
           #   <extract>\c\Include\10.0.28000.0\km\...   (kernel-mode headers)
