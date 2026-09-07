@@ -39,7 +39,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $ver = '10.0.28000.2526'
+          $ver = '10.0.22621.3233'
           $pkg = 'Microsoft.Windows.WDK.x64'
           $nupkg = "$env:RUNNER_TEMP\wdk-$ver.nupkg"
           $url = "https://api.nuget.org/v3-flatcontainer/$($pkg.ToLower())/$ver/$($pkg.ToLower()).$ver.nupkg"
@@ -74,12 +74,21 @@ jobs:
           [System.IO.Compression.ZipFile]::ExtractToDirectory($nupkg, $extract)
 
           # NuGet layout:
-          #   <extract>\c\Include\10.0.28000.0\km\...   (kernel-mode headers)
-          #   <extract>\c\Lib\10.0.28000.0\km\x64\...   (kernel-mode libs)
-          $srcInc = "$extract\c\Include\10.0.28000.0\km"
-          $srcLib = "$extract\c\Lib\10.0.28000.0\km\x64"
+          #   <extract>\c\Include\10.0.22621.0\km\...   (kernel-mode headers)
+          #   <extract>\c\Lib\10.0.22621.0\km\x64\...   (kernel-mode libs)
+          $srcInc = "$extract\c\Include\10.0.22621.0\km"
+          $srcLib = "$extract\c\Lib\10.0.22621.0\km\x64"
           if (-not (Test-Path $srcInc) -or -not (Test-Path $srcLib)) {
-            throw "WDK nupkg layout unexpected: $srcInc or $srcLib missing"
+            # Try alternative layout if versioning differs
+            $srcIncAlt = Get-ChildItem "$extract\c\Include" -Directory | Select-Object -Last 1 | ForEach-Object { Join-Path $_.FullName "km" }
+            $srcLibAlt = Get-ChildItem "$extract\c\Lib" -Directory | Select-Object -Last 1 | ForEach-Object { Join-Path (Join-Path $_.FullName "km") "x64" }
+            if ((Test-Path $srcIncAlt) -and (Test-Path $srcLibAlt)) {
+              $srcInc = $srcIncAlt
+              $srcLib = $srcLibAlt
+              Write-Host "Using alternative WDK layout: $srcInc / $srcLib"
+            } else {
+              throw "WDK nupkg layout unexpected: $srcInc or $srcLib missing"
+            }
           }
 
           $dstInc = "$kitsRoot\Include\$sdkVer\km"
@@ -87,8 +96,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path $dstInc | Out-Null
           New-Item -ItemType Directory -Force -Path $dstLib | Out-Null
           # robocopy returns 0..7 for success, 8+ for failure; tolerate up to 7.
-          $r1 = robocopy $srcInc $dstInc /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
-          $r2 = robocopy $srcLib $dstLib /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+          robocopy $srcInc $dstInc /MIR /NFL /NDL /NJH /NJS /NP
+          $r1 = $LASTEXITCODE
+          robocopy $srcLib $dstLib /MIR /NFL /NDL /NJH /NJS /NP
+          $r2 = $LASTEXITCODE
           if ($r1 -ge 8) { throw "robocopy include failed: $r1" }
           if ($r2 -ge 8) { throw "robocopy lib failed: $r2" }
 
