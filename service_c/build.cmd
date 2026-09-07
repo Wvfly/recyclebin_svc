@@ -14,16 +14,20 @@ setlocal
 set BUILD_TYPE=%1
 if "%BUILD_TYPE%"=="" set BUILD_TYPE=Release
 
-rem ---- Locate the VS toolchain -------------------------------------------
-set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-if not exist "%VCVARS%" (
-    set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
+rem ---- Locate the VS toolchain (probes install dir / year / edition) -----
+set "FOUND_VCVARS="
+for %%B in ("C:\Program Files" "C:\Program Files (x86)") do (
+    for %%Y in (2022 2019) do (
+        for %%E in (Community Professional Enterprise BuildTools) do (
+            if not defined FOUND_VCVARS if exist "%%~B\Microsoft Visual Studio\%%Y\%%E\VC\Auxiliary\Build\vcvars64.bat" (
+                set "VCVARS=%%~B\Microsoft Visual Studio\%%Y\%%E\VC\Auxiliary\Build\vcvars64.bat"
+                set "FOUND_VCVARS=1"
+            )
+        )
+    )
 )
-if not exist "%VCVARS%" (
-    set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-)
-if not exist "%VCVARS%" (
-    echo [ERROR] Cannot find vcvars64.bat. Install Visual Studio 2022 with
+if not defined FOUND_VCVARS (
+    echo [ERROR] Cannot find vcvars64.bat. Install Visual Studio 2019/2022 with
     echo         the "Desktop development with C++" workload.
     exit /b 1
 )

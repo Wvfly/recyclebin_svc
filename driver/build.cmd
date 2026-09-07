@@ -3,18 +3,70 @@ REM build.cmd - Compile rbminiflt.sys
 REM Run inside "x64 Native Tools Command Prompt for VS 2022"
 REM or just double-click (it locates the toolchain automatically).
 
-setlocal
+setlocal EnableDelayedExpansion
 set CFG=Release
 if not "%1"=="" set CFG=%1
 
-REM --- locate toolchain (override if yours differs) ---
-set WDKINC=C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0
-set WDKLIB=C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0
-set MSVC=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207
-set BIN=%MSVC%\bin\Hostx64\x64
+REM --- auto-locate toolchain (set MSVC / WDKINC / WDKLIB env vars to override) ---
+set "VSROOT=C:\Program Files\Microsoft Visual Studio\2022"
+if not exist "%VSROOT%" set "VSROOT=C:\Program Files (x86)\Microsoft Visual Studio\2022"
+if not exist "%VSROOT%" set "VSROOT=C:\Program Files\Microsoft Visual Studio\2019"
+if not exist "%VSROOT%" set "VSROOT=C:\Program Files (x86)\Microsoft Visual Studio\2019"
 
-set INCLUDE=%WDKINC%\km;%WDKINC%\shared;%WDKINC%\um;%WDKINC%\ucrt;%MSVC%\include
-set LIB=%WDKLIB%\km\x64;%WDKLIB%\um\x64;%WDKLIB%\ucrt\x64;%MSVC%\lib\x64
+if defined MSVC goto :msvc_ok
+call :find_msvc
+if errorlevel 1 exit /b 1
+:msvc_ok
+
+if defined WDKINC goto :wdk_ok
+call :find_wdk
+if errorlevel 1 exit /b 1
+:wdk_ok
+
+set "BIN=%MSVC%\bin\Hostx64\x64"
+
+set "INCLUDE=%WDKINC%\km;%WDKINC%\shared;%WDKINC%\um;%WDKINC%\ucrt;%MSVC%\include"
+set "LIB=%WDKLIB%\km\x64;%WDKLIB%\um\x64;%WDKLIB%\ucrt\x64;%MSVC%\lib\x64"
+goto :detect_end
+
+:find_msvc
+set "VSED="
+for %%E in (Community Professional Enterprise BuildTools) do (
+    if not defined VSED if exist "!VSROOT!\%%E\VC\Tools\MSVC" set "VSED=%%E"
+)
+if not defined VSED (
+    echo [ERROR] Cannot find Visual Studio 2019/2022 under !VSROOT!.
+    echo         Install with the "Desktop development with C++" workload.
+    exit /b 1
+)
+set "MSVCVER="
+for /f "delims=" %%V in ('dir /b /ad "!VSROOT!\!VSED!\VC\Tools\MSVC\14.*" 2^>nul ^| sort /r') do (
+    if not defined MSVCVER set "MSVCVER=%%V"
+)
+if not defined MSVCVER (
+    echo [ERROR] No MSVC toolset under !VSROOT!\!VSED!\VC\Tools\MSVC.
+    exit /b 1
+)
+set "MSVC=!VSROOT!\!VSED!\VC\Tools\MSVC\!MSVCVER!"
+exit /b 0
+
+:find_wdk
+set "WDKROOT=C:\Program Files (x86)\Windows Kits\10"
+if not exist "!WDKROOT!\Include" set "WDKROOT=C:\Program Files\Windows Kits\10"
+set "WDKVER="
+for /f "delims=" %%V in ('dir /b /ad "!WDKROOT!\Include\10.*" 2^>nul ^| sort /r') do (
+    if not defined WDKVER set "WDKVER=%%V"
+)
+if not defined WDKVER (
+    echo [ERROR] Cannot find the Windows WDK under !WDKROOT!\Include.
+    echo         Install the WDK matching your Windows SDK version.
+    exit /b 1
+)
+set "WDKINC=!WDKROOT!\Include\!WDKVER!"
+set "WDKLIB=!WDKROOT!\Lib\!WDKVER!"
+exit /b 0
+
+:detect_end
 
 if not exist Build mkdir Build
 

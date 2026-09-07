@@ -89,9 +89,8 @@ if errorlevel 1 (
     echo [FAILED] Driver build failed.
     echo.
     echo   Common causes:
-    echo     - WDK not installed, or driver\build.cmd points at a different
-    echo       SDK version. Edit WDKINC / WDKLIB at the top of that file to
-    echo       match your installed Windows SDK.
+    echo     - WDK not installed. driver\build.cmd auto-detects the WDK/VS;
+    echo       set WDKINC / WDKLIB / MSVC env vars only to override detection.
     echo     - MSVC path in driver\build.cmd does not match your VS version.
     exit /b 1
 )
@@ -134,9 +133,17 @@ if /i "%RBF_SIGN_STORE%"=="machine" set "SM_OPTION=/sm"
 set "SIGNTOOL=%RBF_SIGNTOOL%"
 if defined SIGNTOOL if not exist "%SIGNTOOL%" set "SIGNTOOL="
 if not defined SIGNTOOL (
-    for %%V in (10.0.26100.0 10.0.22621.0 10.0.22000.0 10.0.19041.0) do (
-        if not defined SIGNTOOL if exist "C:\Program Files (x86)\Windows Kits\10\bin\%%V\x64\signtool.exe" set "SIGNTOOL=C:\Program Files (x86)\Windows Kits\10\bin\%%V\x64\signtool.exe"
+    set "SBIN="
+    for %%R in ("C:\Program Files (x86)\Windows Kits\10" "C:\Program Files\Windows Kits\10") do (
+        if not defined SBIN for /d %%V in ("%%~R\bin\10.*") do (
+            if not defined SBIN if exist "%%~V\x64\signtool.exe" set "SBIN=%%~V\x64\signtool.exe"
+        )
     )
+    rem Fallback: App Certification Kit (older standalone SDK installs)
+    if not defined SBIN if exist "C:\Program Files (x86)\Windows Kits\10\App Certification Kit\signtool.exe" (
+        set "SBIN=C:\Program Files (x86)\Windows Kits\10\App Certification Kit\signtool.exe"
+    )
+    if defined SBIN call set "SIGNTOOL=%%SBIN%%"
 )
 if not defined SIGNTOOL (
     echo [WARN] signtool.exe not found - rbminiflt.sys NOT signed.
