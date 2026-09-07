@@ -39,7 +39,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $ver = '10.0.22621.3233'
+          $ver = '10.0.19041.3996'
           $pkg = 'Microsoft.Windows.WDK.x64'
           $nupkg = "$env:RUNNER_TEMP\wdk-$ver.nupkg"
           $url = "https://api.nuget.org/v3-flatcontainer/$($pkg.ToLower())/$ver/$($pkg.ToLower()).$ver.nupkg"
@@ -56,7 +56,7 @@ jobs:
           $kitsRoot = "C:\Program Files (x86)\Windows Kits\10"
           if (-not (Test-Path $kitsRoot)) { $kitsRoot = "C:\Program Files\Windows Kits\10" }
           $sdkVer = Get-ChildItem "$kitsRoot\Include" -Directory |
-                    # Sort by numeric [Version] so "10.0.28000.x" beats "wdf",
+                    # Sort by numeric [Version] so "10.0.19041.x" beats "wdf",
                     # "ntdll" etc. (string sort would pick "wdf" first since
                     # 'w' > '1' lexicographically).
                     Sort-Object { [Version]($_.Name -replace '^\D+', '0.0') } |
@@ -74,10 +74,10 @@ jobs:
           [System.IO.Compression.ZipFile]::ExtractToDirectory($nupkg, $extract)
 
           # NuGet layout:
-          #   <extract>\c\Include\10.0.22621.0\km\...   (kernel-mode headers)
-          #   <extract>\c\Lib\10.0.22621.0\km\x64\...   (kernel-mode libs)
-          $srcInc = "$extract\c\Include\10.0.22621.0\km"
-          $srcLib = "$extract\c\Lib\10.0.22621.0\km\x64"
+          #   <extract>\c\Include\10.0.19041.0\km\...   (kernel-mode headers)
+          #   <extract>\c\Lib\10.0.19041.0\km\x64\...   (kernel-mode libs)
+          $srcInc = "$extract\c\Include\10.0.19041.0\km"
+          $srcLib = "$extract\c\Lib\10.0.19041.0\km\x64"
           if (-not (Test-Path $srcInc) -or -not (Test-Path $srcLib)) {
             # Try alternative layout if versioning differs
             $srcIncAlt = Get-ChildItem "$extract\c\Include" -Directory | Select-Object -Last 1 | ForEach-Object { Join-Path $_.FullName "km" }
