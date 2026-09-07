@@ -109,19 +109,19 @@ jobs:
             $b = [System.IO.File]::ReadAllBytes($path)
             if ($b.Length -lt 0x40) { throw "$path too small to be a PE" }
             
-            $dosHeader = [System.Text.Encoding]::ASCII.GetString($b, 0, 2)
-            if ($dosHeader -ne 'MZ') { 
-              throw "$path: DOS header 'MZ' missing, got: $dosHeader"
+            $header = [System.Text.Encoding]::ASCII.GetString($b, 0, 2)
+            if ($header -ne 'MZ') { 
+              throw "$path : DOS header missing, got: $header"
             }
             
             $peOff = [BitConverter]::ToInt32($b, 0x3C)
             if ($peOff -lt 0x40 -or $peOff -gt $b.Length - 4) {
-              throw "$path: invalid PE offset"
+              throw "$path : invalid PE offset"
             }
             
-            $peSignature = [System.Text.Encoding]::ASCII.GetString($b, $peOff, 2)
-            if ($peSignature -ne 'PE') {
-              throw "$path: PE signature missing, got: $peSignature"
+            $sig = [System.Text.Encoding]::ASCII.GetString($b, $peOff, 2)
+            if ($sig -ne 'PE') {
+              throw "$path : PE signature missing, got: $sig"
             }
             
             Write-Host "OK : $path is a valid PE"
@@ -136,12 +136,12 @@ jobs:
             
             $magic = [BitConverter]::ToUInt16($b, $peOff + 24)
             if ($magic -ne 0x20B) { 
-              throw "$path: not PE32+ (magic 0x$($magic.ToString('X4')))"
+              throw "$path : not PE32+ (magic 0x$($magic.ToString('X4')))"
             }
             
             $subsys = [BitConverter]::ToUInt16($b, $peOff + 24 + 68)
             if ($subsys -ne 1) { 
-              throw "$path: subsystem $subsys, expected NATIVE (1)"
+              throw "$path : subsystem $subsys, expected NATIVE (1)"
             }
             
             Write-Host "OK : $path is a valid x64 NATIVE PE"
@@ -155,7 +155,8 @@ jobs:
           $p = Start-Process -FilePath $api -ArgumentList '-version' `
                 -NoNewWindow -Wait -PassThru -RedirectStandardOutput "$env:RUNNER_TEMP\api.out"
           if ($p.ExitCode -ne 0) {
-            throw "$api -version exited with code $($p.ExitCode)"
+            $msg = if (Test-Path "$env:RUNNER_TEMP\api.out") { Get-Content "$env:RUNNER_TEMP\api.out" -Raw } else { 'no output' }
+            throw "$api -version exited with code $($p.ExitCode): $msg"
           }
           $output = Get-Content "$env:RUNNER_TEMP\api.out" -Raw
           Write-Host "API output: $output"
