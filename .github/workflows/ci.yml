@@ -132,17 +132,19 @@ jobs:
           if (-not (Test-Path $sys)) { throw "missing artifact: $sys" }
           $b = [System.IO.File]::ReadAllBytes($sys)
           if ($b.Length -lt 0x40) { throw "$sys too small to be a PE" }
-          if ([System.Text.Encoding]::ASCII.GetString($b, 0, 2) -ne 'MZ') {
-            throw "$sys: DOS header 'MZ' missing"
+          $dosHeader = [System.Text.Encoding]::ASCII.GetString($b, 0, 2)
+          if ($dosHeader -ne 'MZ') { 
+            throw "DOS header 'MZ' missing, got: $dosHeader"
           }
           $peOff = [BitConverter]::ToInt32($b, 0x3C)
-          if ([System.Text.Encoding]::ASCII.GetString($b, $peOff, 4) -ne "PE$([char]0)$([char]0)") {
-            throw "$sys: PE signature missing"
+          $peSignature = [System.Text.Encoding]::ASCII.GetString($b, $peOff, 2)
+          if ($peSignature -ne 'PE') {
+            throw "PE signature missing, got: $peSignature"
           }
           $magic = [BitConverter]::ToUInt16($b, $peOff + 24)
-          if ($magic -ne 0x20B) { throw "$sys: not PE32+ (magic 0x$($magic.ToString('X4')))" }
+          if ($magic -ne 0x20B) { throw "not PE32+ (magic 0x$($magic.ToString('X4')))" }
           $subsys = [BitConverter]::ToUInt16($b, $peOff + 24 + 68)
-          if ($subsys -ne 1) { throw "$sys: subsystem $subsys, expected NATIVE (1)" }
+          if ($subsys -ne 1) { throw "subsystem $subsys, expected NATIVE (1)" }
           Write-Host "OK : $sys is a valid x64 NATIVE PE image"
 
       - name: Upload build artifacts
