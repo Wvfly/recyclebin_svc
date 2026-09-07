@@ -135,6 +135,13 @@ static void MaintenancePass(int drainOps)
             DbReapTerminalRows(g_Config.TerminalKeepDays);
         }
 
+        /* 6b) SMB session snapshot (client address for items.client_ip).
+              NetSessionEnum is an RPC into the server service, so it must stay
+              off the delete path -- but once per maintenance pass is cheap and
+              keeps the table close to reality. Until the first refresh lands,
+              client_ip stays empty rather than guessed. */
+        SessionRefresh();
+
         /* 7) Database backup + integrity (RB-11).
               Daily. The DB is the only record of where a recycled file
               belongs, so check it before backing it up: copying a corrupt
@@ -278,6 +285,7 @@ DWORD WINAPI ServiceCtrlHandlerEx(DWORD ctrl, DWORD eventType,
 
         DbClose();
         PortFini();
+        SessionShutdown();
         LogInfo(L"service stopped");
         LogShutdown();
 
@@ -325,6 +333,7 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR *argv)
     ConfigLoad(&g_Config);
     VolInit();
     PortInit();
+    SessionInit();
 
     if (!DbOpen(g_Config.StoreRoot)) {
         LogError(L"cannot open database under %s -- aborting", g_Config.StoreRoot);
@@ -426,6 +435,7 @@ static int RunOnce(void)
     ConfigLoad(&g_Config);
     VolInit();
     PortInit();
+    SessionInit();
 
     if (!DbOpen(g_Config.StoreRoot)) {
         fwprintf(stderr, L"cannot open database: %s\n",
@@ -449,6 +459,7 @@ static int RunOnce(void)
     g_StopEvent = NULL;
     DbClose();
     PortFini();
+    SessionShutdown();
     LogShutdown();
     return 0;
 }
@@ -474,6 +485,7 @@ static int RunConsole(void)
     ConfigLoad(&g_Config);
     VolInit();
     PortInit();
+    SessionInit();
 
     if (!DbOpen(g_Config.StoreRoot)) {
         fwprintf(stderr, L"cannot open database: %s\n",
@@ -511,6 +523,7 @@ static int RunConsole(void)
 
     DbClose();
     PortFini();
+    SessionShutdown();
     LogShutdown();
     return 0;
 }

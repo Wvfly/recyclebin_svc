@@ -90,9 +90,9 @@ if /i "%BUILD_TYPE%"=="Debug" (
     set LFLAGS=/LTCG
 )
 
-set LIBS=fltlib.lib wtsapi32.lib advapi32.lib shell32.lib user32.lib
+set LIBS=fltlib.lib wtsapi32.lib advapi32.lib shell32.lib user32.lib netapi32.lib
 
-set SOURCES=rbservice.c rbdb.c rbstore.c rbvol.c rbpolicy.c rbrestore.c rbport.c rbconfig.c rblog.c rbconcile.c sqlite3.c
+set SOURCES=rbservice.c rbdb.c rbstore.c rbvol.c rbpolicy.c rbrestore.c rbport.c rbconfig.c rblog.c rbconcile.c rbsession.c sqlite3.c
 
 echo Building rbservice.exe (%BUILD_TYPE%)...
 echo.

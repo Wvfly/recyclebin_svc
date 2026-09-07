@@ -811,7 +811,8 @@ LONG64 DbAddItem(const RBF_NOTIFICATION *note)
 {
     sqlite3_stmt *st = NULL;
     LONG64 id = -1;
-    char *orig = NULL, *store = NULL, *sid = NULL;
+    char *orig = NULL, *store = NULL, *sid = NULL, *cip = NULL;
+    WCHAR *clientW = NULL;
     const char *sql =
         "INSERT INTO items(orig_path,store_path,sid,session_id,client_ip,"
         "delete_time,file_size,is_dir,status) VALUES (?,?,?,?,?,?,?,?,'staged')";
@@ -833,6 +834,13 @@ LONG64 DbAddItem(const RBF_NOTIFICATION *note)
 
     now = (double)time(NULL);
 
+    /* Best-effort client address. The kernel cannot supply one (srv2.sys runs
+       the delete in session 0), so we resolve it from the SMB session
+       snapshot. Unknown stays empty -- storing a guess would be worse.
+       See rbsession.c for why this can legitimately come back NULL. */
+    clientW = SessionLookupClientBySid(sidBuf);
+    if (clientW && clientW[0] != L'\0') cip = WToU8(clientW);
+
     EnterCriticalSection(&g_DbLock);
 
     if (sqlite3_prepare_v2(g_Db, sql, -1, &st, NULL) == SQLITE_OK) {
@@ -840,7 +848,7 @@ LONG64 DbAddItem(const RBF_NOTIFICATION *note)
         sqlite3_bind_text(st, 2, store, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 3, sid,   -1, SQLITE_TRANSIENT);
         sqlite3_bind_int (st, 4, (int)note->SessionId);
-        sqlite3_bind_text(st, 5, "",    -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 5, cip ? cip : "", -1, SQLITE_TRANSIENT);
         sqlite3_bind_double(st, 6, now);
         sqlite3_bind_int64(st, 7, (sqlite3_int64)note->FileSize);
         sqlite3_bind_int (st, 8, (int)note->IsDirectory);
@@ -856,7 +864,7 @@ LONG64 DbAddItem(const RBF_NOTIFICATION *note)
     if (st) sqlite3_finalize(st);
     LeaveCriticalSection(&g_DbLock);
 
-    free(orig); free(store); free(sid);
+    free(orig); free(store); free(sid); free(cip); free(clientW);
     return id;
 }
 

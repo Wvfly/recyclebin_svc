@@ -300,6 +300,24 @@ WCHAR *SidNormalize(const WCHAR *rawSid);
 int SidEquals(const WCHAR *wideSid, const char *utf8Sid);
 
 /* ------------------------------------------------------------------ */
+/* SMB session snapshot (best-effort client address)                   */
+/* ------------------------------------------------------------------ */
+/* The kernel cannot report the SMB client address (srv2.sys performs the
+   delete in session 0), so we ask the server service instead. These keep a
+   periodically refreshed snapshot of live sessions; lookups read only that
+   snapshot and are cheap enough for the delete path. */
+
+/* Initializes the snapshot lock. Call once at startup. */
+void   SessionInit(void);
+/* Frees the snapshot and its lock. */
+void   SessionShutdown(void);
+/* Re-enumerates SMB sessions. Slow (RPC); call from the maintenance thread. */
+void   SessionRefresh(void);
+/* Best-effort client name/address for a SID. Returns allocated string or
+   NULL when unknown -- never a guess. Caller frees. */
+WCHAR *SessionLookupClientBySid(const WCHAR *sid);
+
+/* ------------------------------------------------------------------ */
 /* Store / landing                                                     */
 /* ------------------------------------------------------------------ */
 /* Moves staging file into <same volume>\$Recycle.Bin\<sid>\$R/$I pair. */
