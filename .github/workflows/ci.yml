@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (driver + service + api)
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Go toolchain for the optional management API (rbapi.exe).
+      # The C<->Go contract verification also needs it.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
+
+      # windows-2022 already ships Visual Studio 2022 Enterprise with the
+      # "Desktop development with C++" workload and the Windows 11 SDK, so the
+      # MSVC toolset and the user-mode SDK are present. We only need to add the
+      # WDK, which provides the kernel-mode headers/libs (km, fltMgr.lib, ...)
+      # under C:\Program Files (x86)\Windows Kits\10.
+      #
+      # The WDK is delivered as a Visual Studio extension (VSIX). Installing it
+      # drops the km include/lib trees into the Windows Kits 10 folder that
+      # driver\build.cmd auto-detects.
+      - name: Install WDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vsix = "$env:RUNNER_TEMP\wdk.vsix"
+          Write-Host "Downloading WDK VSIX ..."
+          Invoke-WebRequest -Uri https://aka.ms/wdk/VS2022 -OutFile $vsix
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Enterprise\Common7\IDE\VSIXInstaller.exe"
+          if (-not (Test-Path $installer)) {
+            $installer = "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise\Common7\IDE\VSIXInstaller.exe"
+          }
+          Write-Host "Installing WDK into VS ..."
+          & $installer /quiet $vsix
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "VSIXInstaller failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+
+      # The runner may carry a newer Windows 11 SDK than the WDK targets, which
+      # would make driver\build.cmd auto-detect a higher 10.* folder that lacks
+      # the km subtree. Pin WDKINC/WDKLIB to the SDK version that actually has
+      # the km headers so the driver build is deterministic.
+      - name: Locate WDK include/lib
+        id: wdk
+        shell: pwsh
+        run: |
+          $kit = "C:\Program Files (x86)\Windows Kits\10"
+          if (-not (Test-Path $kit)) { $kit = "C:\Program Files\Windows Kits\10" }
+          $ver = Get-ChildItem "$kit\Include" -Directory |
+                 Where-Object { Test-Path "$($_.FullName)\km" } |
+                 Sort-Object Name |
+                 Select-Object -Last 1
+          if (-not $ver) {
+            Write-Error "No WDK km include tree found under $kit\Include"
+            exit 1
+          }
+          Write-Host "WDK version: $($ver.Name)"
+          Add-Content -Path $env:GITHUB_ENV -Value "WDKINC=$($ver.FullName)"
+          Add-Content -Path $env:GITHUB_ENV -Value "WDKLIB=$kit\Lib\$($ver.Name)"
+
+      # Full build: driver (.sys) + core service (.exe) + Go API (.exe) +
+      # contract verification. No signing in CI (no cert) -> use "nosign".
+      - name: Run build_all
+        shell: cmd
+        run: build_all.cmd Release nosign
+
+      # Lightweight smoke test of the built artifacts. None of these need the
+      # kernel driver or a registered service, so they run fine on the runner:
+      #   - C service prints usage (executable + CRT load)
+      #   - C service opens/creates the DB, applies schema, runs the rebuild
+      #     path against an empty store (sqlite link + schema init)
+      #   - Go API prints its version (Go runtime + build link)
+      #   - driver is a valid PE32+ (x64) NATIVE image
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = Join-Path $env:GITHUB_WORKSPACE 'target\Release'
+          $sys = Join-Path $bin 'rbminiflt.sys'
+          $srv = Join-Path $bin 'rbservice.exe'
+          $api = Join-Path $bin 'rbapi.exe'
+
+          function Assert-Exe {
+            param([string]$path, [string]$args)
+            if (-not (Test-Path $path)) { throw "missing artifact: $path" }
+            $errLog = "$env:RUNNER_TEMP\smoke.err"
+            $p = Start-Process -FilePath $path -ArgumentList $args `
+                  -NoNewWindow -Wait -PassThru -RedirectStandardError $errLog
+            if ($p.ExitCode -ne 0) {
+              $msg = if (Test-Path $errLog) { Get-Content $errLog -Raw } else { '' }
+              throw "$path $args exited $($p.ExitCode): $msg"
+            }
+            Write-Host "OK : $path $args"
+          }
+
+          # 1) C service self-check: usage, no driver required.
+          Assert-Exe $srv '--help'
+
+          # 2) C service DB round-trip: create schema + run rebuild on empty store.
+          $tmp = New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\smoke" |
+                 Select-Object -ExpandProperty FullName
+          Assert-Exe $srv "rebuild-i --db $tmp\smoke.db"
+
+          # 3) Go API self-check: version banner.
+          Assert-Exe $api '-version'
+
+          # 4) Driver PE sanity: MZ + PE32+ (x64) + NATIVE subsystem.
+          if (-not (Test-Path $sys)) { throw "missing artifact: $sys" }
+          $b = [System.IO.File]::ReadAllBytes($sys)
+          if ($b.Length -lt 0x40) { throw "$sys too small to be a PE" }
+          if ([System.Text.Encoding]::ASCII.GetString($b, 0, 2) -ne 'MZ') {
+            throw "$sys: DOS header 'MZ' missing"
+          }
+          $peOff = [BitConverter]::ToInt32($b, 0x3C)
+          if ([System.Text.Encoding]::ASCII.GetString($b, $peOff, 4) -ne "PE$([char]0)$([char]0)") {
+            throw "$sys: PE signature missing"
+          }
+          $magic = [BitConverter]::ToUInt16($b, $peOff + 24)
+          if ($magic -ne 0x20B) { throw "$sys: not PE32+ (magic 0x$($magic.ToString('X4')))" }
+          $subsys = [BitConverter]::ToUInt16($b, $peOff + 24 + 68)
+          if ($subsys -ne 1) { throw "$sys: subsystem $subsys, expected NATIVE (1)" }
+          Write-Host "OK : $sys is a valid x64 NATIVE PE image"
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-package
+          path: target/Release/
+          if-no-files-found: warn
+          retention-days: 7
