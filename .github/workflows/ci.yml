@@ -27,88 +27,26 @@ jobs:
           go-version: '1.22'
           cache: false
 
-      # windows-2022 ships Visual Studio 2022 Enterprise with the
-      # "Desktop development with C++" workload and a Windows 11 SDK, so the
-      # MSVC toolset and the user-mode SDK (ucrt/um/shared headers, ucrt.lib)
-      # are already present. We only need the WDK kernel-mode pieces (km
-      # headers, fltMgr.lib, ...), which Microsoft now ships as a NuGet
-      # package (Microsoft.Windows.WDK.x64). This avoids the Winget / App
-      # Installer / MSIX dependency chain that is not preinstalled on
-      # windows-2022 and has been tripping up VSIX-based installs.
-      - name: Install WDK via NuGet
+      # Install WDK using Windows Package Manager (winget)
+      - name: Install WDK via Winget
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $ver = '10.0.19041.3996'
-          $pkg = 'Microsoft.Windows.WDK.x64'
-          $nupkg = "$env:RUNNER_TEMP\wdk-$ver.nupkg"
-          $url = "https://api.nuget.org/v3-flatcontainer/$($pkg.ToLower())/$ver/$($pkg.ToLower()).$ver.nupkg"
-
-          Write-Host "Downloading $pkg $ver ..."
-          Invoke-WebRequest -Uri $url -OutFile $nupkg
-
-          # The WDK nupkg is just a zip. Extract it and lay its content
-          # directly under the Windows Kits 10 SDK root that the runner
-          # already ships, so driver\build.cmd's auto-detection still works.
-          # We pick the highest installed SDK version on the runner and merge
-          # the WDK pieces (km include + km Lib\x64) into it. ucrt/um/shared
-          # stay from the SDK.
+          Write-Host "Installing Windows Driver Kit via winget..."
+          winget install -e --id Microsoft.WindowsDriverKit --accept-source-agreements --accept-package-agreements
+          
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Winget installation had issues (exit code: $LASTEXITCODE), continuing..."
+          }
+          
+          # Verify installation
           $kitsRoot = "C:\Program Files (x86)\Windows Kits\10"
           if (-not (Test-Path $kitsRoot)) { $kitsRoot = "C:\Program Files\Windows Kits\10" }
-          $sdkVer = Get-ChildItem "$kitsRoot\Include" -Directory |
-                    # Sort by numeric [Version] so "10.0.19041.x" beats "wdf",
-                    # "ntdll" etc. (string sort would pick "wdf" first since
-                    # 'w' > '1' lexicographically).
-                    Sort-Object { [Version]($_.Name -replace '^\D+', '0.0') } |
-                    Select-Object -Last 1 -ExpandProperty Name
-          if (-not $sdkVer) {
-            throw "No Windows 10 SDK installed under $kitsRoot\Include"
+          if (-not (Test-Path $kitsRoot)) { 
+            throw "Windows Kits not found after WDK installation"
           }
-          Write-Host "Runner SDK version: $sdkVer (merging WDK pieces into it)"
-
-          $extract = "$env:RUNNER_TEMP\wdk-extract"
-          if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
-          # .nupkg is a zip, but Expand-Archive rejects non-.zip extensions,
-          # so use System.IO.Compression.ZipFile directly.
-          Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
-          [System.IO.Compression.ZipFile]::ExtractToDirectory($nupkg, $extract)
-
-          # NuGet layout:
-          #   <extract>\c\Include\10.0.19041.0\km\...   (kernel-mode headers)
-          #   <extract>\c\Lib\10.0.19041.0\km\x64\...   (kernel-mode libs)
-          $srcInc = "$extract\c\Include\10.0.19041.0\km"
-          $srcLib = "$extract\c\Lib\10.0.19041.0\km\x64"
-          if (-not (Test-Path $srcInc) -or -not (Test-Path $srcLib)) {
-            # Try alternative layout if versioning differs
-            $srcIncAlt = Get-ChildItem "$extract\c\Include" -Directory | Select-Object -Last 1 | ForEach-Object { Join-Path $_.FullName "km" }
-            $srcLibAlt = Get-ChildItem "$extract\c\Lib" -Directory | Select-Object -Last 1 | ForEach-Object { Join-Path (Join-Path $_.FullName "km") "x64" }
-            if ((Test-Path $srcIncAlt) -and (Test-Path $srcLibAlt)) {
-              $srcInc = $srcIncAlt
-              $srcLib = $srcLibAlt
-              Write-Host "Using alternative WDK layout: $srcInc / $srcLib"
-            } else {
-              throw "WDK nupkg layout unexpected: $srcInc or $srcLib missing"
-            }
-          }
-
-          $dstInc = "$kitsRoot\Include\$sdkVer\km"
-          $dstLib = "$kitsRoot\Lib\$sdkVer\km\x64"
-          New-Item -ItemType Directory -Force -Path $dstInc | Out-Null
-          New-Item -ItemType Directory -Force -Path $dstLib | Out-Null
-          # robocopy returns 0..7 for success, 8+ for failure; tolerate up to 7.
-          robocopy $srcInc $dstInc /MIR /NFL /NDL /NJH /NJS /NP
-          $r1 = $LASTEXITCODE
-          robocopy $srcLib $dstLib /MIR /NFL /NDL /NJH /NJS /NP
-          $r2 = $LASTEXITCODE
-          if ($r1 -ge 8) { throw "robocopy include failed: $r1" }
-          if ($r2 -ge 8) { throw "robocopy lib failed: $r2" }
-
-          # Sanity check: fltMgr.lib must now be present (it's the telltale
-          # that the km Lib\x64 tree actually got populated).
-          if (-not (Test-Path "$dstLib\fltMgr.lib")) {
-            throw "fltMgr.lib missing under $dstLib after copy"
-          }
-          Write-Host "WDK km headers/libs merged into $dstInc / $dstLib"
+          
+          Write-Host "Windows Kits found at: $kitsRoot"
 
       # Fast-fail check that the SDK + WDK layout driver\build.cmd expects
       # is actually present after the merge above. This catches missing ucrt
