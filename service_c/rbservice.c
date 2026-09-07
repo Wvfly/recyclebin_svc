@@ -393,6 +393,9 @@ static void PrintUsage(void)
         L"  rbservice.exe                 run as a Windows service (SCM)\n"
         L"  rbservice.exe console         run in the foreground (Ctrl+C to stop)\n"
         L"  rbservice.exe once            perform a single maintenance pass and exit\n"
+        L"  rbservice.exe rebuild-i       rewrite $I metadata for every landed item\n"
+        L"                                using the corrected v2 layout (RB-17/RB-39);\n"
+        L"                                $R content is untouched, safe to re-run.\n"
         L"\n"
         L"Options:\n"
         L"  --db <path>                   use an explicit recycle.db instead of\n"
@@ -460,6 +463,34 @@ static int RunOnce(void)
     DbClose();
     PortFini();
     SessionShutdown();
+    LogShutdown();
+    return 0;
+}
+
+/* One-shot migration: rewrite every landed item's $I metadata in the
+   corrected v2 layout (RB-17/RB-39, see rbstore.c). Deliberately skips
+   PortInit/SessionInit -- this touches only the DB and $I files on disk,
+   never the driver, so it can be run even with the driver/service stopped. */
+static int RunRebuildI(void)
+{
+    int rewritten;
+
+    LogInit();
+    LogSetConsole(1);
+    ConfigLoad(&g_Config);
+    VolInit();
+
+    if (!DbOpen(g_Config.StoreRoot)) {
+        fwprintf(stderr, L"cannot open database: %s\n",
+                 g_DbPathOverride ? g_DbPathOverride : g_Config.StoreRoot);
+        LogShutdown();
+        return 1;
+    }
+
+    rewritten = StoreRebuildAllIFiles();
+    fwprintf(stderr, L"rebuild-i: rewrote %d $I file(s)\n", rewritten);
+
+    DbClose();
     LogShutdown();
     return 0;
 }
@@ -535,8 +566,9 @@ int wmain(int argc, WCHAR *argv[])
     if (!ParseDbOverride(argc, argv)) return 1;
 
     if (argc >= 2) {
-        if (_wcsicmp(argv[1], L"console") == 0) return RunConsole();
-        if (_wcsicmp(argv[1], L"once") == 0)    return RunOnce();
+        if (_wcsicmp(argv[1], L"console") == 0)   return RunConsole();
+        if (_wcsicmp(argv[1], L"once") == 0)      return RunOnce();
+        if (_wcsicmp(argv[1], L"rebuild-i") == 0) return RunRebuildI();
         if (_wcsicmp(argv[1], L"/?") == 0 ||
             _wcsicmp(argv[1], L"-h") == 0 ||
             _wcsicmp(argv[1], L"--help") == 0) {

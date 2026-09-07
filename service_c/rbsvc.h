@@ -322,6 +322,10 @@ WCHAR *SessionLookupClientBySid(const WCHAR *sid);
 /* ------------------------------------------------------------------ */
 /* Moves staging file into <same volume>\$Recycle.Bin\<sid>\$R/$I pair. */
 int  StoreLandItem(const RBSVC_ITEM *item);
+/* Rebuilds $I metadata for every landed item using the corrected v2 layout
+   (RB-17/RB-39). One-shot migration for entries landed before the fix;
+   $R content is untouched. Returns the count of $I files rewritten. */
+int  StoreRebuildAllIFiles(void);
 /* Deletes $R/$I (or staging file) for an item. */
 void StoreDeleteEntry(const RBSVC_ITEM *item);
 

@@ -9,17 +9,23 @@
  * enumerate and restore natively:
  *
  *   <vol>\$Recycle.Bin\<SID>\$R<base36><ext>    file data
- *   <vol>\$Recycle.Bin\<SID>\$I<base36><ext>    metadata (v1 format)
+ *   <vol>\$Recycle.Bin\<SID>\$I<base36><ext>    metadata (v2 format)
  *
- * $I v1 layout (matches what Explorer and forensic tools expect):
- *   offset 0x00  ULONG   Version     = 1
- *   offset 0x04  INT64   FileSize
- *   offset 0x0C  INT64   DeleteTime  (FILETIME, 100ns since 1601-01-01)
- *   offset 0x14  ULONG   PathLen     (WCHAR count, NOT bytes)
- *   offset 0x18  WCHAR[] Original path, UTF-16LE, no NUL required
+ * $I v2 layout (per the libyal Windows Recycle.Bin spec; verified against a
+ * native Explorer-generated $I byte-for-byte -- see RB-39 in docs/buglist.md):
+ *   offset 0x00  INT64   Version     = 2               (8 bytes, NOT 4)
+ *   offset 0x08  INT64   FileSize
+ *   offset 0x10  INT64   DeleteTime  (FILETIME, 100ns since 1601-01-01)
+ *   offset 0x18  ULONG   PathLen     (WCHAR count, INCLUDING the terminating
+ *                                     NUL -- Explorer's own writer counts it)
+ *   offset 0x1C  WCHAR[] Original path, UTF-16LE, NUL-terminated
  *
- * Getting PathLen wrong (e.g. using 8 bytes) shifts the whole record and makes
- * the entry unreadable -- see bug B5 in docs/bugfix-report.md.
+ * Version was previously written as a 4-byte ULONG (RB-17/RB-39): that shifts
+ * every field after it 4 bytes early, so Explorer reads garbage for FileSize/
+ * DeleteTime/PathLen and silently drops the entry -- the file and its $I both
+ * exist on disk, the DB says 'landed', but the entry never appears in the
+ * desktop Recycle Bin. Restore via this service still worked throughout,
+ * since restore reads the DB, not the $I file.
  */
 
 #include "rbsvc.h"
@@ -84,10 +90,10 @@ static int BuildRecycleDir(const WCHAR *sid, const WCHAR *storeDos,
 
 #pragma pack(push, 1)
 typedef struct _RB_I_HEADER {
-    ULONG   Version;      /* 1 */
+    LONG64  Version;      /* 2 -- MUST be 8 bytes, see file header comment */
     LONG64  FileSize;
     LONG64  DeleteTime;   /* FILETIME */
-    ULONG   PathLen;      /* WCHAR count */
+    ULONG   PathLen;      /* WCHAR count, INCLUDING the terminating NUL */
 } RB_I_HEADER;
 #pragma pack(pop)
 
@@ -105,24 +111,27 @@ static int WriteIFile(const WCHAR *iPath, const WCHAR *origDos,
     HANDLE h;
     RB_I_HEADER hdr;
     DWORD written;
-    DWORD pathLen;
+    DWORD charsNoNul;
+    DWORD charsWithNul; /* PathLen per spec: character count INCLUDING NUL */
     BOOL ok = TRUE;
 
     h = CreateFileW(iPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                     FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
 
-    pathLen = (DWORD)wcslen(origDos);
+    charsNoNul   = (DWORD)wcslen(origDos);
+    charsWithNul = charsNoNul + 1;
 
-    hdr.Version    = 1;
+    hdr.Version    = 2;
     hdr.FileSize   = fileSize;
     hdr.DeleteTime = UnixToFileTime(deleteTime);
-    hdr.PathLen    = pathLen;
+    hdr.PathLen    = charsWithNul;
 
     ok &= WriteFile(h, &hdr, sizeof(hdr), &written, NULL);
-    if (ok && pathLen > 0) {
-        ok &= WriteFile(h, origDos, pathLen * sizeof(WCHAR), &written, NULL);
-    }
+    /* Write the path AND its terminating NUL -- charsWithNul WCHARs total,
+       matching the PathLen we just wrote. Explorer's own $I writer does the
+       same; a mismatch here is exactly what makes RB-17/RB-39 recur. */
+    ok &= WriteFile(h, origDos, charsWithNul * sizeof(WCHAR), &written, NULL);
 
     CloseHandle(h);
     if (!ok) { DeleteFileW(iPath); return 0; }
@@ -224,6 +233,68 @@ cleanup:
     free(origDos);
     free(realSid);
     return result;
+}
+
+/* ------------------------------------------------------------------ */
+/* Migration: rebuild $I files that were written with the pre-fix       */
+/* 4-byte Version field (RB-17/RB-39). $R is untouched -- only the      */
+/* $I sidecar is regenerated, from the DB row, in the corrected format. */
+/* Idempotent: WriteIFile always overwrites (CREATE_ALWAYS), so this    */
+/* is safe to run more than once (e.g. after a partial failure).        */
+/* ------------------------------------------------------------------ */
+
+static int RebuildIFileFor(const RBSVC_ITEM *item)
+{
+    WCHAR iPath[MAX_PATH];
+    WCHAR *found;
+    const WCHAR *origDos;
+
+    if (!item || !item->RecyclePath || !item->RecyclePath[0]) return 0;
+
+    /* $I counterpart of the $R file: same name, $R -> $I (first hit only) */
+    wcsncpy_s(iPath, ARRAYSIZE(iPath), item->RecyclePath, _TRUNCATE);
+    found = wcsrchr(iPath, L'\\');
+    if (!found || found[1] != L'$' || found[2] != L'R') {
+        LogWarn(L"[rebuild-i] id=%lld recycle_path not in $R form: %s",
+                item->Id, item->RecyclePath);
+        return 0;
+    }
+    found[2] = L'I';
+
+    /* Prefer the DOS form resolved at landing time; fall back to the raw
+       NT path rather than skip the item outright. */
+    origDos = (item->OrigPathDos && item->OrigPathDos[0])
+                  ? item->OrigPathDos
+                  : (item->OrigPath ? item->OrigPath : L"");
+
+    if (!WriteIFile(iPath, origDos, item->FileSize, item->DeleteTime)) {
+        LogError(L"[rebuild-i] id=%lld cannot write %s", item->Id, iPath);
+        return 0;
+    }
+    SetHiddenSystem(iPath);
+    return 1;
+}
+
+/* Rewrites every currently-landed item's $I file. Returns the number that
+   were successfully rewritten; logs a warning per item that was skipped
+   (e.g. already purged, or a malformed recycle_path). */
+int StoreRebuildAllIFiles(void)
+{
+    RBSVC_ITEM *items = NULL;
+    int count, ok = 0, i;
+
+    /* DbListExpired(cutoff) returns every 'landed' row with delete_time <
+       cutoff; a far-future cutoff makes that "every landed row", with no
+       LIMIT truncation (unlike DbListLandedOldest). */
+    count = DbListExpired(&items, 253402300800.0 /* ~year 9999 */);
+
+    for (i = 0; i < count; i++) {
+        if (RebuildIFileFor(&items[i])) ok++;
+    }
+
+    LogInfo(L"[rebuild-i] rewrote %d/%d $I files", ok, count);
+    if (items) DbFreeItemList(items, count);
+    return ok;
 }
 
 /* ------------------------------------------------------------------ */

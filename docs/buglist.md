@@ -12,7 +12,10 @@
   报 `ERROR_INVALID_HANDLE(6)`、每 `RBSVC_RECONNECT_MS` 重连死循环、`notify_sent` 恒 0 而
   `rename_ok` 持续上涨——即用户长期报的"删除不拦截"；实为 2026-09-02 RB-34 加固未根除的残留，
   本次以 `DuplicateHandle` 给 worker 独立句柄副本彻底修复）并新增 RB-38（Office 临时文件与任意命名
-  `*.tmp` 如 `FA5E97C4.tmp` 被误暂存进回收站，驱动新增按文件名最终分量匹配的内置排除默认集））
+  `*.tmp` 如 `FA5E97C4.tmp` 被误暂存进回收站，驱动新增按文件名最终分量匹配的内置排除默认集）；
+  **2026-09-07 新增并修复 RB-39**（`$I` 元数据 `Version` 字段少写 4 字节，落地条目桌面回收站
+  不可见——即 RB-17 的复发，2026-08-31 的"误判撤回"结论有误；已修复并提供 `rebuild-i` 迁移
+  一次性修复历史落地条目）
 - 条目：RB-01 ~ RB-38（含 5 项大目录树删除场景专项问题、3 项删除拦截盲区、端口线程死锁相关：
   RB-34 取消等待 + RB-34b 同步采样 + RB-37 句柄误关残留修复）
 - 评估结论：**核心 P0 阻塞已消除，仍不具备生产部署条件**
@@ -78,7 +81,7 @@
 | RB-14 | P2 | 全局 | 无监控指标导出、事件日志无 manifest、无告警规则 | 待修 |
 | RB-15 | P2 | 工程 | 测试覆盖为零（无单元测试、压力测试、故障注入测试） | 待修 |
 | RB-16 | P2 | Go API | Token 非恒定时间比较、注册表明文存储、无限流、无操作审计 | 待修 |
-| RB-17 | P2 | 服务 | `$I` 元数据格式兼容性 | **误判（已撤回）** |
+| RB-17 | P2 | 服务 | `$I` 元数据格式兼容性 | **误判撤回后于 2026-09-07 复发确认，见 RB-39** |
 | RB-18 | **P1** | 服务 | 深层目录还原失败：`CreateDirectoryW` 只建一级父目录 | **已修复** |
 | RB-19 | P1 | 驱动 | 删除大目录树极慢：每文件重复调用 `RbfEnsureStoreDir` | **已修复** |
 | RB-20 | P1 | 驱动 | 队列满时部分删除失败，目录删不干净（RB-08 副作用） | 待修 |
@@ -100,6 +103,7 @@
 | RB-36 | **P1** | 部署/运维 | 本地杀软/EDR/索引器/备份 agent 以**非 `DELETE` 共享**的句柄常驻占住共享目录/文件，SMB 删除（`srv2` 以 `DELETE` 打开）被 Windows `SHARING_VIOLATION` 挡在驱动拦截**之前**，表现为"SMB 端删除回收失效" | **环境性（将共享加入杀软/索引器排除名单即恢复，非驱动缺陷）** |
 | RB-37 | **P0** | 服务 | 端口线程 stats worker 按值捕获 `g_Port` 并在 `PortSendWorker` 中 `CloseHandle`，与端口线程的 `FilterGetMessage` 形成竞态；Windows 句柄号复用令该 `CloseHandle` 误关刚重连的活连接 → `GetOverlappedResult` 报 `ERROR_INVALID_HANDLE(6)`、每 `RBSVC_RECONNECT_MS` 重连死循环、`notify_sent` 恒 0 而 `rename_ok`/`intercepts` 持续上涨（即"删除不拦截"真凶：内核拦截/转移正常，连接活不到被读） | **已修复**（2026-09-04 `DuplicateHandle` 给 worker 独立句柄副本，其 `CloseHandle` 只关副本、永不影响 `g_Port`，编译通过、待部署实测） |
 | RB-38 | **P2** | 驱动 | Office 编辑产生的临时文件（锁文件 `~$*`、原子保存临时 `~WRF*.tmp`/`~DF*.tmp`、以及任意命名 `*.tmp` 如 `FA5E97C4.tmp`）被错误暂存进回收站，污染 RBStore 且掩盖真实删除 | **已实施**（驱动 `RbfIsExcluded` 按文件名最终分量匹配，内置默认集 `~$*`/`~WRF*.tmp`/`~DF*.tmp`/`*.tmp`，可由注册表 `ExcludePatterns`(REG_MULTI_SZ) 覆盖；编译通过、待部署实测） |
+| RB-39 | **P0** | 服务 | `$I` 元数据 `Version` 字段写成 4 字节 `ULONG`（应为 8 字节），导致其后所有字段相对 Explorer 的期望偏移错位 4 字节；`$R`/`$I` 均落地、DB 记 `landed`，但桌面回收站枚举不到该条目（**RB-17 的复发，2026-08-31 的"误判撤回"结论有误**） | **已修复**（`rbstore.c` `RB_I_HEADER.Version` 改为 `LONG64`=2，`PathLen` 改为计入结尾 NUL 并据此写入；新增 `rbservice.exe rebuild-i` 一次性迁移，重写历史 `landed` 条目的 `$I`，`$R` 不变） |
 
 > RB-18 ~ RB-22 为**大目录树删除场景**专项问题（详见第五章）。
 > 该场景在单文件删除时不暴露，删除含大量子目录/文件的目录树时集中显现。
@@ -494,10 +498,51 @@ Explorer 无法解析"的结论。2026-08-31 实测取证推翻该结论：
 3. 用户"看不到"被删文件的**真正原因**是 RB-29（文件被永久删除，从未产生 `$I`/`$R`），
    而非 `$I` 格式问题
 
-**结论**
+**结论（已被 RB-39 推翻，见下）**
 
 - `$I` 格式与命名均与 Explorer 原生一致，回收站显示正常，**无需修改**
 - 该缺陷描述从 buglist 撤回；相关"桌面回收站不可见"现象由 RB-29 解释并已随 RB-29 修复
+
+---
+
+### RB-39 `$I` 元数据 `Version` 字段少写 4 字节，导致落地条目回收站不可见（RB-17 复发）
+
+- **模块**：service_c
+- **位置**：`service_c/rbstore.c`（`RB_I_HEADER`、`WriteIFile`）
+- **级别**：**P0**（数据未丢——`$R` 与 DB 记录都完好——但用户感知为"文件消失"，且历史 `landed` 条目全部受影响）
+- **状态**：**已修复（2026-09-07）**
+
+**现象**
+
+- 管理面板显示某条目 `landed`，`E:\$Recycle.Bin\<SID>\$R....out` 用 `cmd /c if exist` 验证确实存在；
+- 但打开桌面回收站图标，Explorer 的枚举列表里看不到这个文件。
+
+**根因**
+
+- 2026-08-31 对 RB-17 的撤回依据的是一次人工字节比对，把 8 字节的 `Version` 字段和紧随其后的
+  `FileSize`/`DeleteTime` 看混了，误得出"格式已与原生一致"的结论；
+- `rbstore.c` 里的 `RB_I_HEADER.Version` 实际写的是 `ULONG`（4 字节），而 Explorer/libyal 规范里
+  这个字段是 **8 字节**（`1`=Win10 之前，`2`=Win10+）。少写的 4 字节让 `FileSize`、`DeleteTime`、
+  `PathLen`、路径字符串**全部**比 Explorer 期望的偏移提前了 4 字节；
+- 具体表现：Explorer 在偏移 `0x18` 处读"文件名长度"，实际读到的是原始路径字符串的头两个字符，
+  解出一个不合理的巨大长度值，解析失败，该条目被静默丢弃——不报错、不崩溃，只是不出现在列表里；
+- `PathLen` 本身也漏了一件事：应计入结尾的 NUL 终止符（Explorer 自己的写入器就是这么算的），
+  旧代码没算、也没写这个 NUL。
+
+**修复**
+
+- `RB_I_HEADER.Version` 由 `ULONG` 改为 `LONG64`，写入值由 `1` 改为 `2`（Win10+ 长度前缀格式）；
+- `PathLen` 改为 `wcslen(origDos) + 1`（含 NUL），`WriteIFile` 对应多写 1 个 `WCHAR` 的 NUL；
+- 新增 `rbservice.exe rebuild-i` 一次性迁移模式：遍历 DB 里所有 `status='landed'` 的行，按
+  `recycle_path`（`$R`）推出同名 `$I`，用修好的 `WriteIFile` 重新生成——只重写 `$I`，`$R` 内容
+  不动，可重复执行。**只改 `rbstore.c` 不会修复已经落地的历史条目**，必须跑一次这个迁移。
+
+**验证方法**
+
+1. 停止 `rbservice`（或至少确认没有并发写 DB），执行：
+   `rbservice.exe rebuild-i --db <StoreRoot>\recycle.db`
+2. 打开受影响用户的桌面回收站，确认历史 `landed` 条目重新可见；
+3. 之后新产生的删除，落地时直接用新格式写 `$I`，无需再跑迁移。
 
 ---
 
