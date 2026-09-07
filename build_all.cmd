@@ -330,7 +330,15 @@ if errorlevel 1 goto :collect_failed
 copy /y "%ROOT%\deploy.ps1"            "%TARGET%\deploy.ps1"     >nul
 if errorlevel 1 goto :collect_failed
 
-echo   [OK] binaries + INF + deploy.ps1 in %TARGET%
+rem Web console: single static file, just copy it into the deploy folder.
+if exist "%ROOT%\web\index.html" (
+    copy /y "%ROOT%\web\index.html" "%TARGET%\index.html" >nul
+    if errorlevel 1 goto :collect_failed
+) else (
+    echo   [WARN] web\index.html not found - console skipped
+)
+
+echo   [OK] binaries + INF + deploy.ps1 + index.html in %TARGET%
 echo.
 goto :summary
 
@@ -374,7 +382,7 @@ if defined API_SKIPPED (
 
 echo.
 echo   Deploy package ready: %TARGET%
-echo     ^(self-contained: binaries + rbminiflt.inf + deploy.ps1^)
+echo     ^(self-contained: binaries + rbminiflt.inf + deploy.ps1 + index.html^)
 echo.
 echo   Next steps:
 echo     1. Copy the whole folder above to the target machine
