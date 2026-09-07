@@ -33,26 +33,34 @@ jobs:
       # WDK, which provides the kernel-mode headers/libs (km, fltMgr.lib, ...)
       # under C:\Program Files (x86)\Windows Kits\10.
       #
-      # The WDK is delivered as a Visual Studio extension (VSIX). Installing it
-      # drops the km include/lib trees into the Windows Kits 10 folder that
-      # driver\build.cmd auto-detects.
+      # The WDK is delivered as a WinGet package (Microsoft.WindowsWDK.<ver>).
+      # Installing it via winget also pulls the matching Windows 11 SDK, which
+      # keeps the SDK and WDK build numbers in sync (required by the WDK).
       - name: Install WDK
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $vsix = "$env:RUNNER_TEMP\wdk.vsix"
-          Write-Host "Downloading WDK VSIX ..."
-          Invoke-WebRequest -Uri https://aka.ms/wdk/VS2022 -OutFile $vsix
-          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Enterprise\Common7\IDE\VSIXInstaller.exe"
-          if (-not (Test-Path $installer)) {
-            $installer = "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise\Common7\IDE\VSIXInstaller.exe"
+          $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+          if (-not $winget) {
+            # windows-2022 ships winget via App Installer, but be defensive.
+            throw "winget.exe not found on PATH"
           }
-          Write-Host "Installing WDK into VS ..."
-          & $installer /quiet $vsix
+          $log = "$env:RUNNER_TEMP\wdk-install.log"
+          $wingetArgs = @(
+            'install', '--id', 'Microsoft.WindowsWDK.10.0.28000',
+            '--silent',
+            '--accept-package-agreements', '--accept-source-agreements',
+            '--log', $log
+          )
+          & $winget $wingetArgs
           if ($LASTEXITCODE -ne 0) {
-            Write-Error "VSIXInstaller failed with exit code $LASTEXITCODE"
-            exit $LASTEXITCODE
+            if (Test-Path $log) {
+              Write-Host "---- winget log (tail) ----"
+              Get-Content $log -Tail 80
+            }
+            throw "winget install WDK failed with exit code $LASTEXITCODE"
           }
+          Write-Host "WDK installed."
 
       # The runner may carry a newer Windows 11 SDK than the WDK targets, which
       # would make driver\build.cmd auto-detect a higher 10.* folder that lacks
