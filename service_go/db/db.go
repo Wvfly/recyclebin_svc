@@ -71,12 +71,13 @@ type Item struct {
 
 // Op is a command row written by this service and executed by rbservice.exe.
 type Op struct {
-	ID      int64  `json:"id"`
-	Type    string `json:"type"`
-	ItemID  int64  `json:"item_id"`
-	Arg     string `json:"arg,omitempty"`
-	State   string `json:"state"` // pending|done|failed
-	Message string `json:"message,omitempty"`
+	ID          int64  `json:"id"`
+	Type        string `json:"type"`
+	ItemID      int64  `json:"item_id"`
+	Arg         string `json:"arg,omitempty"`
+	PreserveAcl bool   `json:"preserve_acl,omitempty"` // 'restore' only, see db/schema.sql (RB-41)
+	State       string `json:"state"` // pending|done|failed
+	Message     string `json:"message,omitempty"`
 }
 
 // DB holds the two handles described in the package comment.
@@ -628,14 +629,18 @@ func (d *DB) DriverStatsMap() map[string]interface{} {
 // The CHECK constraint on ops.type rejects unsupported types, so a mismatch
 // between this service and the C service surfaces as an insert error rather
 // than a row that silently never executes.
-func (d *DB) EnqueueOp(opType string, itemID int64, arg string) (int64, error) {
+//
+// preserveAcl is honoured by both 'restore' and 'restore-tree' (RB-41/RB-41b):
+// rbservice.exe applies it per-entry either way. Default is false; the web
+// console only sets it true when the caller explicitly opts in.
+func (d *DB) EnqueueOp(opType string, itemID int64, arg string, preserveAcl bool) (int64, error) {
 	if !IsSupportedOp(opType) {
 		return 0, fmt.Errorf("unsupported op type %q; supported: %v",
 			opType, SupportedOps)
 	}
 	res, err := d.rw.Exec(
-		"INSERT INTO ops(type, item_id, arg, state, ts) VALUES (?, ?, ?, 'pending', ?)",
-		opType, itemID, arg, float64(time.Now().Unix()),
+		"INSERT INTO ops(type, item_id, arg, preserve_acl, state, ts) VALUES (?, ?, ?, ?, 'pending', ?)",
+		opType, itemID, arg, preserveAcl, float64(time.Now().Unix()),
 	)
 	if err != nil {
 		return 0, err
@@ -644,8 +649,8 @@ func (d *DB) EnqueueOp(opType string, itemID int64, arg string) (int64, error) {
 }
 
 // EnqueueRestore is a convenience wrapper around EnqueueOp.
-func (d *DB) EnqueueRestore(itemID int64, targetOverride string) (int64, error) {
-	return d.EnqueueOp("restore", itemID, targetOverride)
+func (d *DB) EnqueueRestore(itemID int64, targetOverride string, preserveAcl bool) (int64, error) {
+	return d.EnqueueOp("restore", itemID, targetOverride, preserveAcl)
 }
 
 // OpStatus returns the current state of a queued op.
@@ -653,8 +658,8 @@ func (d *DB) OpStatus(opID int64) (*Op, error) {
 	var op Op
 	var arg, msg sql.NullString
 	err := d.ro.QueryRow(
-		"SELECT id, type, item_id, arg, state, message FROM ops WHERE id = ?",
-		opID).Scan(&op.ID, &op.Type, &op.ItemID, &arg, &op.State, &msg)
+		"SELECT id, type, item_id, arg, preserve_acl, state, message FROM ops WHERE id = ?",
+		opID).Scan(&op.ID, &op.Type, &op.ItemID, &arg, &op.PreserveAcl, &op.State, &msg)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -682,7 +687,7 @@ func (d *DB) RecentOps(limit int) ([]Op, error) {
 		limit = 50
 	}
 	rows, err := d.ro.Query(
-		"SELECT id, type, item_id, arg, state, message FROM ops ORDER BY id DESC LIMIT ?",
+		"SELECT id, type, item_id, arg, preserve_acl, state, message FROM ops ORDER BY id DESC LIMIT ?",
 		limit)
 	if err != nil {
 		return nil, err
@@ -693,7 +698,7 @@ func (d *DB) RecentOps(limit int) ([]Op, error) {
 	for rows.Next() {
 		var op Op
 		var arg, msg sql.NullString
-		if err := rows.Scan(&op.ID, &op.Type, &op.ItemID, &arg, &op.State, &msg); err != nil {
+		if err := rows.Scan(&op.ID, &op.Type, &op.ItemID, &arg, &op.PreserveAcl, &op.State, &msg); err != nil {
 			return nil, err
 		}
 		op.Arg = arg.String

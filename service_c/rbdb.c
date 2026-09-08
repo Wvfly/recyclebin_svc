@@ -161,6 +161,12 @@ static int DbEnsureSchema(void)
         return 0;
     }
 
+    /* RB-41: same idiom, for the preserve_acl restore option. */
+    if (!DbEnsureColumn("ops", "preserve_acl",
+                        "INTEGER NOT NULL DEFAULT 0")) {
+        return 0;
+    }
+
     if (ver == 0) {
         if (DbWriteVersion(RB_SCHEMA_VERSION) != SQLITE_OK) return 0;
         LogInfo(L"created new database, schema version %d", RB_SCHEMA_VERSION);
@@ -1076,7 +1082,7 @@ int DbOpsPending(RBSVC_OP **out, int limit)
     if (!g_Db) return 0;
 
     sprintf_s(sql, sizeof(sql),
-              "SELECT id,type,item_id,arg,state,message FROM ops "
+              "SELECT id,type,item_id,arg,state,message,preserve_acl FROM ops "
               "WHERE state='pending' ORDER BY id ASC LIMIT %d",
               limit > 0 ? limit : 64);
 
@@ -1106,6 +1112,7 @@ int DbOpsPending(RBSVC_OP **out, int limit)
         if (text) strncpy_s(list[count].State, 16, text, _TRUNCATE);
         text = (const char *)sqlite3_column_text(st, 5);
         if (text) list[count].Message = _strdup(text);
+        list[count].PreserveAcl = sqlite3_column_int(st, 6);
         count++;
     }
     if (rc != SQLITE_DONE && rc != SQLITE_ROW) DbLogError("step ops");

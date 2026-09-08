@@ -156,6 +156,127 @@ static int DestIsAllowed(const WCHAR *dstDos, WCHAR *reasonBuf, DWORD cch)
     return 0;
 }
 
+/*
+ * RB-40 (owner fidelity): GrantSelfAccessToStaging below takes ownership of the
+ * staging file so SYSTEM can rename it, but nothing ever gave ownership back --
+ * every restored file/directory was left owned by NT AUTHORITY\SYSTEM forever.
+ * Combined with RestoreInheritParentAcl (DACL only, not owner) that meant a
+ * restore never actually put the file back the way it was: Owner was always
+ * SYSTEM, and any DACL that differed from the parent's inherited one was gone.
+ *
+ * CaptureOwnerSid must run BEFORE GrantSelfAccessToStaging touches the file --
+ * it is the only chance to see the real owner before it is overwritten.
+ */
+static PSID CaptureOwnerSid(const WCHAR *path)
+{
+    PSECURITY_DESCRIPTOR sd = NULL;
+    PSID owner = NULL;
+    PSID copy = NULL;
+
+    if (!path || path[0] == L'\0') return NULL;
+
+    if (GetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT,
+                              OWNER_SECURITY_INFORMATION,
+                              &owner, NULL, NULL, NULL, &sd) != ERROR_SUCCESS) {
+        return NULL;
+    }
+
+    if (owner && IsValidSid(owner)) {
+        DWORD len = GetLengthSid(owner);
+        copy = LocalAlloc(LPTR, len);
+        if (copy && !CopySid(len, copy, owner)) {
+            LocalFree(copy);
+            copy = NULL;
+        }
+    }
+
+    if (sd) LocalFree(sd);
+    return copy;
+}
+
+/* Sets path's owner back to a SID captured by CaptureOwnerSid. Best-effort: the
+   file is already correctly moved and DACL'd by this point, so a failure here
+   is logged, not treated as a restore failure -- the alternative (Owner stuck
+   as SYSTEM) is strictly better than losing the file over an ACL write. */
+static void RestoreOwnerSid(const WCHAR *path, PSID owner)
+{
+    if (!path || path[0] == L'\0' || !owner) return;
+
+    if (SetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT,
+                              OWNER_SECURITY_INFORMATION,
+                              owner, NULL, NULL, NULL) != ERROR_SUCCESS) {
+        LogWarn(L"[restore] RB-40 restore-owner failed for %s (win32=%lu)",
+                path, GetLastError());
+    }
+}
+
+/*
+ * RB-41 (optional strict permission fidelity): CaptureOwnerSid/RestoreOwnerSid
+ * above always run -- Owner should never be left as SYSTEM. DACL is different:
+ * RestoreInheritParentAcl's "inherit from destination parent" is the right
+ * default (a restored tree stays in sync with the share's current permission
+ * policy), but an admin restoring a single file that had its own explicit
+ * grant, distinct from the folder, may want that exact grant back instead.
+ * That is what preserveAcl opts into. Same capture timing as the owner: this
+ * must run BEFORE GrantSelfAccessToStaging appends its own SYSTEM ACE.
+ *
+ * RB-41b: RestoreTreeByPrefix can also opt into this for every entry in a
+ * tree (files and directories alike), but only when its caller explicitly
+ * asks -- it still defaults to RestoreInheritParentAcl per-entry. Applying
+ * it there means the cost below (one extra read per object) and the
+ * inheritance-drift effect (each object pulled out of the live inheritance
+ * chain) apply to every object in the tree, not just one -- worth it when
+ * the caller actually wants the tree's exact pre-deletion permissions back,
+ * not the default choice for "just get my files back".
+ */
+static PACL CaptureDacl(const WCHAR *path)
+{
+    PSECURITY_DESCRIPTOR sd = NULL;
+    PACL   dacl = NULL;
+    PACL   copy = NULL;
+    BOOL   present = FALSE, defaulted = FALSE;
+    DWORD  len;
+
+    if (!path || path[0] == L'\0') return NULL;
+
+    if (GetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT,
+                              DACL_SECURITY_INFORMATION,
+                              NULL, NULL, &dacl, NULL, &sd) != ERROR_SUCCESS) {
+        return NULL;
+    }
+
+    /* GetSecurityDescriptorDacl on the descriptor we just got tells us whether
+       a DACL is actually present (an object can legitimately have none, which
+       means "full access to everyone" -- do not manufacture one). */
+    if (GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted) &&
+        present && dacl != NULL && IsValidAcl(dacl)) {
+        len = dacl->AclSize;
+        copy = (PACL)LocalAlloc(LPTR, len);
+        if (copy) memcpy(copy, dacl, len);
+    }
+
+    if (sd) LocalFree(sd);
+    return copy;
+}
+
+/* Applies a DACL captured by CaptureDacl to path, as an explicit (protected)
+   ACL -- i.e. exactly what the object had at deletion time, not something
+   that will keep following the destination folder's inheritance. Best-effort,
+   same rationale as RestoreOwnerSid: a failure here is logged, not treated as
+   a restore failure. */
+static void RestoreDacl(const WCHAR *path, PACL dacl)
+{
+    if (!path || path[0] == L'\0' || !dacl) return;
+
+    if (SetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT,
+                              DACL_SECURITY_INFORMATION |
+                              PROTECTED_DACL_SECURITY_INFORMATION,
+                              NULL, NULL, dacl, NULL) != ERROR_SUCCESS) {
+        LogWarn(L"[restore] RB-41 restore-dacl failed for %s (win32=%lu)",
+                path, GetLastError());
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* RB-35 source-side fix (方案C)                                        */
 /* ------------------------------------------------------------------ */
@@ -269,12 +390,14 @@ static void RestoreInheritParentAcl(const WCHAR *path)
  * Restores item `itemId` back to its original path (or `argOverride` if given).
  * Returns 1 on success, 0 on failure; `msgBuf` receives a human-readable reason.
  */
-int RestoreItemById(LONG64 itemId, const WCHAR *argOverride,
+int RestoreItemById(LONG64 itemId, const WCHAR *argOverride, int preserveAcl,
                     WCHAR *msgBuf, DWORD cchMsg)
 {
     RBSVC_ITEM item;
     WCHAR *srcDos = NULL;
     WCHAR *dstDos = NULL;
+    PSID   origOwner = NULL;
+    PACL   origDacl = NULL;
     int ok = 0;
 
     if (msgBuf && cchMsg > 0) msgBuf[0] = L'\0';
@@ -358,6 +481,14 @@ int RestoreItemById(LONG64 itemId, const WCHAR *argOverride,
         }
     }
 
+    /* RB-40: snapshot the real owner before GrantSelfAccessToStaging below
+       overwrites it with SYSTEM -- this is the only point where the original
+       owner is still readable. */
+    origOwner = CaptureOwnerSid(srcDos);
+
+    /* RB-41: same timing, only when the caller opted into strict fidelity. */
+    if (preserveAcl) origDacl = CaptureDacl(srcDos);
+
     /* RB-35 (方案C): the staging file kept the deleting user's DACL, so SYSTEM
        has no DELETE on it. Take ownership + grant SYSTEM first so the rename
        below can proceed. Non-fatal if it fails -- the rename will then surface
@@ -404,9 +535,21 @@ int RestoreItemById(LONG64 itemId, const WCHAR *argOverride,
         }
     }
 
-    /* RB-35 (visibility): the moved file kept the staging file's DACL; reset it to
-       inherit from the destination folder so share users can see it. */
-    RestoreInheritParentAcl(dstDos);
+    /* RB-35 (visibility) / RB-41 (optional strict fidelity): the moved file
+       still carries the staging file's DACL at this point. Either reset it to
+       inherit from the destination folder (default), or put back the exact
+       DACL it had at deletion time (preserveAcl). */
+    if (preserveAcl && origDacl) {
+        RestoreDacl(dstDos, origDacl);
+    } else {
+        RestoreInheritParentAcl(dstDos);
+    }
+
+    /* RB-40: give ownership back now that the rename has landed. Independent of
+       the DACL step above (both only ever touch their own SECURITY_INFORMATION
+       flag), kept after it simply so all the ACL/owner cleanup reads as one
+       sequence. */
+    RestoreOwnerSid(dstDos, origOwner);
 
     DbSetStatus(itemId, "restored");
     if (msgBuf) swprintf_s(msgBuf, cchMsg, L"ok");
@@ -414,6 +557,8 @@ int RestoreItemById(LONG64 itemId, const WCHAR *argOverride,
     ok = 1;
 
 cleanup:
+    if (origOwner) LocalFree(origOwner);
+    if (origDacl) LocalFree(origDacl);
     free(srcDos);
     free(dstDos);
     DbFreeItem(&item);
@@ -446,8 +591,20 @@ cleanup:
  *    independent rename; undoing the ones that already succeeded would be
  *    more surprising than leaving them and reporting what failed.
  *  - Stop is checked between entries so a long restore cannot delay shutdown.
+ *
+ *  - preserveAcl (RB-41b): 0 (default) restores every entry with
+ *    RestoreInheritParentAcl, same as a single restore's default -- the tree
+ *    stays in sync with the share's current permission policy. 1 restores
+ *    every entry (files AND directories alike) with its own captured DACL
+ *    instead, via the same per-item CaptureDacl/RestoreDacl path a single
+ *    restore uses. The cost and inheritance-drift trade-off described on
+ *    CaptureDacl's comment still applies -- it is simply now the caller's
+ *    choice for the whole tree rather than never available. Callers that
+ *    want the exact pre-deletion permissions back on a folder they trust
+ *    (as opposed to "just get my files back") should pass 1.
  */
-int RestoreTreeByPrefix(const WCHAR *prefixDos, WCHAR *msgBuf, DWORD cchMsg)
+int RestoreTreeByPrefix(const WCHAR *prefixDos, int preserveAcl,
+                        WCHAR *msgBuf, DWORD cchMsg)
 {
     WCHAR *prefixNt = NULL;
     RBSVC_ITEM *items = NULL;
@@ -511,8 +668,11 @@ int RestoreTreeByPrefix(const WCHAR *prefixDos, WCHAR *msgBuf, DWORD cchMsg)
         }
 
         /* NULL override: every entry goes back to its own original path,
-           which is what makes this reassemble the tree. */
-        ok = RestoreItemById(items[i].Id, NULL, msg, ARRAYSIZE(msg));
+           which is what makes this reassemble the tree. preserveAcl comes
+           from the caller (RB-41b) -- applies uniformly to every entry,
+           files and directories alike, since a DACL/Owner restore works the
+           same way on either. */
+        ok = RestoreItemById(items[i].Id, NULL, preserveAcl, msg, ARRAYSIZE(msg));
 
         if (ok) {
             okCount++;
@@ -570,7 +730,8 @@ int RestoreDrainOps(void)
         if (_stricmp(ops[i].Type, "restore") == 0) {
             if (ops[i].Arg) argW = U8ToWLocal(ops[i].Arg);
 
-            ok = RestoreItemById(ops[i].ItemId, argW, msg, ARRAYSIZE(msg));
+            ok = RestoreItemById(ops[i].ItemId, argW, ops[i].PreserveAcl,
+                                 msg, ARRAYSIZE(msg));
             free(argW);
 
         } else if (_stricmp(ops[i].Type, "restore-tree") == 0) {
@@ -583,7 +744,7 @@ int RestoreDrainOps(void)
 
             argW = U8ToWLocal(ops[i].Arg);
 
-            ok = RestoreTreeByPrefix(argW, msg, ARRAYSIZE(msg));
+            ok = RestoreTreeByPrefix(argW, ops[i].PreserveAcl, msg, ARRAYSIZE(msg));
             free(argW);
 
         } else {

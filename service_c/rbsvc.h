@@ -271,6 +271,7 @@ typedef struct _RBSVC_OP {
     CHAR  *Arg;       /* optional target path for restore */
     CHAR   State[16]; /* pending|done|failed */
     CHAR  *Message;
+    int    PreserveAcl; /* 'restore' only; see db/schema.sql (RB-41) */
 } RBSVC_OP;
 
 int    DbOpsPending(RBSVC_OP **out, int limit);
@@ -350,8 +351,12 @@ int  DbWriteDriverStats(const RBF_STATS *stats, int driverResponded);
 /* ------------------------------------------------------------------ */
 /* Restore (executed here on behalf of Go REST)                        */
 /* ------------------------------------------------------------------ */
-/* Returns 1 ok, 0 fail. Message written into buf. */
-int  RestoreItemById(LONG64 itemId, const WCHAR *argOverride,
+/* Returns 1 ok, 0 fail. Message written into buf.
+   preserveAcl (RB-41): 0 = current behaviour, restored object inherits its
+   DACL from the destination parent folder. 1 = restore the exact DACL the
+   object had at deletion time (captured before this service takes ownership
+   of the staging file to perform the move). */
+int  RestoreItemById(LONG64 itemId, const WCHAR *argOverride, int preserveAcl,
                      WCHAR *msgBuf, DWORD cchMsg);
 
 /* Restore every live item whose original path begins with prefixDos, e.g.
@@ -361,8 +366,17 @@ int  RestoreItemById(LONG64 itemId, const WCHAR *argOverride,
    Deleting a directory over SMB removes one entry at a time, so a tree
    arrives in the store as many scattered rows (see docs/buglist.md RB-21b).
    This reassembles them from a single request instead of requiring one
-   restore per entry. */
-int  RestoreTreeByPrefix(const WCHAR *prefixDos, WCHAR *msgBuf, DWORD cchMsg);
+   restore per entry.
+
+   preserveAcl (RB-41b): same meaning as RestoreItemById's, applied to every
+   entry in the tree (files and directories alike). Defaults to 0 at the API
+   layer; pass 1 only when the caller wants the tree's exact pre-deletion
+   permissions back rather than having it re-sync with the share's current
+   policy -- see the cost/inheritance-drift trade-off on CaptureDacl's
+   comment in rbrestore.c, which now applies per-entry across the whole
+   tree when this is 1. */
+int  RestoreTreeByPrefix(const WCHAR *prefixDos, int preserveAcl,
+                         WCHAR *msgBuf, DWORD cchMsg);
 
 /* ------------------------------------------------------------------ */
 /* Kernel port reader                                                  */

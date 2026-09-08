@@ -308,9 +308,10 @@ func (s *Server) handleOps(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 		var req struct {
-			Type string `json:"type"`
-			ID   int64  `json:"id"`
-			Arg  string `json:"arg"`
+			Type        string `json:"type"`
+			ID          int64  `json:"id"`
+			Arg         string `json:"arg"`
+			PreserveAcl bool   `json:"preserve_acl"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeErr(w, http.StatusBadRequest, "invalid JSON body")
@@ -364,7 +365,7 @@ func (s *Server) handleOps(w http.ResponseWriter, r *http.Request) {
 		// into a single restore of item_id=0 and fail with "item 0 not found"
 		// in the C service's drain (RestoreItemById(0)). req.Type is already
 		// validated by IsSupportedOp above, and req.ID is 0 for restore-tree.
-		opID, err := s.DB.EnqueueOp(req.Type, req.ID, req.Arg)
+		opID, err := s.DB.EnqueueOp(req.Type, req.ID, req.Arg, req.PreserveAcl)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return

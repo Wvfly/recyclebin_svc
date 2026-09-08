@@ -366,8 +366,8 @@ function renderItems(){
       <td class="kv">${fmtTime(it.delete_time)}</td>
       <td>${statusPill(it.status)}</td>
       <td><div class="row-actions">
-        ${canRestore&&isDir?`<button class="primary" data-act="tree" data-path="${escapeAttr(path)}">还原目录</button>`:''}
-        ${canRestore&&!isDir?`<button class="primary" data-act="restore" data-id="${it.id}">还原文件</button>`:''}
+        ${canRestore&&isDir?`<div style="display:flex;align-items:center;gap:6px"><button class="primary" data-act="tree" data-path="${escapeAttr(path)}" data-id="${it.id}">还原目录</button><input type="checkbox" data-preserve-acl-tree-for="${it.id}" title="保留原权限（含子项）：还原后每个子项按删除前的原始权限恢复，不再跟随共享当前权限策略" style="vertical-align:middle"></div>`:''}
+        ${canRestore&&!isDir?`<div style="display:flex;align-items:center;gap:6px"><button class="primary" data-act="restore" data-id="${it.id}">还原文件</button><input type="checkbox" data-preserve-acl-for="${it.id}" title="保留原权限：还原后按删除前的原始权限恢复，不再跟随所在目录当前的权限策略" style="vertical-align:middle"></div>`:''}
       </div></td>
     </tr>`;
   }).join('');
@@ -395,24 +395,37 @@ function renderItems(){
   area.querySelectorAll('button[data-act]').forEach(b=>{
     b.onclick = ()=>{
       const act=b.dataset.act, id=b.dataset.id, p=b.dataset.path;
-      if(act==='restore') doRestore(id);
-      else if(act==='tree') doRestoreTree(p);
+      if(act==='restore'){
+        const cb = area.querySelector(`input[data-preserve-acl-for="${id}"]`);
+        doRestore(id, !!(cb && cb.checked));
+      }
+      else if(act==='tree'){
+        const cb = area.querySelector(`input[data-preserve-acl-tree-for="${id}"]`);
+        doRestoreTree(p, !!(cb && cb.checked));
+      }
     };
   });
 }
 
-async function doRestore(id){
+async function doRestore(id, preserveAcl){
   try{
-    const r = await api.post('/ops', {type:'restore', id:Number(id)});
-    toast(`已提交还原 #${id}，任务 ${r.op_id}`, 'ok');
+    const body = {type:'restore', id:Number(id)};
+    if(preserveAcl) body.preserve_acl = true;
+    const r = await api.post('/ops', body);
+    toast(`已提交还原 #${id}${preserveAcl?'（保留原权限）':''}，任务 ${r.op_id}`, 'ok');
     pollOp(r.op_id);
   }catch(e){ toast('还原失败：'+e.message, 'bad'); }
 }
-async function doRestoreTree(path){
-  if(!confirm(`确认还原整棵目录？\n目标前缀：${path}`)) return;
+async function doRestoreTree(path, preserveAcl){
+  const warn = preserveAcl
+    ? `\n\n已勾选"保留原权限"：整棵树（含所有子目录/文件）都会按删除前各自的原始权限恢复，恢复后不再跟随共享当前的权限策略变化。`
+    : '';
+  if(!confirm(`确认还原整棵目录？\n目标前缀：${path}${warn}`)) return;
   try{
-    const r = await api.post('/ops', {type:'restore-tree', arg:path});
-    toast(`已提交整棵还原，任务 ${r.op_id}`, 'ok');
+    const body = {type:'restore-tree', arg:path};
+    if(preserveAcl) body.preserve_acl = true;
+    const r = await api.post('/ops', body);
+    toast(`已提交整棵还原${preserveAcl?'（保留原权限）':''}，任务 ${r.op_id}`, 'ok');
     pollOp(r.op_id);
   }catch(e){ toast('整棵还原失败：'+e.message, 'bad'); }
 }

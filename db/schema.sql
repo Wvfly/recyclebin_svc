@@ -88,6 +88,15 @@ CREATE TABLE IF NOT EXISTS ops (
     --                  Matched as a prefix, so "D:\Share\Project" does NOT
     --                  also pull in "D:\Share\ProjectBackup".
     arg     TEXT,
+
+    -- 'restore' only: 1 = restore the ORIGINAL DACL captured just before this
+    -- service took ownership of the staging file, instead of resetting the
+    -- restored object to inherit from its destination parent folder. Always
+    -- treated as 0 for 'restore-tree' (RB-41): a large tree freezes each of
+    -- its objects out of the live inheritance chain, one by one, which is a
+    -- correctness/performance cost that grows with the tree, not a one-off.
+    preserve_acl INTEGER NOT NULL DEFAULT 0,
+
     state   TEXT NOT NULL DEFAULT 'pending'
                     CHECK (state IN ('pending', 'done', 'failed')),
     message TEXT,   -- human-readable outcome
