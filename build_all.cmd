@@ -335,6 +335,7 @@ if exist "%TARGET%\rbservice.exe"  del /f /q "%TARGET%\rbservice.exe"  >nul 2>&1
 if exist "%TARGET%\rbapi.exe"      del /f /q "%TARGET%\rbapi.exe"      >nul 2>&1
 if exist "%TARGET%\rbminiflt.inf"  del /f /q "%TARGET%\rbminiflt.inf"  >nul 2>&1
 if exist "%TARGET%\deploy.ps1"     del /f /q "%TARGET%\deploy.ps1"     >nul 2>&1
+if exist "%TARGET%\favicon.ico"    del /f /q "%TARGET%\favicon.ico"    >nul 2>&1
 
 copy /y "%ROOT%\driver\rbminiflt.sys"   "%TARGET%\rbminiflt.sys"   >nul
 if errorlevel 1 goto :collect_failed
@@ -357,11 +358,20 @@ copy /y "%ROOT%\deploy.ps1"            "%TARGET%\deploy.ps1"     >nul
 if errorlevel 1 goto :collect_failed
 
 rem Web console: single static file, just copy it into the deploy folder.
+rem favicon.ico sits next to index.html in web\ and is referenced relatively,
+rem so it must travel with it or the console shows a broken icon on the target.
 if exist "%ROOT%\web\index.html" (
     copy /y "%ROOT%\web\index.html" "%TARGET%\index.html" >nul
     if errorlevel 1 goto :collect_failed
 ) else (
     call :c_warn   [WARN] web\index.html not found - console skipped
+)
+
+if exist "%ROOT%\web\favicon.ico" (
+    copy /y "%ROOT%\web\favicon.ico" "%TARGET%\favicon.ico" >nul
+    if errorlevel 1 goto :collect_failed
+) else (
+    call :c_warn   [WARN] web\favicon.ico not found - console icon skipped
 )
 
 call :c_ok   [OK] binaries + INF + deploy.ps1 + index.html in %TARGET%

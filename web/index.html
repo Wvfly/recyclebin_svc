@@ -4,6 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RecycleBin for SMB · 回收站看板</title>
+<link rel="icon" type="image/x-icon" href="favicon.ico">
+<link rel="apple-touch-icon" href="favicon.ico">
+<meta name="theme-color" content="#2563eb">
 <style>
   :root{
     --bg:#f3f4f6;
@@ -26,6 +29,7 @@
   header{display:flex;align-items:center;gap:14px;padding:10px 16px;
     background:var(--panel);border-bottom:1px solid var(--line)}
   header h1{font-size:15px;font-weight:600;margin:0}
+  header .logo{display:block;width:26px;height:26px;border-radius:5px;flex:none}
   header .sp{flex:1}
   header input,header button{font:inherit}
   .conn{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
@@ -42,7 +46,9 @@
   button.primary:hover{background:var(--accent-dark)}
   .wrap{padding:16px;max-width:1240px;margin:0 auto}
   /* 状态面板固定右侧, 不随回收项滚动; 窄屏退化为普通流 */
-  #statusPanel{position:fixed;top:56px;right:16px;width:340px;max-height:calc(100vh - 72px);
+  /* max-height leaves room for the fixed footer pinned below it (~47px tall
+     + 16px margin), so the two never overlap. */
+  #statusPanel{position:fixed;top:56px;right:16px;width:340px;max-height:calc(100vh - 140px);
     overflow:auto;z-index:8}
   #statusPanel .cards{grid-template-columns:1fr 1fr}
   @media (max-width:980px){
@@ -92,22 +98,50 @@
   .muted{color:var(--muted)}
   .empty{padding:28px;text-align:center;color:var(--muted);background:var(--panel);
     border:1px solid var(--line);border-radius:6px}
-  .toast{position:fixed;right:16px;bottom:16px;background:#24292f;color:#fff;
+  .empty::before{content:"";display:block;width:48px;height:48px;margin:0 auto 10px;
+    background:url("favicon.ico") center/contain no-repeat;opacity:.5}
+  /* Sits to the LEFT of the fixed right column (panel + footer) so it never
+     overlaps them; no vertical offset needed since it's horizontally clear. */
+  .toast{position:fixed;right:372px;bottom:16px;background:#24292f;color:#fff;
     border-left:3px solid var(--accent);padding:10px 14px;border-radius:4px;max-width:380px;
     font-size:12px;box-shadow:0 4px 14px rgba(0,0,0,.18);
     opacity:0;transform:translateY(6px);transition:.2s;pointer-events:none;z-index:50}
+  @media (max-width:980px){
+    /* Footer is a corner float here, so stack the toast above it. */
+    .toast{right:12px;bottom:72px}
+  }
   .toast.show{opacity:1;transform:none}
   .toast.bad{border-left-color:var(--bad)}
   .toast.ok{border-left-color:var(--ok)}
   .toast.warn{border-left-color:var(--warn)}
   .state-pending{color:var(--warn)} .state-done{color:var(--ok)} .state-failed{color:var(--bad)}
   .kv{font-family:var(--mono);font-size:12px}
+  /* Fixed as part of the same right-hand column as #statusPanel: same
+     right edge (16px) and same width (340px), so the two line up exactly
+     and read as one unit. Sits directly below the panel. */
+  footer{position:fixed;right:16px;bottom:16px;width:340px;z-index:9;
+    display:flex;align-items:center;justify-content:center;gap:4px 6px;
+    flex-wrap:wrap;
+    margin:0;padding:7px 10px;
+    background:var(--panel);border:1px solid var(--line);border-radius:6px;
+    box-shadow:0 2px 8px rgba(0,0,0,.06);
+    color:var(--muted);font-size:11px;line-height:1.4}
+  @media (max-width:980px){
+    /* Status panel returns to normal flow here, so the footer drops the
+       fixed column width and just floats in the corner. */
+    footer{right:12px;bottom:12px;width:auto}
+  }
+  footer img{display:block;border-radius:3px;opacity:.75}
+  footer .sep{color:var(--line-strong)}
+  footer a{color:var(--muted);text-decoration:none}
+  footer a:hover{color:var(--accent);text-decoration:underline}
   details{margin-top:6px} summary{cursor:pointer;color:var(--muted);font-size:12px}
   .sec-title{font-size:12px;font-weight:600;color:var(--muted);margin:14px 0 6px}
 </style>
 </head>
 <body>
 <header>
+  <img class="logo" src="favicon.ico" alt="RecycleBin for SMB" width="26" height="26">
   <h1>RecycleBin for SMB</h1>
   <span class="sp"></span>
   <div class="conn">
@@ -154,13 +188,28 @@
     </div>
     <div id="opsArea"></div>
   </section>
-    <span>© <span id="yr"></span> wuweigang</span>
+
+  <footer>
+    <img src="favicon.ico" alt="" width="14" height="14">
+    <span>RecycleBin for SMB</span>
+    <span class="sep">·</span>
+    <span>GPL-3.0</span>
+    <span class="sep">·</span>
+    <span>© <span id="yr"></span> Wvfly</span>
+    <span class="sep">·</span>
+    <a href="https://github.com/Wvfly/recyclebin_svc" target="_blank" rel="noopener">GitHub</a>
+  </footer>
 </div>
 
 <div class="toast" id="toast"></div>
 
 <script>
 const $ = s => document.querySelector(s);
+
+// Footer copyright year, kept current without editing the file every January.
+const yrEl = document.getElementById('yr');
+if (yrEl) yrEl.textContent = new Date().getFullYear();
+
 const api = {
   base: () => ($('#baseUrl').value.trim() || 'http://127.0.0.1:8800').replace(/\/+$/, ''),
   token: () => $('#token').value.trim(),
