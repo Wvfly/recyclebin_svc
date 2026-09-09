@@ -405,17 +405,43 @@ int ReconcileLanded(void)
            there either -> gone for good (Shift+Delete from inside the
            native bin, or the whole $Recycle.Bin\<SID>\ folder was cleared
            some other way). */
-        if (it->OrigPathDos && it->OrigPathDos[0] &&
-            GetFileAttributesW(it->OrigPathDos) != INVALID_FILE_ATTRIBUTES) {
-            DbSetStatus(it->Id, "restored");
-            st.Restored++;
-            LogInfo(L"[reconcile-landed] id=%lld restored externally -> %s",
-                    it->Id, it->OrigPathDos);
-        } else {
-            DbSetStatus(it->Id, "purged");
-            st.Purged++;
-            LogInfo(L"[reconcile-landed] id=%lld purged externally (was %s)",
-                    it->Id, it->RecyclePath);
+        {
+            DWORD attrs = (it->OrigPathDos && it->OrigPathDos[0])
+                              ? GetFileAttributesW(it->OrigPathDos)
+                              : INVALID_FILE_ATTRIBUTES;
+
+            if (attrs != INVALID_FILE_ATTRIBUTES) {
+                /* RB-30 set Hidden+System when this landed (SetHiddenSystem in
+                   rbstore.c); RestoreItemById clears it back off when WE do
+                   the restore, but a restore performed natively through the
+                   desktop Recycle Bin never runs that code -- Explorer just
+                   moves $R back, with no idea those two attributes are ours
+                   rather than its own. Nothing else about the file is
+                   touched here on purpose: its DACL/Owner were never mutated
+                   by this service in the first place (GrantSelfAccessToStaging
+                   only runs inside RestoreItemById), so what is on disk right
+                   now already IS the exact pre-deletion permission set --
+                   restoring it further would mean overwriting it with
+                   something else, not preserving it. */
+                if (attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) {
+                    if (!SetFileAttributesW(it->OrigPathDos,
+                            attrs & ~(FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))) {
+                        LogWarn(L"[reconcile-landed] id=%lld could not clear "
+                                L"hidden/system on %s (win32=%lu)",
+                                it->Id, it->OrigPathDos, GetLastError());
+                    }
+                }
+
+                DbSetStatus(it->Id, "restored");
+                st.Restored++;
+                LogInfo(L"[reconcile-landed] id=%lld restored externally -> %s",
+                        it->Id, it->OrigPathDos);
+            } else {
+                DbSetStatus(it->Id, "purged");
+                st.Purged++;
+                LogInfo(L"[reconcile-landed] id=%lld purged externally (was %s)",
+                        it->Id, it->RecyclePath);
+            }
         }
     }
 
