@@ -27,7 +27,8 @@
   *{box-sizing:border-box}
   body{margin:0;font:13px/1.5 var(--sans);color:var(--fg);background:var(--bg)}
   header{display:flex;align-items:center;gap:14px;padding:10px 16px;
-    background:var(--panel);border-bottom:1px solid var(--line)}
+    background:var(--panel);border-bottom:1px solid var(--line);
+    position:sticky;top:0;z-index:20}
   header h1{font-size:15px;font-weight:600;margin:0}
   header .logo{display:block;width:26px;height:26px;border-radius:5px;flex:none}
   header .sp{flex:1}
@@ -83,12 +84,15 @@
   .banner.bad{border-left-color:var(--bad);background:var(--bad-bg);color:#7a241a}
   .banner.warn{border-left-color:var(--warn);background:var(--warn-bg);color:#7c4a03}
   .banner.ok{border-left-color:var(--ok);background:var(--ok-bg);color:#14532d}
-  .tabs{display:flex;gap:16px;margin:0 0 12px;border-bottom:1px solid var(--line)}
+  .tabs{display:flex;gap:16px;margin:0 0 12px;border-bottom:1px solid var(--line);
+    position:sticky;top:var(--stick-h1,56px);z-index:19;background:var(--bg)}
   .tabs button{border:none;background:none;border-radius:0;padding:6px 2px;color:var(--muted);
     border-bottom:2px solid transparent;margin-bottom:-1px}
   .tabs button:hover{background:none;color:var(--fg)}
   .tabs button.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
-  .toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+  .toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;
+    position:sticky;top:var(--stick-h2,92px);z-index:18;background:var(--bg);
+    padding:8px 0 8px}
   .toolbar input,.toolbar select{background:#fff;border:1px solid var(--line-strong);color:var(--fg);
     padding:5px 8px;border-radius:4px;outline:none}
   .toolbar input:focus,.toolbar select:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(37,99,235,.15)}
@@ -96,14 +100,45 @@
   table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line)}
   th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
   th{background:#f6f7f9;color:var(--muted);font-size:12px;font-weight:600;white-space:nowrap}
+  /* 主表列宽。给短列一个最小宽度，避免在窄容器里被挤压成中文一字一行的难看排版。
+     路径列 (.path) 走 word-break:break-all 撑满剩余空间。 */
+  #itemsArea>table>thead>tr>th:nth-child(1){min-width:36px;text-align:right}
+  #itemsArea>table>tbody>tr>td:nth-child(1){text-align:right;color:var(--muted)}
+  #itemsArea>table>thead>tr>th:nth-child(3),
+  #itemsArea>table>tbody>tr>td:nth-child(3){min-width:54px}
+  #itemsArea>table>thead>tr>th:nth-child(4),
+  #itemsArea>table>tbody>tr>td:nth-child(4){min-width:64px}
+  #itemsArea>table>thead>tr>th:nth-child(7),
+  #itemsArea>table>tbody>tr>td:nth-child(7){min-width:130px}
   tbody tr:nth-child(even){background:#fafbfc}
   tbody tr:hover{background:#f0f6ff}
   /* 驱动计数器小表头在固定面板内吸顶 */
   #driverDetail th{position:sticky;top:0;z-index:5;background:#f6f7f9;box-shadow:0 1px 0 var(--line)}
+  /* 回收项/操作记录表头吸顶。两个 area 现在是自带滚动条的固定高度容器，
+     表头吸顶基准是容器自身（top:0），不再需要减掉 header/tabs/toolbar 高度。 */
+  #itemsArea th,#opsArea th{position:sticky;top:0;z-index:17;
+    box-shadow:0 1px 0 var(--line)}
+  /* 表格区域内部滚动：整页不再被超长表格拉长，滚动条落在表格容器最右侧
+     （也就是固定状态面板的左边缘），跟表格内容贴在一起。
+     高度 = 视口 - header/tabs/toolbar（--stick-h3 已算好三者之和） - 余量。 */
+  #itemsArea,#opsArea{overflow:auto;overscroll-behavior:contain;
+    max-height:calc(100vh - var(--stick-h3,128px) - 24px);
+    background:var(--panel)}
+  @media (max-width:980px){
+    /* 窄屏状态面板回到普通流，页面本身要滚，这里恢复成自然高度。 */
+    #itemsArea,#opsArea{overflow:visible;max-height:none}
+    #itemsArea th,#opsArea th{position:static}
+  }
   td.path{font-family:var(--mono);font-size:12px;word-break:break-all}
   .row-actions{display:flex;gap:6px;flex-wrap:nowrap;white-space:nowrap}
   .row-actions button{padding:3px 8px;font-size:12px;white-space:nowrap}
   .pager{display:flex;gap:8px;align-items:center;margin-top:10px;font-size:12px}
+  /* 分页条钉在滚动容器底部，不随表格内容滚走，否则翻页要看完整页才够得着。 */
+  #itemsArea .pager{position:sticky;bottom:0;z-index:16;background:var(--panel);
+    padding:8px 2px;border-top:1px solid var(--line);margin-top:0}
+  @media (max-width:980px){
+    #itemsArea .pager{position:static;border-top:none;padding:8px 0;margin-top:10px}
+  }
   .pager select{font:inherit;border:1px solid var(--line-strong);border-radius:4px;
     padding:2px 4px;background:#fff}
   .muted{color:var(--muted)}
@@ -491,6 +526,24 @@ async function loadOps(){
 function escapeHtml(s){ return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function escapeAttr(s){ return escapeHtml(s).replace(/'/g,'&#39;'); }
 
+// header/tabs/toolbar 依次吸顶，表头再吸在它们下面（不随行内容滚动，见用户反馈）。
+// 三层的高度会随字体渲染、窗口宽度换行等变化，写死像素早晚会跟实际渲染的高度错位，
+// 表现为表头盖住第一行或者留一道空白——所以量的是实际渲染出来的高度，不是猜的。
+function updateStickyOffsets(){
+  const headerH = document.querySelector('header').offsetHeight;
+  const tabsH = document.querySelector('.tabs').offsetHeight;
+  const activeSection = $('#tab-items').style.display!=='none' ? $('#tab-items') : $('#tab-ops');
+  const toolbar = activeSection.querySelector('.toolbar');
+  const toolbarH = toolbar ? toolbar.offsetHeight : 0;
+
+  const root = document.documentElement.style;
+  root.setProperty('--stick-h1', headerH + 'px');
+  root.setProperty('--stick-h2', (headerH + tabsH) + 'px');
+  root.setProperty('--stick-h3', (headerH + tabsH + toolbarH) + 'px');
+}
+window.addEventListener('resize', updateStickyOffsets);
+updateStickyOffsets();
+
 // 事件
 document.querySelectorAll('.tabs button').forEach(b=>{
   b.onclick=()=>{
@@ -500,6 +553,7 @@ document.querySelectorAll('.tabs button').forEach(b=>{
     $('#tab-items').style.display = t==='items'?'block':'none';
     $('#tab-ops').style.display = t==='ops'?'block':'none';
     if(t==='ops') loadOps(); else loadItems();
+    updateStickyOffsets();
   };
 });
 $('#connect').onclick = ()=>{ state.offset=0; refreshAll(); };
