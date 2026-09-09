@@ -387,7 +387,16 @@ func (s *Server) handleOps(w http.ResponseWriter, r *http.Request) {
 		})
 
 	case http.MethodGet:
-		ops, err := s.DB.RecentOps(50)
+		q := r.URL.Query()
+		limit, _ := strconv.Atoi(q.Get("limit"))
+		offset, _ := strconv.Atoi(q.Get("offset"))
+		if limit <= 0 {
+			limit = 50
+		}
+		if offset < 0 {
+			offset = 0
+		}
+		ops, err := s.DB.RecentOpsOffset(limit, offset)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -395,8 +404,15 @@ func (s *Server) handleOps(w http.ResponseWriter, r *http.Request) {
 		if ops == nil {
 			ops = []db.Op{}
 		}
+		// Total feeds the UI pager; failure to count must not break listing
+		// (the UI degrades to "unknown total" and still shows the page).
+		total := -1
+		if n, err := s.DB.CountOps(); err == nil {
+			total = n
+		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"count": len(ops),
+			"total": total,
 			"ops":   ops,
 		})
 

@@ -708,5 +708,49 @@ func (d *DB) RecentOps(limit int) ([]Op, error) {
 	return out, rows.Err()
 }
 
+// RecentOpsOffset is the paginated form of RecentOps: returns at most `limit`
+// ops starting at `offset`, newest first. Used by the management UI's ops
+// history pager; for an unfiltered "give me the most recent N" call, use
+// RecentOps directly.
+func (d *DB) RecentOpsOffset(limit, offset int) ([]Op, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := d.ro.Query(
+		"SELECT id, type, item_id, arg, preserve_acl, state, message FROM ops ORDER BY id DESC LIMIT ? OFFSET ?",
+		limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Op
+	for rows.Next() {
+		var op Op
+		var arg, msg sql.NullString
+		if err := rows.Scan(&op.ID, &op.Type, &op.ItemID, &arg, &op.PreserveAcl, &op.State, &msg); err != nil {
+			return nil, err
+		}
+		op.Arg = arg.String
+		op.Message = msg.String
+		out = append(out, op)
+	}
+	return out, rows.Err()
+}
+
+// CountOps returns the total number of ops rows. Paired with RecentOpsOffset
+// to drive the UI pager; the same ordering (id DESC) is used so the count
+// is consistent with the page.
+func (d *DB) CountOps() (int, error) {
+	var n int
+	if err := d.ro.QueryRow("SELECT COUNT(*) FROM ops").Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // MarshalJSON is not needed on Item; kept explicit for stable field order.
 var _ = json.Marshal

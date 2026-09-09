@@ -134,10 +134,10 @@
   .row-actions button{padding:3px 8px;font-size:12px;white-space:nowrap}
   .pager{display:flex;gap:8px;align-items:center;margin-top:10px;font-size:12px}
   /* 分页条钉在滚动容器底部，不随表格内容滚走，否则翻页要看完整页才够得着。 */
-  #itemsArea .pager{position:sticky;bottom:0;z-index:16;background:var(--panel);
+  #itemsArea .pager,#opsArea .pager{position:sticky;bottom:0;z-index:16;background:var(--panel);
     padding:8px 2px;border-top:1px solid var(--line);margin-top:0}
   @media (max-width:980px){
-    #itemsArea .pager{position:static;border-top:none;padding:8px 0;margin-top:10px}
+    #itemsArea .pager,#opsArea .pager{position:static;border-top:none;padding:8px 0;margin-top:10px}
   }
   .pager select{font:inherit;border:1px solid var(--line-strong);border-radius:4px;
     padding:2px 4px;background:#fff}
@@ -274,7 +274,7 @@ const api = {
   }
 };
 
-const state = { items: [], offset:0, limit:50, total:-1, ops:[] };
+const state = { items: [], offset:0, limit:50, total:-1, ops:[], opsOffset:0, opsLimit:50, opsTotal:-1 };
 
 function fmtSize(n){
   if(n==null) return '-';
@@ -510,16 +510,51 @@ async function pollOp(opId){
 async function loadOps(){
   const area=$('#opsArea'); area.innerHTML='<div class="empty">加载中…</div>';
   try{
-    const d = await api.get('/ops?limit=100');
+    const d = await api.get(`/ops?limit=${state.opsLimit}&offset=${state.opsOffset}`);
     const ops = d.ops||[];
-    if(!ops.length){ area.innerHTML='<div class="empty">无操作记录</div>'; return; }
+    state.opsTotal = (typeof d.total === 'number') ? d.total : -1;
+
+    // 翻到末页后再翻回一页空，是新数据刚好耗尽一整页的常见场景
+    // （例如 ops 减了一条导致当前页空了）。后跳回前页。
+    if(!ops.length && state.opsOffset > 0){
+      state.opsOffset = Math.max(0, state.opsOffset - state.opsLimit);
+      return loadOps();
+    }
+
+    if(!ops.length){
+      area.innerHTML = '<div class="empty">无操作记录</div>';
+      return;
+    }
+
     const head=`<tr><th>#</th><th>类型</th><th>目标项</th><th>参数</th><th>状态</th><th>结果</th></tr>`;
     const body=ops.map(o=>`<tr>
       <td class="kv">${o.id}</td><td>${o.type}</td><td class="kv">${o.item_id||0}</td>
       <td class="path">${escapeHtml(o.arg||'-')}</td>
       <td class="state-${o.state}">${o.state}</td>
       <td class="muted">${escapeHtml(o.message||'')}</td></tr>`).join('');
-    area.innerHTML=`<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+
+    // 分页条与表格走同一容器；pager 由 CSS position:sticky 钉到容器底部。
+    const pageSize = state.opsLimit;
+    const total = state.opsTotal;
+    const page = Math.floor(state.opsOffset / pageSize) + 1;
+    const totalPages = total >= 0 ? Math.max(1, Math.ceil(total / pageSize)) : (ops.length < pageSize ? page : page + 1);
+    const atStart = state.opsOffset <= 0;
+    const atEnd   = (total >= 0 && state.opsOffset + pageSize >= total) || (total < 0 && ops.length < pageSize);
+    const pager = `<div class="pager">
+      <button id="opsPrev" ${atStart?'disabled':''}>上一页</button>
+      <span class="muted">第 ${page} 页${total>=0?` / 共 ${totalPages} 页（${total} 条）`:` · 本页 ${ops.length} 条`}</span>
+      <button id="opsNext" ${atEnd?'disabled':''}>下一页</button>
+      <label class="muted">每页
+        <select id="opsPageSize">
+          ${[20,50,100,200].map(n=>`<option value="${n}" ${n===pageSize?'selected':''}>${n}</option>`).join('')}
+        </select>
+      </label>
+    </div>`;
+
+    area.innerHTML=`<table><thead>${head}</thead><tbody>${body}</tbody></table>${pager}`;
+    area.querySelector('#opsPrev').onclick = ()=>{ if(state.opsOffset>0){ state.opsOffset=Math.max(0,state.opsOffset-pageSize); loadOps(); } };
+    area.querySelector('#opsNext').onclick = ()=>{ if(!atEnd){ state.opsOffset+=pageSize; loadOps(); } };
+    area.querySelector('#opsPageSize').onchange = e=>{ state.opsLimit=Number(e.target.value); state.opsOffset=0; loadOps(); };
   }catch(e){ area.innerHTML=`<div class="empty">加载失败：${e.message}</div>`; }
 }
 
