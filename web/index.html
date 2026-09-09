@@ -442,11 +442,21 @@ async function doRestoreTree(path, preserveAcl){
   }catch(e){ toast('整棵还原失败：'+e.message, 'bad'); }
 }
 async function doReconcile(){
+  const btn = $('#reconcileBtn');
+  if(btn.disabled) return; // a sweep is already in flight, ignore extra clicks
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '对账中…';
   try{
     const r = await api.post('/ops', {type:'reconcile'});
     toast(`已提交对账，任务 ${r.op_id}（数据量大时可能需要一些时间）`, 'ok');
-    pollOp(r.op_id);
-  }catch(e){ toast('提交对账失败：'+e.message, 'bad'); }
+    await pollOp(r.op_id); // keeps the button disabled until this settles
+  }catch(e){
+    toast('提交对账失败：'+e.message, 'bad');
+  }finally{
+    btn.disabled = false;
+    btn.textContent = label;
+  }
 }
 async function pollOp(opId){
   for(let i=0;i<30;i++){
