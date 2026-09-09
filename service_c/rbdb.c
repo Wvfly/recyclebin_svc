@@ -138,6 +138,69 @@ static int DbEnsureColumn(const char *table, const char *column,
  *                                    schema we do not understand would
  *                                    corrupt data or mis-place columns.
  */
+/* Returns 1 if `table`'s stored CREATE TABLE text (sqlite_master.sql)
+   contains `needle`, 0 if it doesn't, -1 if the table doesn't exist yet. */
+static int DbTableSqlContains(const char *table, const char *needle)
+{
+    sqlite3_stmt *st = NULL;
+    int result = -1;
+
+    if (sqlite3_prepare_v2(g_Db,
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, table, -1, SQLITE_STATIC);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char *sql = sqlite3_column_text(st, 0);
+            result = (sql && strstr((const char *)sql, needle)) ? 1 : 0;
+        }
+    }
+    if (st) sqlite3_finalize(st);
+    return result;
+}
+
+/*
+ * RB-43: `ops.type` carries a CHECK constraint baked into the table's DDL at
+ * CREATE time. Adding 'reconcile' to the allowed list in schema.sql
+ * only affects brand-new databases -- "CREATE TABLE IF NOT EXISTS" is a
+ * no-op against an `ops` table that already exists, old constraint and all,
+ * so every already-deployed database needs the table rebuilt once before it
+ * will accept the new type. Detected via sqlite_master's stored SQL text
+ * rather than a version bump, so this stays a self-healing idiom like
+ * DbEnsureColumn below rather than a hard refusal-to-start.
+ *
+ * Must run BEFORE DbExec(kSchema): renaming ops out of the way first makes
+ * kSchema's own "CREATE TABLE IF NOT EXISTS ops" create it fresh, with the
+ * updated constraint, instead of seeing "ops" already exists and doing
+ * nothing.
+ */
+static int DbMigrateOpsTypeCheck(void)
+{
+    int hasNewType = DbTableSqlContains("ops", "reconcile");
+
+    if (hasNewType != 0) return 1;  /* already migrated, or table doesn't exist yet */
+
+    LogInfo(L"schema migration: rebuilding ops table for 'reconcile' (RB-43)");
+
+    if (DbExec("ALTER TABLE ops RENAME TO ops_v1") != SQLITE_OK) return 0;
+
+    /* "ops" no longer exists, so kSchema's CREATE TABLE IF NOT EXISTS creates
+       it fresh with the updated CHECK constraint. Every other statement in
+       kSchema is already satisfied and stays a no-op. */
+    if (DbExec(kSchema) != SQLITE_OK) return 0;
+
+    if (DbExec(
+            "INSERT INTO ops(id,type,item_id,arg,preserve_acl,state,message,ts,result) "
+            "SELECT id,type,item_id,arg,preserve_acl,state,message,ts,result FROM ops_v1")
+            != SQLITE_OK) {
+        return 0;
+    }
+
+    if (DbExec("DROP TABLE ops_v1") != SQLITE_OK) return 0;
+
+    LogInfo(L"schema migration: ops table rebuilt, old rows preserved");
+    return 1;
+}
+
 static int DbEnsureSchema(void)
 {
     int ver = DbReadVersion();
@@ -146,6 +209,12 @@ static int DbEnsureSchema(void)
         LogError(L"schema version mismatch: database is %d, this build expects %d. "
                  L"Refusing to start -- migrate the database or delete it.",
                  ver, RB_SCHEMA_VERSION);
+        return 0;
+    }
+
+    /* RB-43: must run before DbExec(kSchema) -- see its own comment. */
+    if (!DbMigrateOpsTypeCheck()) {
+        LogError(L"schema migration failed: could not add 'reconcile' to ops.type");
         return 0;
     }
 

@@ -345,6 +345,15 @@ int  PolicyDiskWatermark(DWORD minFreeMB);
    number of files reclaimed (>=0), or -1 if the sweep could not run. */
 int  ReconcileStaging(DWORD graceDays);
 
+/* RB-43: manual reconciliation for 'landed' rows whose $R file left
+   $Recycle.Bin some way OTHER than this service's own restore/purge path --
+   chiefly an admin restoring or Shift+Deleting straight from the native
+   desktop Recycle Bin, which never touches items/ops. Not run on a timer;
+   triggered on demand via ops type 'reconcile' (web console "刷新对账"
+   button). Returns the number of rows whose status was corrected
+   (restored + purged), or -1 if it could not run at all. */
+int  ReconcileLanded(void);
+
 /* RB-13: persist the latest driver counter snapshot into driver_stats. */
 int  DbWriteDriverStats(const RBF_STATS *stats, int driverResponded);
 

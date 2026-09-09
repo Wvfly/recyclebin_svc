@@ -33,10 +33,21 @@
   header .sp{flex:1}
   header input,header button{font:inherit}
   .conn{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-  .conn input{background:#fff;border:1px solid var(--line-strong);color:var(--fg);
+  /* The auto-refresh label is a single logical control; keep the checkbox
+     hugging the text on the right so the pair reads as one unit. */
+  .conn label.auto{display:inline-flex;align-items:center;gap:2px;
+    color:var(--muted);font-size:12px;cursor:pointer;user-select:none;
+    margin-left:-4px}
+  /* Text inputs only. Without :not([type=checkbox]) this rule also hit the
+     #auto checkbox, giving it 8px right padding + a border and pushing the
+     "自动" label away no matter how tight the label gap was. */
+  .conn input:not([type=checkbox]){background:#fff;border:1px solid var(--line-strong);color:var(--fg);
     padding:5px 8px;border-radius:4px;width:230px;outline:none}
-  .conn input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(37,99,235,.15)}
-  .conn input.tok{width:150px}
+  .conn input:not([type=checkbox]):focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(37,99,235,.15)}
+  .conn input:not([type=checkbox]).tok{width:150px}
+  /* Checkbox keeps its native look: no padding/border/forced width. */
+  .conn input[type=checkbox]{width:auto;padding:0;margin:0;border:none;background:none;
+    cursor:pointer;flex:none}
   button{cursor:pointer;background:#fff;border:1px solid var(--line-strong);color:var(--fg);
     font-size:12px;padding:6px 12px;border-radius:4px}
   button:hover{background:#f0f2f5}
@@ -148,7 +159,7 @@
     <input id="baseUrl" value="http://127.0.0.1:8800" title="API 地址">
     <input id="token" class="tok" placeholder="Token(可选)" title="X-Auth-Token，未设则留空">
     <button id="connect">连接</button>
-    <label class="muted" title="自动刷新"><input type="checkbox" id="auto"> 自动</label>
+    <label class="auto" title="自动刷新"><input type="checkbox" id="auto"><span>自动</span></label>
   </div>
 </header>
 
@@ -176,7 +187,8 @@
       </select>
       <input id="fSid" placeholder="SID / 用户名" title="可按 SID（支持前缀，如 S-1-5-21）或用户名片段过滤（如 alice、CORP\alice），留空不过滤" style="width:240px">
       <input id="fSearch" class="search" placeholder="按路径搜索（子串，回车）">
-      <button id="refreshItems" class="primary">刷新</button>
+      <button id="refreshItems" class="primary">搜索</button>
+      <button id="reconcileBtn" title="重新核对所有 landed 条目：管理员直接从桌面回收站还原或彻底删除的文件/目录，状态会在这里同步回来">刷新</button>
     </div>
     <div id="itemsArea"></div>
   </section>
@@ -429,6 +441,13 @@ async function doRestoreTree(path, preserveAcl){
     pollOp(r.op_id);
   }catch(e){ toast('整棵还原失败：'+e.message, 'bad'); }
 }
+async function doReconcile(){
+  try{
+    const r = await api.post('/ops', {type:'reconcile'});
+    toast(`已提交对账，任务 ${r.op_id}（数据量大时可能需要一些时间）`, 'ok');
+    pollOp(r.op_id);
+  }catch(e){ toast('提交对账失败：'+e.message, 'bad'); }
+}
 async function pollOp(opId){
   for(let i=0;i<30;i++){
     await new Promise(r=>setTimeout(r,1000));
@@ -475,6 +494,7 @@ document.querySelectorAll('.tabs button').forEach(b=>{
 });
 $('#connect').onclick = ()=>{ state.offset=0; refreshAll(); };
 $('#refreshItems').onclick = ()=>{ state.offset=0; loadItems(); };
+$('#reconcileBtn').onclick = doReconcile;
 $('#refreshOps').onclick = loadOps;
 $('#fStatus').onchange = ()=>{ state.offset=0; loadItems(); };
 $('#fSid').onchange = ()=>{ state.offset=0; loadItems(); };

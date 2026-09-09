@@ -723,7 +723,7 @@ int RestoreDrainOps(void)
 
         if (!ops[i].Type || ops[i].Type[0] == '\0') {
             DbOpFinish(ops[i].Id, "failed",
-                       "missing op type (expected: restore, restore-tree)");
+                       "missing op type (expected: restore, restore-tree, reconcile)");
             continue;
         }
 
@@ -747,6 +747,23 @@ int RestoreDrainOps(void)
             ok = RestoreTreeByPrefix(argW, ops[i].PreserveAcl, msg, ARRAYSIZE(msg));
             free(argW);
 
+        } else if (_stricmp(ops[i].Type, "reconcile") == 0) {
+            /* RB-43: no item_id/arg needed -- sweeps every 'landed' row.
+               Can genuinely take a while at large file counts (see the scale
+               discussion in docs/buglist.md), which is exactly why it is
+               admin-triggered rather than on the 30s maintenance timer; the
+               ops-drain loop already runs off that timer, not blocking it,
+               so a long sweep here does not delay restores queued after it
+               -- they simply wait behind it in the same drain pass. */
+            int rc = ReconcileLanded();
+            if (rc < 0) {
+                swprintf_s(msg, ARRAYSIZE(msg), L"reconcile sweep could not run");
+                ok = 0;
+            } else {
+                swprintf_s(msg, ARRAYSIZE(msg), L"reconciled %d row(s)", rc);
+                ok = 1;
+            }
+
         } else {
             /* The `ops.type` column carries a CHECK constraint, so anything
                reaching here should already be valid. We still reject
@@ -755,7 +772,7 @@ int RestoreDrainOps(void)
             char reason[256];
             sprintf_s(reason, sizeof(reason),
                       "unsupported op type '%s'; this build handles: "
-                      "restore, restore-tree",
+                      "restore, restore-tree, reconcile",
                       ops[i].Type);
             LogWarn(L"[ops] %S", reason);
             DbOpFinish(ops[i].Id, "failed", reason);

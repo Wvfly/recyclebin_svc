@@ -80,7 +80,13 @@ CREATE TABLE IF NOT EXISTS ops (
     -- 'restore'      : restore one item.      item_id = that item's id.
     -- 'restore-tree' : restore every item whose orig_path starts with the
     --                  prefix in `arg`. item_id is not used and must be 0.
-    type    TEXT NOT NULL CHECK (type IN ('restore', 'restore-tree')),
+    -- 'reconcile'    : admin-triggered sweep (RB-43). Re-checks every
+    --                  'landed' row against what is actually still in
+    --                  $Recycle.Bin, for items restored/purged directly
+    --                  through the native Windows Recycle Bin (bypassing
+    --                  this service). item_id unused (0), arg unused.
+    type    TEXT NOT NULL CHECK (type IN
+                    ('restore', 'restore-tree', 'reconcile')),
     item_id INTEGER NOT NULL,
 
     -- 'restore'      : optional restore target override (may be NULL)

@@ -292,6 +292,12 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 //	    the recycle bin as many scattered entries; this restores them in one
 //	    request. `id` is unused.
 //
+//	{"type":"reconcile"}
+//	    Re-checks every 'landed' row against $Recycle.Bin (RB-43): items an
+//	    admin restored or permanently deleted directly through the native
+//	    desktop Recycle Bin never touch this service's own restore/purge
+//	    path, so their DB row goes stale until this runs. `id`/`arg` unused.
+//
 // Queues a command for rbservice.exe. This endpoint does NOT perform the
 // restore itself -- poll GET /ops/{id} for the outcome. For restore-tree the
 // result message summarises how many entries succeeded and how many failed.
@@ -331,12 +337,15 @@ func (s *Server) handleOps(w http.ResponseWriter, r *http.Request) {
 		// Each op type carries a different payload:
 		//   restore      -> id  (the item to restore), arg optional
 		//   restore-tree -> arg (path prefix),          id unused (stored as 0)
+		//   reconcile    -> neither; sweeps every 'landed' row (RB-43)
 		if req.Type == "restore-tree" {
 			if strings.TrimSpace(req.Arg) == "" {
 				writeErr(w, http.StatusBadRequest,
 					"arg required for restore-tree: path prefix, e.g. D:\\Share\\Project")
 				return
 			}
+			req.ID = 0 // not a single-item op; the schema requires a value
+		} else if req.Type == "reconcile" {
 			req.ID = 0 // not a single-item op; the schema requires a value
 		} else {
 			if req.ID <= 0 {
