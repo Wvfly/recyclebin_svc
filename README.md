@@ -360,6 +360,103 @@ build_all.cmd Release nosign   # 显式跳过签名（仅当需纯 test-signing 
   `WARNING: signtool missing or cert unavailable, driver left unsigned` 并回落到
   未签名产物——此时部署机必须开启 test-signing（见 B）才能加载。
 
+#### 自建测试证书
+
+`F57B8149…` 是随项目分发的既有测试证书。若要**自己生成**一份（例如不想共用，
+或该证书已丢失），用管理员 PowerShell 造一张代码签名证书：
+
+```powershell
+# 生成自签代码签名证书，存到 CurrentUser\My
+$cert = New-SelfSignedCertificate `
+  -Type CodeSigningCert `
+  -Subject "CN=RecycleBin Test" `
+  -KeyUsage DigitalSignature `
+  -KeyAlgorithm RSA -KeyLength 2048 `
+  -CertStoreLocation "Cert:\CurrentUser\My" `
+  -NotAfter (Get-Date).AddYears(3)
+
+# 记下指纹，后面 /sha1 要用
+$cert.Thumbprint
+```
+
+> 证书存 `LocalMachine\My`（`/sm` 能查到）时改用
+> `-CertStoreLocation "Cert:\LocalMachine\My"`，需管理员权限。
+
+导出成 pfx 便于在别的机器上使用（`/f` + `/p` 方式签名）：
+
+```powershell
+$pwd = ConvertTo-SecureString -String "your-cert-password" -Force -AsPlainText
+Export-PfxCertificate -Cert $cert -FilePath ".\rb-cert.pfx" -Password $pwd
+```
+
+> 自签证书**不受任何根证书信任**，仅测试签名模式可用，不入生产。
+
+#### 手动签名（不走 build_all.cmd）
+
+已构建好的 `.sys` 可以单独补签。典型场景：从 Release 包下载产物、
+换了一台机器签名、或想重签已有文件。
+
+```powershell
+cd <部署包目录>   # 例如 C:\...\recyclebin_svc-v1.7.1\deploy-package
+
+& "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe" sign `
+  /sha1 F57B8149935CD56C5565965AB5DF66E454B903F9 `
+  /fd sha256 /tr http://timestamp.digicert.com /td sha256 `
+  rbminiflt.sys
+```
+
+| 参数 | 含义 |
+|---|---|
+| `sign` | 签名子命令（`verify` / `timestamp` 为同级命令） |
+| `/sha1 <指纹>` | 按 SHA1 指纹在证书存储里选证书。默认查 `CurrentUser\My`；存 `LocalMachine\My` 时加 `/sm`。<br>用 pfx 文件时改为 `/f cert.pfx /p <密码>` |
+| `/fd sha256` | **文件摘要算法**（计算 `.sys` 哈希）。勿用 sha1，现代 Windows 不接受 |
+| `/tr <URL>` | RFC3161 时间戳服务器。盖章后即使证书过期，签名仍有效 |
+| `/td sha256` | **时间戳摘要算法**，与 `/fd` 是两个独立设置，都要给 |
+
+> ⚠️ `/sha1` 里的 "sha1" 指的是**指纹形状**（thumbprint 传统为 SHA1 格式），
+> **不是**签名算法。签名强度由 `/fd` 决定，两者别混淆。
+
+验证签名结果：
+
+```powershell
+# signtool 校验（/v 打印证书链，/pa 用默认 Authenticode 策略）
+& "...\signtool.exe" verify /v /pa rbminiflt.sys
+
+# 或 PowerShell 查看
+Get-AuthenticodeSignature rbminiflt.sys |
+  Select-Object Status, StatusMessage, @{n='Signer';e={$_.SignerCertificate.Subject}}
+```
+
+自签测试证书下 `signtool verify` 会报
+`root certificate which is not trusted by the trust provider`（PowerShell 侧显示
+`UnknownError`）——这是**预期结果**，只说明自签根不在系统信任库，
+签名本身完好。确认 `Signer` 是你的证书、`/v` 输出里时间戳服务正常即可。
+
+#### 需要正规 INF 安装时（签 .cat）
+
+`rbminiflt.inf` **故意未声明 `CatalogFile`**（见 INF 内注释），因此 setupapi 校验
+必然失败、`deploy.ps1` 回退到 legacy 注册。仅测试机这已够用。
+
+若要让 `[3/6]` 的 `pnputil` 走**正式 INF 安装**，需补目录文件：
+
+```powershell
+cd driver
+
+# 1) 在 rbminiflt.inf 的 [Version] 节加一行：
+#    CatalogFile = rbminiflt.cat
+
+# 2) 生成 .cat（Inf2Cat 随 WDK 安装）
+& "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\Inf2Cat.exe" `
+  /driver:. /os:10_19H1_X64,Server2016_X64,Server2019_X64,Server2022_X64
+
+# 3) 先签 .cat，再签 .sys（顺序不能反）
+& "...\signtool.exe" sign /sha1 <指纹> /fd sha256 /tr http://timestamp.digicert.com /td sha256 rbminiflt.cat
+& "...\signtool.exe" sign /sha1 <指纹> /fd sha256 /tr http://timestamp.digicert.com /td sha256 rbminiflt.sys
+```
+
+> **必须先 `.cat` 后 `.sys`**：`.cat` 记录了 `.sys` 的哈希，后签 `.sys` 会让
+> 目录文件失效。装好 `.cat` 后也可用 `pnputil /add-driver rbminiflt.inf /install` 验证。
+
 **B. 测试签名模式（test-signing，仅测试机）**
 
 无生产证书、且需要加载未签名/测试证书签名的驱动时，目标机开启测试模式：

@@ -1,10 +1,36 @@
-# 1) 生成新自签测试证书（有效期设 10 年，别再一年一签）
-$c = New-SelfSignedCertificate -Type CodeSigning -Subject "CN=RbMiniflt Test" `
+  # 1) 生成新自签测试证书（有效期设 10 年）
+  $c = New-SelfSignedCertificate -Type CodeSigning -Subject "CN=RbMiniflt Test" `
     -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(10)
-# 导出 pfx 交给团队（密码 = RB_CERT_PWD）
-Export-PfxCertificate -Cert $c -FilePath rbminiflt_test.pfx -Password (ConvertTo-SecureString $env:RB_CERT_PWD -AsPlainText -Force)
 
-# 2) 重签
-set RBF_CERT_SHA1=<新证书SHA1>
-set RB_CERT_PWD=<密码>
-build_all.cmd Release
+  # 2）查看证书sha1
+  $cert.Thumbprint
+
+  # 3）使用证书给驱动签名
+  & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe" /sha1 {上一步查出来的sha1} /fd sha256 /tr http://timestamp.digicert.com /td sha256 rbminiflt.sys
+
+  # 4）查看驱动签名情况
+  & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe" verify /v /pa rbminiflt.sys
+
+  # 5) 导出 pfx 交给团队协作
+  交互式设置密码
+  $pwd = Read-Host "pfx password" -AsSecureString
+  导出证书
+  Export-PfxCertificate -Cert $cert -FilePath rbminiflt_test.pfx -Password $pwd
+
+  # 6) pfx的导入
+  交互式输入密码
+  $pwd = Read-Host "pfx password" -AsSecureString
+  或者非交互式输入密码
+  $pwd = ConvertTo-SecureString "your-cert-password" -AsPlainText -Force
+
+  Import-PfxCertificate -FilePath C:\path\to\rbminiflt_test.pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pwd
+
+  # 7） 导入后查看证书信息
+  Get-ChildItem Cert:\CurrentUser\My |
+  Where-Object { $_.Subject -like "*RecycleBin*" } |
+  Select-Object Subject, Thumbprint, NotAfter, HasPrivateKey
+
+  # 8） 删除证书
+  Get-ChildItem Cert:\CurrentUser\My |
+  Where-Object { $_.Subject -like "*RecycleBin*" } |
+  Remove-Item

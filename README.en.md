@@ -379,6 +379,111 @@ build_all.cmd Release nosign   # explicitly skip signing (only for pure test-sig
   yields an unsigned binary — the target must then enable test signing
   (see B) to load it.
 
+#### Creating your own test certificate
+
+`F57B8149…` is the test certificate shipped with the project. To **generate
+your own** (for example, you do not want to share it, or it was lost), create
+a code-signing certificate from an elevated PowerShell:
+
+```powershell
+# Self-signed code signing certificate, stored in CurrentUser\My
+$cert = New-SelfSignedCertificate `
+  -Type CodeSigningCert `
+  -Subject "CN=RecycleBin Test" `
+  -KeyUsage DigitalSignature `
+  -KeyAlgorithm RSA -KeyLength 2048 `
+  -CertStoreLocation "Cert:\CurrentUser\My" `
+  -NotAfter (Get-Date).AddYears(3)
+
+# Note the thumbprint - you pass it to /sha1 later
+$cert.Thumbprint
+```
+
+> To store it in `LocalMachine\My` (so `/sm` can find it), use
+> `-CertStoreLocation "Cert:\LocalMachine\My"` instead; this needs elevation.
+
+Export a pfx to sign from another machine (the `/f` + `/p` form):
+
+```powershell
+$pwd = ConvertTo-SecureString -String "your-cert-password" -Force -AsPlainText
+Export-PfxCertificate -Cert $cert -FilePath ".\rb-cert.pfx" -Password $pwd
+```
+
+> A self-signed certificate is **not trusted by any root**; it only works in
+> test signing mode and must never reach production.
+
+#### Manual signing (without build_all.cmd)
+
+An already-built `.sys` can be signed afterwards. Typical cases: signing a
+downloaded Release package, signing on a different machine, or re-signing an
+existing file.
+
+```powershell
+cd <package dir>   # e.g. C:\...\recyclebin_svc-v1.7.1\deploy-package
+
+& "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe" sign `
+  /sha1 F57B8149935CD56C5565965AB5DF66E454B903F9 `
+  /fd sha256 /tr http://timestamp.digicert.com /td sha256 `
+  rbminiflt.sys
+```
+
+| Flag | Meaning |
+|---|---|
+| `sign` | Signing subcommand (`verify` / `timestamp` are siblings) |
+| `/sha1 <thumbprint>` | Picks the certificate by SHA1 thumbprint. Looks in `CurrentUser\My` by default; add `/sm` for `LocalMachine\My`.<br>With a pfx, use `/f cert.pfx /p <password>` instead |
+| `/fd sha256` | **File digest algorithm** used to hash the `.sys`. Never sha1 — modern Windows rejects it |
+| `/tr <URL>` | RFC3161 timestamp server. With a timestamp the signature stays valid even after the cert expires |
+| `/td sha256` | **Timestamp digest algorithm**. Independent of `/fd`; both must be given |
+
+> ⚠️ The "sha1" in `/sha1` refers to the **thumbprint shape** (thumbprints are
+> traditionally SHA1), **not** the signature algorithm. Signature strength is
+> set by `/fd` — do not confuse the two.
+
+Verify the result:
+
+```powershell
+# signtool verify (/v prints the chain, /pa uses the default Authenticode policy)
+& "...\signtool.exe" verify /v /pa rbminiflt.sys
+
+# or check it from PowerShell
+Get-AuthenticodeSignature rbminiflt.sys |
+  Select-Object Status, StatusMessage, @{n='Signer';e={$_.SignerCertificate.Subject}}
+```
+
+With a self-signed test certificate, `signtool verify` reports
+`root certificate which is not trusted by the trust provider` (`UnknownError`
+from PowerShell). This is **expected**: it only means the self-signed root is
+not in the system trust store, the signature itself is intact. Confirm the
+`Signer` is your certificate and that `/v` shows a healthy timestamp.
+
+#### When you need proper INF installation (signing .cat)
+
+`rbminiflt.inf` **deliberately omits `CatalogFile`** (see the comment inside
+the INF), so the setupapi check always fails and `deploy.ps1` falls back to
+legacy registration. On a test machine that is good enough.
+
+To make `[3/6]` `pnputil` take the **proper INF install path**, add a catalog
+file:
+
+```powershell
+cd driver
+
+# 1) Add one line to the [Version] section of rbminiflt.inf:
+#    CatalogFile = rbminiflt.cat
+
+# 2) Generate the .cat (Inf2Cat ships with the WDK)
+& "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\Inf2Cat.exe" `
+  /driver:. /os:10_19H1_X64,Server2016_X64,Server2019_X64,Server2022_X64
+
+# 3) Sign .cat FIRST, then .sys (order matters)
+& "...\signtool.exe" sign /sha1 <thumbprint> /fd sha256 /tr http://timestamp.digicert.com /td sha256 rbminiflt.cat
+& "...\signtool.exe" sign /sha1 <thumbprint> /fd sha256 /tr http://timestamp.digicert.com /td sha256 rbminiflt.sys
+```
+
+> **Always `.cat` before `.sys`**: the catalog records the `.sys` hash, so
+> signing the `.sys` afterwards invalidates the catalog. You can then verify
+> with `pnputil /add-driver rbminiflt.inf /install`.
+
 **B. Test signing mode (test machines only)**
 
 With no production cert, when you need to load an unsigned or test-signed
