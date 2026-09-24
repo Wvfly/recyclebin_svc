@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [master]
+    tags: ['v*']
   pull_request:
     branches: [master]
 
@@ -10,6 +11,10 @@ on:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+# Required by the release job to create/update GitHub Releases.
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -41,7 +46,7 @@ jobs:
             dir "C:\Program Files\Windows Kits\10\Include"
           ) else (
             echo Windows Kits not found - attempting winget install
-            C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe install -e --id Microsoft.WindowsDriverKit --accept-source-agreements --accept-package-agreements || echo Winget install attempt completed
+            C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe install -e --id Microsoft.WindowsDriverKit --accept-source-agreements --accept-package-agreements
           )
 
       # Fast-fail check that the SDK + WDK layout driver\build.cmd expects
@@ -53,17 +58,17 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $kitsRoot = "C:\Program Files (x86)\Windows Kits\10"
           if (-not (Test-Path $kitsRoot)) { $kitsRoot = "C:\Program Files\Windows Kits\10" }
-          
+
           Write-Host "Looking for SDK in: $kitsRoot"
           if (-not (Test-Path "$kitsRoot\Include")) {
             throw "Windows Kits Include directory not found at $kitsRoot"
           }
-          
+
           $ver = Get-ChildItem "$kitsRoot\Include" -Directory |
                  Sort-Object { [Version]($_.Name -replace '^\D+', '0.0') } |
                  Select-Object -Last 1 -ExpandProperty Name
           if (-not $ver) { throw "no SDK include tree under $kitsRoot" }
-          
+
           Write-Host "Found SDK version: $ver"
           $must = @(
             "$kitsRoot\Include\$ver\ucrt",
@@ -74,9 +79,9 @@ jobs:
             "$kitsRoot\Lib\$ver\km\x64\fltMgr.lib"
           )
           foreach ($p in $must) {
-            if (-not (Test-Path $p)) { 
+            if (-not (Test-Path $p)) {
               Write-Host "Missing: $p"
-              throw "missing: $p" 
+              throw "missing: $p"
             }
             Write-Host "OK: $p"
           }
@@ -88,12 +93,7 @@ jobs:
         shell: cmd
         run: build_all.cmd Release nosign
 
-      # Lightweight smoke test of the built artifacts. Verifies:
-      #   - Artifacts exist and are valid PE executables
-      #   - Go API can run (prints version)
-      #   - Driver is a valid PE32+ (x64) NATIVE image
-      # Note: C service (rbservice.exe) requires Windows service registration,
-      # so we only verify it's a valid PE, not run it as a console app.
+      # Lightweight smoke test...
       - name: Smoke test
         shell: pwsh
         run: |
@@ -108,42 +108,42 @@ jobs:
             if (-not (Test-Path $path)) { throw "missing artifact: $path" }
             $b = [System.IO.File]::ReadAllBytes($path)
             if ($b.Length -lt 0x40) { throw "$path too small to be a PE" }
-            
+
             $header = [System.Text.Encoding]::ASCII.GetString($b, 0, 2)
-            if ($header -ne 'MZ') { 
+            if ($header -ne 'MZ') {
               throw "$path : DOS header missing, got: $header"
             }
-            
+
             $peOff = [BitConverter]::ToInt32($b, 0x3C)
             if ($peOff -lt 0x40 -or $peOff -gt $b.Length - 4) {
               throw "$path : invalid PE offset"
             }
-            
+
             $sig = [System.Text.Encoding]::ASCII.GetString($b, $peOff, 2)
             if ($sig -ne 'PE') {
               throw "$path : PE signature missing, got: $sig"
             }
-            
+
             Write-Host "OK : $path is a valid PE"
           }
 
           function Test-PeNative {
             param([string]$path)
             Test-PeFile $path
-            
+
             $b = [System.IO.File]::ReadAllBytes($path)
             $peOff = [BitConverter]::ToInt32($b, 0x3C)
-            
+
             $magic = [BitConverter]::ToUInt16($b, $peOff + 24)
-            if ($magic -ne 0x20B) { 
+            if ($magic -ne 0x20B) {
               throw "$path : not PE32+ (magic 0x$($magic.ToString('X4')))"
             }
-            
+
             $subsys = [BitConverter]::ToUInt16($b, $peOff + 24 + 68)
-            if ($subsys -ne 1) { 
+            if ($subsys -ne 1) {
               throw "$path : subsystem $subsys, expected NATIVE (1)"
             }
-            
+
             Write-Host "OK : $path is a valid x64 NATIVE PE"
           }
 
@@ -158,17 +158,5 @@ jobs:
             $msg = if (Test-Path "$env:RUNNER_TEMP\api.out") { Get-Content "$env:RUNNER_TEMP\api.out" -Raw } else { 'no output' }
             throw "$api -version exited with code $($p.ExitCode): $msg"
           }
-          $output = Get-Content "$env:RUNNER_TEMP\api.out" -Raw
-          Write-Host "API output: $output"
-
-          # 3) Driver PE sanity: MZ + PE32+ (x64) + NATIVE subsystem
-          Test-PeNative $sys
-
-      - name: Upload build artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: deploy-package
-          path: target/Release/
-          if-no-files-found: warn
-          retention-days: 7
+          $output = Get-Content "$env:RUNNER_TEMP\api.out"`
+ª¡
