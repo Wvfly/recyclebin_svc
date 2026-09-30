@@ -1,5 +1,7 @@
+  ##powershell操作
+
   # 1) 生成新自签测试证书（有效期设 10 年）
-  $c = New-SelfSignedCertificate -Type CodeSigning -Subject "CN=RbMiniflt Test" `
+  $cert = New-SelfSignedCertificate -Type CodeSigning -Subject "CN=RbMiniflt Test" `
     -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(10)
 
   # 2）查看证书sha1
